@@ -468,10 +468,27 @@ impl<T, S: Storage<T>> List<T, S> {
         self.free_node(index)
     }
 
-    /// 对齐 `LinkedList::clear`。保留已分配的内存与 free-list。
+    /// 对齐 `LinkedList::clear`。保留已分配的容量与槽位。
+    ///
+    /// 单趟完成：逐个析构 live 元素，并把槽位就地挂回 free list。
     #[inline]
     pub fn clear(&mut self) {
-        while self.pop_front().is_some() {}
+        let mut index = self.head;
+
+        while index != NIL {
+            let next = self.storage.next(index);
+
+            unsafe { self.storage.data_mut(index).assume_init_drop() };
+
+            self.storage.set_next(index, self.free_head);
+            self.free_head = index;
+
+            index = next;
+        }
+
+        self.head = NIL;
+        self.tail = NIL;
+        self.len = 0;
     }
 }
 

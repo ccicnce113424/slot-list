@@ -547,6 +547,38 @@ fn check_drop<S: Storage<Tracked> + Default>() {
     assert_eq!(count.get(), 10);
 }
 
+fn check_clear<S: Storage<Tracked> + Default>() {
+    let count = Rc::new(Cell::new(0));
+    let mut list: List<Tracked, S> = List::default();
+
+    for _ in 0..50 {
+        list.push_back(Tracked(Rc::clone(&count)));
+    }
+
+    let slots = list.storage.len();
+
+    list.clear();
+
+    // 每个元素恰好析构一次，槽位容量保留，容器回到空状态。
+    assert_eq!(count.get(), 50);
+    assert!(list.is_empty());
+    assert!(list.front().is_none());
+    assert!(list.back().is_none());
+    assert!(list.iter().next().is_none());
+    assert_eq!(list.storage.len(), slots);
+
+    // 清空后重新填充应复用槽位，不扩容。
+    for _ in 0..50 {
+        list.push_back(Tracked(Rc::clone(&count)));
+    }
+
+    assert_eq!(list.storage.len(), slots);
+
+    drop(list);
+
+    assert_eq!(count.get(), 100);
+}
+
 // ============================================================
 // IterMut 的地址计算（元素大小/对齐与 usize 不同）
 // ============================================================
@@ -747,6 +779,10 @@ fn drop_semantics() {
     check_drop::<Soa<Tracked>>();
     check_drop::<Packed<Tracked>>();
     check_drop::<Aos<Tracked>>();
+
+    check_clear::<Soa<Tracked>>();
+    check_clear::<Packed<Tracked>>();
+    check_clear::<Aos<Tracked>>();
 }
 
 #[test]
