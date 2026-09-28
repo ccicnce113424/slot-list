@@ -41,7 +41,16 @@
           ];
           config =
             let
-              craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.fenix.default.toolchain);
+              craneLib = (crane.mkLib pkgs).overrideToolchain (
+                p:
+                p.fenix.complete.withComponents [
+                  "cargo"
+                  "clippy"
+                  "miri"
+                  "rustc"
+                  "rustfmt"
+                ]
+              );
               src = craneLib.cleanCargoSource ./.;
               commonArgs = {
                 inherit src;
@@ -103,7 +112,6 @@
 
                 # Extra inputs can be added here; cargo and rustc are provided by default.
                 packages = [
-                  pkgs.gcc
                 ];
               };
             };

@@ -1,0 +1,1125 @@
+//! 三种内存布局（`SoaList` / `PackedList` / `AosList`）与
+//! std `LinkedList`、`VecDeque`、fast-list、`Vec` 的横向基准。
+//!
+//! 三种布局是同一个泛型类型 `List<T, S>` 的不同 `Storage` 参数，所以
+//! 基准体用宏生成三种实例，不手写三份；基线各自手写。
+//!
+//! 运行：`cargo bench [-- <过滤正则>]`
+//! 报告：`target/criterion/report/index.html`
+
+#![feature(linked_list_cursors)]
+
+// 全局分配器。`cargo bench --no-default-features` 会切回系统 malloc，
+// 便于对比"分配器是否把内存还给内核"对端操作的影响。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use slot_list::{AosList, PackedList, SoaList};
+
+use fast_list::LinkedList as FastLinkedList;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+
+use std::{
+    collections::{LinkedList, VecDeque},
+    hint::black_box,
+    time::Duration,
+};
+
+const N: usize = 1_000_000;
+
+const LOOKUPS: usize = 100;
+
+const MIDDLE_OPS: usize = 1_000;
+
+const CHURN_OPS: usize = 1_000_000;
+
+const RANDOM_OPS: usize = 100;
+
+const CURSOR_UPDATE_OPS: usize = 1_000_000;
+
+const LARGE_N: usize = 250_000;
+
+// ============================================================
+// 我们三种布局的基准体
+//
+// 三种布局共用一份实现（`List<T, S>`），所以基准体也用宏生成三种实例，
+// 而不是手写三份拷贝。布局只体现在 `$ty` 上。
+// ============================================================
+
+macro_rules! bench_end_ops {
+    ($name:ident, $ty:ty, $push:ident, $pop:ident) => {
+        fn $name() {
+            let mut list: $ty = <$ty>::new();
+
+            for i in 0..N {
+                list.$push(black_box(i));
+            }
+
+            while let Some(value) = list.$pop() {
+                black_box(value);
+            }
+        }
+    };
+}
+
+macro_rules! bench_construct {
+    ($name:ident, $ty:ty) => {
+        fn $name() -> $ty {
+            let mut list: $ty = <$ty>::new();
+
+            for i in 0..N {
+                list.push_back(i);
+            }
+
+            list
+        }
+    };
+}
+
+macro_rules! bench_iter {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &$ty) {
+            let mut sum = 0usize;
+
+            for value in list.iter() {
+                sum = sum.wrapping_add(*value);
+            }
+
+            black_box(sum);
+        }
+    };
+}
+
+macro_rules! bench_at_middle {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &mut $ty) {
+            let mut sum = 0usize;
+            let middle = N / 2;
+
+            for _ in 0..LOOKUPS {
+                let mut cursor = list.at(black_box(middle)).unwrap();
+
+                sum = sum.wrapping_add(*cursor.current().unwrap());
+            }
+
+            black_box(sum);
+        }
+    };
+}
+
+macro_rules! bench_insert_before_remove {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &mut $ty) {
+            let middle = N / 2;
+            let mut cursor = list.at(middle).unwrap();
+
+            for i in 0..MIDDLE_OPS {
+                // 在当前位置之前插入，游标不动。
+                cursor.insert_before(black_box(i));
+
+                // 移到刚插入的节点。
+                cursor.move_prev();
+
+                // 删掉它；游标回到原来的节点。
+                let value = cursor.remove_current().unwrap();
+
+                black_box(value);
+            }
+
+            black_box(cursor.index());
+        }
+    };
+}
+
+macro_rules! bench_churn {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &mut $ty) {
+            for i in 0..CHURN_OPS {
+                let value = list.pop_front().unwrap();
+
+                black_box(value);
+
+                list.push_back(black_box(i));
+            }
+        }
+    };
+}
+
+macro_rules! bench_random_remove_insert {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &mut $ty, positions: &[usize]) {
+            for (i, &pos) in positions.iter().enumerate() {
+                let mut cursor = list.at(pos).unwrap();
+
+                let removed = cursor.remove_current().unwrap();
+
+                black_box(removed);
+
+                // 游标已指向下一个元素（删的是尾元素时为幽灵位置，
+                // insert_before 会把新元素追加到末尾）。
+                cursor.insert_before(black_box(i));
+            }
+
+            black_box(list.len());
+        }
+    };
+}
+
+macro_rules! bench_cursor_update {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &mut $ty) {
+            let mut cursor = list.at(N / 2).unwrap();
+
+            let mut checksum = 0usize;
+
+            for i in 0..CURSOR_UPDATE_OPS {
+                let delta = black_box(i.wrapping_mul(0x9e37_79b9));
+
+                let value = *cursor.current().unwrap();
+
+                let new_value = value.wrapping_add(delta);
+
+                *cursor.current().unwrap() = new_value;
+
+                checksum ^= black_box(new_value);
+            }
+
+            black_box(checksum);
+        }
+    };
+}
+
+macro_rules! bench_construct_blob {
+    ($name:ident, $ty:ty) => {
+        fn $name() -> $ty {
+            let mut list: $ty = <$ty>::new();
+
+            for i in 0..LARGE_N {
+                list.push_back(Blob64::new(i));
+            }
+
+            list
+        }
+    };
+}
+
+macro_rules! bench_blob_iter {
+    ($name:ident, $ty:ty) => {
+        fn $name(list: &$ty) {
+            let mut sum = 0usize;
+
+            for value in list.iter() {
+                sum = sum.wrapping_add(value.key());
+            }
+
+            black_box(sum);
+        }
+    };
+}
+
+macro_rules! bench_blob_end_ops {
+    ($name:ident, $ty:ty) => {
+        fn $name() {
+            let mut list: $ty = <$ty>::new();
+
+            for i in 0..LARGE_N {
+                list.push_back(black_box(Blob64::new(i)));
+            }
+
+            while let Some(value) = list.pop_front() {
+                black_box(value);
+            }
+        }
+    };
+}
+
+// ---- 实例化（三种布局 × 12 个基准）----
+
+bench_end_ops!(
+    soalist_push_back_pop_front,
+    SoaList<usize>,
+    push_back,
+    pop_front
+);
+bench_end_ops!(
+    packedlist_push_back_pop_front,
+    PackedList<usize>,
+    push_back,
+    pop_front
+);
+bench_end_ops!(
+    aoslist_push_back_pop_front,
+    AosList<usize>,
+    push_back,
+    pop_front
+);
+
+bench_end_ops!(
+    soalist_push_front_pop_back,
+    SoaList<usize>,
+    push_front,
+    pop_back
+);
+bench_end_ops!(
+    packedlist_push_front_pop_back,
+    PackedList<usize>,
+    push_front,
+    pop_back
+);
+bench_end_ops!(
+    aoslist_push_front_pop_back,
+    AosList<usize>,
+    push_front,
+    pop_back
+);
+
+bench_construct!(make_soalist, SoaList<usize>);
+bench_construct!(make_packedlist, PackedList<usize>);
+bench_construct!(make_aoslist, AosList<usize>);
+
+bench_iter!(soalist_iter, SoaList<usize>);
+bench_iter!(packedlist_iter, PackedList<usize>);
+bench_iter!(aoslist_iter, AosList<usize>);
+
+bench_at_middle!(soalist_at_middle, SoaList<usize>);
+bench_at_middle!(packedlist_at_middle, PackedList<usize>);
+bench_at_middle!(aoslist_at_middle, AosList<usize>);
+
+bench_insert_before_remove!(soalist_insert_before_remove, SoaList<usize>);
+bench_insert_before_remove!(packedlist_insert_before_remove, PackedList<usize>);
+bench_insert_before_remove!(aoslist_insert_before_remove, AosList<usize>);
+
+bench_churn!(soalist_churn, SoaList<usize>);
+bench_churn!(packedlist_churn, PackedList<usize>);
+bench_churn!(aoslist_churn, AosList<usize>);
+
+bench_random_remove_insert!(soalist_random_remove_insert, SoaList<usize>);
+bench_random_remove_insert!(packedlist_random_remove_insert, PackedList<usize>);
+bench_random_remove_insert!(aoslist_random_remove_insert, AosList<usize>);
+
+bench_cursor_update!(soalist_cursor_update, SoaList<usize>);
+bench_cursor_update!(packedlist_cursor_update, PackedList<usize>);
+bench_cursor_update!(aoslist_cursor_update, AosList<usize>);
+
+bench_construct_blob!(make_soalist_blob, SoaList<Blob64>);
+bench_construct_blob!(make_packedlist_blob, PackedList<Blob64>);
+bench_construct_blob!(make_aoslist_blob, AosList<Blob64>);
+
+bench_blob_iter!(soalist_blob_iter, SoaList<Blob64>);
+bench_blob_iter!(packedlist_blob_iter, PackedList<Blob64>);
+bench_blob_iter!(aoslist_blob_iter, AosList<Blob64>);
+
+bench_blob_end_ops!(soalist_blob_push_back_pop_front, SoaList<Blob64>);
+bench_blob_end_ops!(packedlist_blob_push_back_pop_front, PackedList<Blob64>);
+bench_blob_end_ops!(aoslist_blob_push_back_pop_front, AosList<Blob64>);
+
+// ============================================================
+// 基线：std VecDeque / std LinkedList / fast-list / Vec
+// ============================================================
+
+// ---- 输入生成与游标定位 ----
+
+fn next_rng(state: &mut u64) -> usize {
+    // xorshift64
+    let mut x = *state;
+
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    *state = x;
+
+    x as usize
+}
+
+fn make_random_positions(len: usize, count: usize) -> Vec<usize> {
+    let mut state = 0x1234_5678_9abc_def0u64;
+
+    let mut positions = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        positions.push(next_rng(&mut state) % len);
+    }
+
+    positions
+}
+
+fn linkedlist_cursor_at(
+    list: &mut LinkedList<usize>,
+    pos: usize,
+) -> std::collections::linked_list::CursorMut<'_, usize> {
+    let len = list.len();
+
+    assert!(pos < len);
+
+    if pos < len / 2 {
+        let mut cursor = list.cursor_front_mut();
+
+        for _ in 0..pos {
+            cursor.move_next();
+        }
+
+        cursor
+    } else {
+        let mut cursor = list.cursor_back_mut();
+
+        for _ in 0..(len - 1 - pos) {
+            cursor.move_prev();
+        }
+
+        cursor
+    }
+}
+
+// ---- 端操作 ----
+
+fn vecdeque_push_back_pop_front() {
+    let mut deque = VecDeque::new();
+
+    for i in 0..N {
+        deque.push_back(black_box(i));
+    }
+
+    while let Some(value) = deque.pop_front() {
+        black_box(value);
+    }
+}
+
+fn linkedlist_push_back_pop_front() {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_back(black_box(i));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
+fn fastlist_push_back_pop_front() {
+    let mut list = FastLinkedList::new();
+
+    for i in 0..N {
+        list.push_back(black_box(i));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
+fn vecdeque_push_front_pop_back() {
+    let mut deque = VecDeque::new();
+
+    for i in 0..N {
+        deque.push_front(black_box(i));
+    }
+
+    while let Some(value) = deque.pop_back() {
+        black_box(value);
+    }
+}
+
+fn linkedlist_push_front_pop_back() {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_front(black_box(i));
+    }
+
+    while let Some(value) = list.pop_back() {
+        black_box(value);
+    }
+}
+
+fn fastlist_push_front_pop_back() {
+    let mut list = FastLinkedList::new();
+
+    for i in 0..N {
+        list.push_front(black_box(i));
+    }
+
+    while let Some(value) = list.pop_back() {
+        black_box(value);
+    }
+}
+
+// ---- 构造 ----
+
+fn make_vecdeque() -> VecDeque<usize> {
+    let mut deque = VecDeque::new();
+
+    for i in 0..N {
+        deque.push_back(i);
+    }
+
+    deque
+}
+
+fn make_linkedlist() -> LinkedList<usize> {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_back(i);
+    }
+
+    list
+}
+
+fn make_fastlist() -> FastLinkedList<usize> {
+    let mut list = FastLinkedList::new();
+
+    for i in 0..N {
+        list.push_back(i);
+    }
+
+    list
+}
+
+fn make_vec() -> Vec<usize> {
+    (0..N).collect()
+}
+
+// ---- 纯迭代 ----
+
+fn vecdeque_iter(deque: &VecDeque<usize>) {
+    let mut sum = 0usize;
+
+    for value in deque.iter() {
+        sum = sum.wrapping_add(*value);
+    }
+
+    black_box(sum);
+}
+
+fn linkedlist_iter(list: &LinkedList<usize>) {
+    let mut sum = 0usize;
+
+    for value in list.iter() {
+        sum = sum.wrapping_add(*value);
+    }
+
+    black_box(sum);
+}
+
+fn fastlist_iter(list: &FastLinkedList<usize>) {
+    let mut sum = 0usize;
+
+    for item in list.iter() {
+        sum = sum.wrapping_add(item.value);
+    }
+
+    black_box(sum);
+}
+
+fn vec_iter(vec: &[usize]) {
+    let mut sum = 0usize;
+
+    for value in vec {
+        sum = sum.wrapping_add(*value);
+    }
+
+    black_box(sum);
+}
+
+// ---- 中间位置访问 ----
+
+fn vecdeque_index_middle(deque: &VecDeque<usize>) {
+    let mut sum = 0usize;
+
+    let middle = N / 2;
+
+    for _ in 0..LOOKUPS {
+        sum = sum.wrapping_add(deque[black_box(middle)]);
+    }
+
+    black_box(sum);
+}
+
+fn linkedlist_at_middle(list: &LinkedList<usize>) {
+    let mut sum = 0usize;
+
+    let middle = N / 2;
+
+    for _ in 0..LOOKUPS {
+        let value = list.iter().nth(black_box(middle)).unwrap();
+
+        sum = sum.wrapping_add(*value);
+    }
+
+    black_box(sum);
+}
+
+fn fastlist_at_middle(list: &FastLinkedList<usize>) {
+    let mut sum = 0usize;
+
+    let middle = N / 2;
+
+    for _ in 0..LOOKUPS {
+        let index = list.nth(black_box(middle)).unwrap();
+
+        let item = list.get(index).unwrap();
+
+        sum = sum.wrapping_add(item.value);
+    }
+
+    black_box(sum);
+}
+
+// ---- 已知位置的局部插入/删除 ----
+
+fn vecdeque_insert_remove(deque: &mut VecDeque<usize>) {
+    let middle = N / 2;
+
+    for i in 0..MIDDLE_OPS {
+        deque.insert(middle, black_box(i));
+
+        let value = deque.remove(middle).unwrap();
+
+        black_box(value);
+    }
+}
+
+fn linkedlist_insert_before_remove(list: &mut LinkedList<usize>) {
+    let mut cursor = linkedlist_cursor_at(list, N / 2);
+
+    for i in 0..MIDDLE_OPS {
+        cursor.insert_before(black_box(i));
+
+        cursor.move_prev();
+
+        let value = cursor.remove_current().unwrap();
+
+        black_box(value);
+    }
+
+    black_box(cursor.index().unwrap());
+}
+
+fn fastlist_insert_before_remove(list: &mut FastLinkedList<usize>) {
+    let middle_index = list.nth(N / 2).unwrap();
+
+    for i in 0..MIDDLE_OPS {
+        let inserted = list.insert_before(middle_index, black_box(i));
+
+        let removed = list.remove(inserted).unwrap();
+
+        black_box(removed.value);
+    }
+
+    black_box(middle_index);
+}
+
+// ---- 稳态 churn ----
+
+fn vecdeque_churn(deque: &mut VecDeque<usize>) {
+    for i in 0..CHURN_OPS {
+        let value = deque.pop_front().unwrap();
+
+        black_box(value);
+
+        deque.push_back(black_box(i));
+    }
+}
+
+fn linkedlist_churn(list: &mut LinkedList<usize>) {
+    for i in 0..CHURN_OPS {
+        let value = list.pop_front().unwrap();
+
+        black_box(value);
+
+        list.push_back(black_box(i));
+    }
+}
+
+fn fastlist_churn(list: &mut FastLinkedList<usize>) {
+    for i in 0..CHURN_OPS {
+        let value = list.pop_front().unwrap();
+
+        black_box(value);
+
+        list.push_back(black_box(i));
+    }
+}
+
+// ---- 随机位置删除 + 插入 ----
+
+fn vecdeque_random_remove_insert(deque: &mut VecDeque<usize>, positions: &[usize]) {
+    for (i, &pos) in positions.iter().enumerate() {
+        let value = deque.remove(pos).unwrap();
+
+        black_box(value);
+
+        deque.insert(pos, black_box(i));
+    }
+
+    black_box(deque.len());
+}
+
+fn linkedlist_random_remove_insert(list: &mut LinkedList<usize>, positions: &[usize]) {
+    for (i, &pos) in positions.iter().enumerate() {
+        let mut cursor = linkedlist_cursor_at(list, pos);
+
+        let value = cursor.remove_current().unwrap();
+
+        black_box(value);
+
+        cursor.insert_before(black_box(i));
+    }
+
+    black_box(list.len());
+}
+
+fn fastlist_random_remove_insert(list: &mut FastLinkedList<usize>, positions: &[usize]) {
+    for (i, &pos) in positions.iter().enumerate() {
+        let index = list.nth(pos).unwrap();
+
+        let removed = list.remove(index).unwrap();
+
+        black_box(removed.value);
+
+        if pos < list.len() {
+            let next_index = list.nth(pos).unwrap();
+
+            list.insert_before(next_index, black_box(i));
+        } else {
+            list.push_back(black_box(i));
+        }
+    }
+
+    black_box(list.len());
+}
+
+// ---- 已知位置读写 ----
+
+fn vecdeque_index_update(deque: &mut VecDeque<usize>) {
+    let middle = N / 2;
+
+    let mut checksum = 0usize;
+
+    for i in 0..CURSOR_UPDATE_OPS {
+        let delta = black_box(i.wrapping_mul(0x9e37_79b9));
+
+        let value = deque[middle];
+
+        let new_value = value.wrapping_add(delta);
+
+        deque[middle] = new_value;
+
+        checksum ^= black_box(new_value);
+    }
+
+    black_box(checksum);
+}
+
+fn linkedlist_cursor_update(list: &mut LinkedList<usize>) {
+    let mut cursor = linkedlist_cursor_at(list, N / 2);
+
+    let mut checksum = 0usize;
+
+    for i in 0..CURSOR_UPDATE_OPS {
+        let delta = black_box(i.wrapping_mul(0x9e37_79b9));
+
+        let value = *cursor.current().unwrap();
+
+        let new_value = value.wrapping_add(delta);
+
+        *cursor.current().unwrap() = new_value;
+
+        checksum ^= black_box(new_value);
+    }
+
+    black_box(checksum);
+}
+
+fn fastlist_index_update(list: &mut FastLinkedList<usize>) {
+    let index = list.nth(N / 2).unwrap();
+
+    let mut checksum = 0usize;
+
+    for i in 0..CURSOR_UPDATE_OPS {
+        let delta = black_box(i.wrapping_mul(0x9e37_79b9));
+
+        let value = list.get(index).unwrap().value;
+
+        let new_value = value.wrapping_add(delta);
+
+        list.get_mut(index).unwrap().value = new_value;
+
+        checksum ^= black_box(new_value);
+    }
+
+    black_box(checksum);
+}
+
+// ============================================================
+// 64 字节元素
+// ============================================================
+
+#[derive(Clone, Copy)]
+struct Blob64([u64; 8]);
+
+impl Blob64 {
+    #[inline]
+    fn new(value: usize) -> Self {
+        Self([value as u64; 8])
+    }
+
+    #[inline]
+    fn key(&self) -> usize {
+        self.0[0] as usize
+    }
+}
+
+// ---- 64B 构造 / 迭代 / 端操作 ----
+
+fn make_vecdeque_blob() -> VecDeque<Blob64> {
+    let mut deque = VecDeque::new();
+
+    for i in 0..LARGE_N {
+        deque.push_back(Blob64::new(i));
+    }
+
+    deque
+}
+
+fn make_linkedlist_blob() -> LinkedList<Blob64> {
+    let mut list = LinkedList::new();
+
+    for i in 0..LARGE_N {
+        list.push_back(Blob64::new(i));
+    }
+
+    list
+}
+
+fn make_fastlist_blob() -> FastLinkedList<Blob64> {
+    let mut list = FastLinkedList::new();
+
+    for i in 0..LARGE_N {
+        list.push_back(Blob64::new(i));
+    }
+
+    list
+}
+
+fn make_vec_blob() -> Vec<Blob64> {
+    (0..LARGE_N).map(Blob64::new).collect()
+}
+
+fn vecdeque_blob_iter(deque: &VecDeque<Blob64>) {
+    let mut sum = 0usize;
+
+    for value in deque.iter() {
+        sum = sum.wrapping_add(value.key());
+    }
+
+    black_box(sum);
+}
+
+fn linkedlist_blob_iter(list: &LinkedList<Blob64>) {
+    let mut sum = 0usize;
+
+    for value in list.iter() {
+        sum = sum.wrapping_add(value.key());
+    }
+
+    black_box(sum);
+}
+
+fn fastlist_blob_iter(list: &FastLinkedList<Blob64>) {
+    let mut sum = 0usize;
+
+    for item in list.iter() {
+        sum = sum.wrapping_add(item.value.key());
+    }
+
+    black_box(sum);
+}
+
+fn vec_blob_iter(vec: &[Blob64]) {
+    let mut sum = 0usize;
+
+    for value in vec {
+        sum = sum.wrapping_add(value.key());
+    }
+
+    black_box(sum);
+}
+
+fn vecdeque_blob_push_back_pop_front() {
+    let mut deque = VecDeque::new();
+
+    for i in 0..LARGE_N {
+        deque.push_back(black_box(Blob64::new(i)));
+    }
+
+    while let Some(value) = deque.pop_front() {
+        black_box(value);
+    }
+}
+
+fn linkedlist_blob_push_back_pop_front() {
+    let mut list = LinkedList::new();
+
+    for i in 0..LARGE_N {
+        list.push_back(black_box(Blob64::new(i)));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
+fn fastlist_blob_push_back_pop_front() {
+    let mut list = FastLinkedList::new();
+
+    for i in 0..LARGE_N {
+        list.push_back(black_box(Blob64::new(i)));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
+// ============================================================
+// Criterion groups
+// ============================================================
+
+fn end_ops(c: &mut Criterion) {
+    let mut g = c.benchmark_group("end_ops/push_back_pop_front");
+    g.bench_function("SoaList", |b| b.iter(soalist_push_back_pop_front));
+    g.bench_function("PackedList", |b| b.iter(packedlist_push_back_pop_front));
+    g.bench_function("AosList", |b| b.iter(aoslist_push_back_pop_front));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_push_back_pop_front));
+    g.bench_function("LinkedList", |b| b.iter(linkedlist_push_back_pop_front));
+    g.bench_function("FastList", |b| b.iter(fastlist_push_back_pop_front));
+    g.finish();
+
+    let mut g = c.benchmark_group("end_ops/push_front_pop_back");
+    g.bench_function("SoaList", |b| b.iter(soalist_push_front_pop_back));
+    g.bench_function("PackedList", |b| b.iter(packedlist_push_front_pop_back));
+    g.bench_function("AosList", |b| b.iter(aoslist_push_front_pop_back));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_push_front_pop_back));
+    g.bench_function("LinkedList", |b| b.iter(linkedlist_push_front_pop_back));
+    g.bench_function("FastList", |b| b.iter(fastlist_push_front_pop_back));
+    g.finish();
+}
+
+fn iteration(c: &mut Criterion) {
+    let soalist = make_soalist();
+    let packedlist = make_packedlist();
+    let aoslist = make_aoslist();
+    let vecdeque = make_vecdeque();
+    let linkedlist = make_linkedlist();
+    let fastlist = make_fastlist();
+    let vec = make_vec();
+
+    let mut g = c.benchmark_group("iteration");
+    g.bench_function("SoaList", |b| b.iter(|| soalist_iter(&soalist)));
+    g.bench_function("PackedList", |b| b.iter(|| packedlist_iter(&packedlist)));
+    g.bench_function("AosList", |b| b.iter(|| aoslist_iter(&aoslist)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_iter(&vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_iter(&linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_iter(&fastlist)));
+    g.bench_function("Vec", |b| b.iter(|| vec_iter(&vec)));
+    g.finish();
+}
+
+fn middle_access(c: &mut Criterion) {
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+    let vecdeque = make_vecdeque();
+    let linkedlist = make_linkedlist();
+    let fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("middle_access");
+    g.bench_function("SoaList", |b| b.iter(|| soalist_at_middle(&mut soalist)));
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_at_middle(&mut packedlist))
+    });
+    g.bench_function("AosList", |b| b.iter(|| aoslist_at_middle(&mut aoslist)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_index_middle(&vecdeque)));
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_at_middle(&linkedlist))
+    });
+    g.bench_function("FastList", |b| b.iter(|| fastlist_at_middle(&fastlist)));
+    g.finish();
+}
+
+fn middle_insert_remove(c: &mut Criterion) {
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("middle_insert_remove");
+    g.bench_function("SoaList", |b| {
+        b.iter(|| soalist_insert_before_remove(&mut soalist))
+    });
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_insert_before_remove(&mut packedlist))
+    });
+    g.bench_function("AosList", |b| {
+        b.iter(|| aoslist_insert_before_remove(&mut aoslist))
+    });
+    g.bench_function("VecDeque", |b| {
+        b.iter(|| vecdeque_insert_remove(&mut vecdeque))
+    });
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_insert_before_remove(&mut linkedlist))
+    });
+    g.bench_function("FastList", |b| {
+        b.iter(|| fastlist_insert_before_remove(&mut fastlist))
+    });
+    g.finish();
+}
+
+fn churn(c: &mut Criterion) {
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("churn");
+    g.bench_function("SoaList", |b| b.iter(|| soalist_churn(&mut soalist)));
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_churn(&mut packedlist))
+    });
+    g.bench_function("AosList", |b| b.iter(|| aoslist_churn(&mut aoslist)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_churn(&mut vecdeque)));
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_churn(&mut linkedlist))
+    });
+    g.bench_function("FastList", |b| b.iter(|| fastlist_churn(&mut fastlist)));
+    g.finish();
+}
+
+fn random_remove_insert(c: &mut Criterion) {
+    let positions = make_random_positions(N, RANDOM_OPS);
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("random_remove_insert");
+    g.bench_function("SoaList", |b| {
+        b.iter(|| soalist_random_remove_insert(&mut soalist, &positions))
+    });
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_random_remove_insert(&mut packedlist, &positions))
+    });
+    g.bench_function("AosList", |b| {
+        b.iter(|| aoslist_random_remove_insert(&mut aoslist, &positions))
+    });
+    g.bench_function("VecDeque", |b| {
+        b.iter(|| vecdeque_random_remove_insert(&mut vecdeque, &positions))
+    });
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_random_remove_insert(&mut linkedlist, &positions))
+    });
+    g.bench_function("FastList", |b| {
+        b.iter(|| fastlist_random_remove_insert(&mut fastlist, &positions))
+    });
+    g.finish();
+}
+
+fn cursor_update(c: &mut Criterion) {
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("cursor_update");
+    g.bench_function("SoaList", |b| {
+        b.iter(|| soalist_cursor_update(&mut soalist))
+    });
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_cursor_update(&mut packedlist))
+    });
+    g.bench_function("AosList", |b| {
+        b.iter(|| aoslist_cursor_update(&mut aoslist))
+    });
+    g.bench_function("VecDeque", |b| {
+        b.iter(|| vecdeque_index_update(&mut vecdeque))
+    });
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_cursor_update(&mut linkedlist))
+    });
+    g.bench_function("FastList", |b| {
+        b.iter(|| fastlist_index_update(&mut fastlist))
+    });
+    g.finish();
+}
+
+fn blob_iter(c: &mut Criterion) {
+    let soalist = make_soalist_blob();
+    let packedlist = make_packedlist_blob();
+    let aoslist = make_aoslist_blob();
+    let vecdeque = make_vecdeque_blob();
+    let linkedlist = make_linkedlist_blob();
+    let fastlist = make_fastlist_blob();
+    let vec = make_vec_blob();
+
+    let mut g = c.benchmark_group("blob_iter");
+    g.bench_function("SoaList", |b| b.iter(|| soalist_blob_iter(&soalist)));
+    g.bench_function("PackedList", |b| {
+        b.iter(|| packedlist_blob_iter(&packedlist))
+    });
+    g.bench_function("AosList", |b| b.iter(|| aoslist_blob_iter(&aoslist)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_blob_iter(&vecdeque)));
+    g.bench_function("LinkedList", |b| {
+        b.iter(|| linkedlist_blob_iter(&linkedlist))
+    });
+    g.bench_function("FastList", |b| b.iter(|| fastlist_blob_iter(&fastlist)));
+    g.bench_function("Vec", |b| b.iter(|| vec_blob_iter(&vec)));
+    g.finish();
+}
+
+fn blob_end_ops(c: &mut Criterion) {
+    let mut g = c.benchmark_group("blob_end_ops");
+    g.bench_function("SoaList", |b| b.iter(soalist_blob_push_back_pop_front));
+    g.bench_function("PackedList", |b| {
+        b.iter(packedlist_blob_push_back_pop_front)
+    });
+    g.bench_function("AosList", |b| b.iter(aoslist_blob_push_back_pop_front));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_blob_push_back_pop_front));
+    g.bench_function("LinkedList", |b| {
+        b.iter(linkedlist_blob_push_back_pop_front)
+    });
+    g.bench_function("FastList", |b| b.iter(fastlist_blob_push_back_pop_front));
+    g.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(1));
+    targets =
+        end_ops,
+        iteration,
+        middle_access,
+        middle_insert_remove,
+        churn,
+        random_remove_insert,
+        cursor_update,
+        blob_iter,
+        blob_end_ops,
+}
+
+criterion_main!(benches);

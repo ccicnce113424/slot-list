@@ -1,10 +1,10 @@
 [package]
-name = "my-deque"
+name = "slot-list"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "my_deque"
+name = "slot_list"
 path = "src/lib.rs"
 
 [features]
@@ -18,5 +18,5 @@ fast-list = "0.1.8"
 mimalloc = "0.1"
 
 [[bench]]
-name = "deque"
+name = "list"
 harness = false
