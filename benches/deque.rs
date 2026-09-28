@@ -1,24 +1,26 @@
 #![feature(linked_list_cursors)]
 
-mod my_deque;
-mod my_deque_aos;
-mod my_deque_packed;
+// 全局分配器。`cargo bench --no-default-features` 会切回系统 malloc，
+// 便于对比"分配器是否把内存还给内核"对 SoA 端操作的影响。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use my_deque::MyDeque;
-use my_deque_aos::MyDequeAos;
-use my_deque_packed::MyDequePacked;
+use my_deque::my_deque::MyDeque;
+use my_deque::my_deque_aos::MyDequeAos;
+use my_deque::my_deque_packed::MyDequePacked;
 
 use fast_list::LinkedList as FastLinkedList;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use std::{
     collections::{LinkedList, VecDeque},
     hint::black_box,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const N: usize = 1_000_000;
-
-const ROUNDS: usize = 10;
 
 const LOOKUPS: usize = 100;
 
@@ -36,24 +38,6 @@ const LARGE_N: usize = 250_000;
 // Benchmark infrastructure
 // ============================================================
 
-fn benchmark<F: FnMut()>(mut f: F) -> Duration {
-    // Warmup.
-    f();
-
-    let mut samples = Vec::with_capacity(ROUNDS);
-
-    for _ in 0..ROUNDS {
-        let start = Instant::now();
-
-        f();
-
-        samples.push(start.elapsed());
-    }
-
-    samples.sort_unstable();
-
-    samples[ROUNDS / 2]
-}
 
 // ============================================================
 // Deterministic pseudo-random input
@@ -1195,481 +1179,187 @@ fn fastlist_blob_push_back_pop_front() {
 }
 
 // ============================================================
-// Main
+// Criterion groups
 // ============================================================
 
-fn main() {
-    println!("N = {N}, rounds = {ROUNDS}");
-    println!();
+fn end_ops(c: &mut Criterion) {
+    let mut g = c.benchmark_group("end_ops/push_back_pop_front");
+    g.bench_function("MyDeque", |b| b.iter(mydeque_push_back_pop_front));
+    g.bench_function("MyDequePacked", |b| b.iter(packeddeque_push_back_pop_front));
+    g.bench_function("MyDequeAos", |b| b.iter(aosdeque_push_back_pop_front));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_push_back_pop_front));
+    g.bench_function("LinkedList", |b| b.iter(linkedlist_push_back_pop_front));
+    g.bench_function("FastList", |b| b.iter(fastlist_push_back_pop_front));
+    g.finish();
 
-    // --------------------------------------------------------
-    // End operations
-    // --------------------------------------------------------
+    let mut g = c.benchmark_group("end_ops/push_front_pop_back");
+    g.bench_function("MyDeque", |b| b.iter(mydeque_push_front_pop_back));
+    g.bench_function("MyDequePacked", |b| b.iter(packeddeque_push_front_pop_back));
+    g.bench_function("MyDequeAos", |b| b.iter(aosdeque_push_front_pop_back));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_push_front_pop_back));
+    g.bench_function("LinkedList", |b| b.iter(linkedlist_push_front_pop_back));
+    g.bench_function("FastList", |b| b.iter(fastlist_push_front_pop_back));
+    g.finish();
+}
 
-    let mydeque_push_back_pop_front_time = benchmark(mydeque_push_back_pop_front);
-
-    let aosdeque_push_back_pop_front_time = benchmark(aosdeque_push_back_pop_front);
-
-    let packeddeque_push_back_pop_front_time = benchmark(packeddeque_push_back_pop_front);
-
-    let vecdeque_push_back_pop_front_time = benchmark(vecdeque_push_back_pop_front);
-
-    let linkedlist_push_back_pop_front_time = benchmark(linkedlist_push_back_pop_front);
-
-    let fastlist_push_back_pop_front_time = benchmark(fastlist_push_back_pop_front);
-
-    let mydeque_push_front_pop_back_time = benchmark(mydeque_push_front_pop_back);
-
-    let aosdeque_push_front_pop_back_time = benchmark(aosdeque_push_front_pop_back);
-
-    let packeddeque_push_front_pop_back_time = benchmark(packeddeque_push_front_pop_back);
-
-    let vecdeque_push_front_pop_back_time = benchmark(vecdeque_push_front_pop_back);
-
-    let linkedlist_push_front_pop_back_time = benchmark(linkedlist_push_front_pop_back);
-
-    let fastlist_push_front_pop_back_time = benchmark(fastlist_push_front_pop_back);
-
-    println!("End operations:");
-
-    println!(
-        "MyDeque      push_back + pop_front: {:?}",
-        mydeque_push_back_pop_front_time
-    );
-
-    println!(
-        "MyDequeAos   push_back + pop_front: {:?}",
-        aosdeque_push_back_pop_front_time
-    );
-
-    println!(
-        "MyDequePacked push_back + pop_front: {:?}",
-        packeddeque_push_back_pop_front_time
-    );
-
-    println!(
-        "VecDeque     push_back + pop_front: {:?}",
-        vecdeque_push_back_pop_front_time
-    );
-
-    println!(
-        "LinkedList   push_back + pop_front: {:?}",
-        linkedlist_push_back_pop_front_time
-    );
-
-    println!(
-        "FastList     push_back + pop_front: {:?}",
-        fastlist_push_back_pop_front_time
-    );
-
-    println!();
-
-    println!(
-        "MyDeque      push_front + pop_back: {:?}",
-        mydeque_push_front_pop_back_time
-    );
-
-    println!(
-        "MyDequeAos   push_front + pop_back: {:?}",
-        aosdeque_push_front_pop_back_time
-    );
-
-    println!(
-        "MyDequePacked push_front + pop_back: {:?}",
-        packeddeque_push_front_pop_back_time
-    );
-
-    println!(
-        "VecDeque     push_front + pop_back: {:?}",
-        vecdeque_push_front_pop_back_time
-    );
-
-    println!(
-        "LinkedList   push_front + pop_back: {:?}",
-        linkedlist_push_front_pop_back_time
-    );
-
-    println!(
-        "FastList     push_front + pop_back: {:?}",
-        fastlist_push_front_pop_back_time
-    );
-
-    println!();
-
-    // --------------------------------------------------------
-    // Construct reusable containers
-    // --------------------------------------------------------
-
+fn iteration(c: &mut Criterion) {
     let mydeque = make_mydeque();
-    let aosdeque = make_aosdeque();
     let packeddeque = make_packeddeque();
+    let aosdeque = make_aosdeque();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
     let fastlist = make_fastlist();
     let vec = make_vec();
 
-    // --------------------------------------------------------
-    // Iteration
-    // --------------------------------------------------------
+    let mut g = c.benchmark_group("iteration");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_iter(&mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_iter(&packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_iter(&aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_iter(&vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_iter(&linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_iter(&fastlist)));
+    g.bench_function("Vec", |b| b.iter(|| vec_iter(&vec)));
+    g.finish();
+}
 
-    let mydeque_iter_time = benchmark(|| mydeque_iter(&mydeque));
-
-    let aosdeque_iter_time = benchmark(|| aosdeque_iter(&aosdeque));
-
-    let packeddeque_iter_time = benchmark(|| packeddeque_iter(&packeddeque));
-
-    let vecdeque_iter_time = benchmark(|| vecdeque_iter(&vecdeque));
-
-    let linkedlist_iter_time = benchmark(|| linkedlist_iter(&linkedlist));
-
-    let fastlist_iter_time = benchmark(|| fastlist_iter(&fastlist));
-
-    let vec_iter_time = benchmark(|| vec_iter(&vec));
-
-    println!("Iteration:");
-
-    println!("MyDeque      iter: {:?}", mydeque_iter_time);
-
-    println!("MyDequeAos   iter: {:?}", aosdeque_iter_time);
-
-    println!("MyDequePacked iter: {:?}", packeddeque_iter_time);
-
-    println!("VecDeque     iter: {:?}", vecdeque_iter_time);
-
-    println!("LinkedList   iter: {:?}", linkedlist_iter_time);
-
-    println!("FastList     iter: {:?}", fastlist_iter_time);
-
-    println!("Vec          iter: {:?}", vec_iter_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // Middle positional access
-    // --------------------------------------------------------
-
+fn middle_access(c: &mut Criterion) {
     let mut mydeque = make_mydeque();
-
-    let mut aosdeque = make_aosdeque();
-
     let mut packeddeque = make_packeddeque();
-
+    let mut aosdeque = make_aosdeque();
     let vecdeque = make_vecdeque();
-
     let linkedlist = make_linkedlist();
-
     let fastlist = make_fastlist();
 
-    let mydeque_at_time = benchmark(|| mydeque_at_middle(&mut mydeque));
-
-    let aosdeque_at_time = benchmark(|| aosdeque_at_middle(&mut aosdeque));
-
-    let packeddeque_at_time = benchmark(|| packeddeque_at_middle(&mut packeddeque));
-
-    let vecdeque_index_time = benchmark(|| vecdeque_index_middle(&vecdeque));
-
-    let linkedlist_at_time = benchmark(|| linkedlist_at_middle(&linkedlist));
-
-    let fastlist_at_time = benchmark(|| fastlist_at_middle(&fastlist));
-
-    println!("Middle access ({LOOKUPS} lookups):");
-
-    println!("MyDeque      at():     {:?}", mydeque_at_time);
-
-    println!("MyDequeAos   at():     {:?}", aosdeque_at_time);
-
-    println!("MyDequePacked at():     {:?}", packeddeque_at_time);
-
-    println!("VecDeque     index:    {:?}", vecdeque_index_time);
-
-    println!("LinkedList   iter nth: {:?}", linkedlist_at_time);
-
-    println!("FastList     nth:      {:?}", fastlist_at_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // Known-position local insertion/removal
-    // --------------------------------------------------------
-
-    let mut mydeque = make_mydeque();
-
-    let mut aosdeque = make_aosdeque();
-
-    let mut packeddeque = make_packeddeque();
-
-    let mut vecdeque = make_vecdeque();
-
-    let mut linkedlist = make_linkedlist();
-
-    let mut fastlist = make_fastlist();
-
-    let mydeque_insert_remove_time = benchmark(|| mydeque_insert_before_remove(&mut mydeque));
-
-    let aosdeque_insert_remove_time = benchmark(|| aosdeque_insert_before_remove(&mut aosdeque));
-
-    let packeddeque_insert_remove_time =
-        benchmark(|| packeddeque_insert_before_remove(&mut packeddeque));
-
-    let linkedlist_insert_remove_time =
-        benchmark(|| linkedlist_insert_before_remove(&mut linkedlist));
-
-    let fastlist_insert_remove_time = benchmark(|| fastlist_insert_before_remove(&mut fastlist));
-
-    let vecdeque_insert_remove_time = benchmark(|| vecdeque_insert_remove(&mut vecdeque));
-
-    println!("Middle insert + remove ({MIDDLE_OPS} operations):");
-
-    println!(
-        "MyDeque      cursor insert_before + remove: {:?}",
-        mydeque_insert_remove_time
-    );
-
-    println!(
-        "MyDequeAos   cursor insert_before + remove: {:?}",
-        aosdeque_insert_remove_time
-    );
-
-    println!(
-        "MyDequePacked cursor insert_before + remove: {:?}",
-        packeddeque_insert_remove_time
-    );
-
-    println!(
-        "LinkedList   cursor insert_before + remove: {:?}",
-        linkedlist_insert_remove_time
-    );
-
-    println!(
-        "FastList     index  insert_before + remove: {:?}",
-        fastlist_insert_remove_time
-    );
-
-    println!(
-        "VecDeque     index  insert + remove:          {:?}",
-        vecdeque_insert_remove_time
-    );
-
-    println!();
-
-    // --------------------------------------------------------
-    // Steady-state churn
-    // --------------------------------------------------------
-
-    let mut mydeque = make_mydeque();
-
-    let mut aosdeque = make_aosdeque();
-
-    let mut packeddeque = make_packeddeque();
-
-    let mut vecdeque = make_vecdeque();
-
-    let mut linkedlist = make_linkedlist();
-
-    let mut fastlist = make_fastlist();
-
-    let mydeque_churn_time = benchmark(|| mydeque_churn(&mut mydeque));
-
-    let aosdeque_churn_time = benchmark(|| aosdeque_churn(&mut aosdeque));
-
-    let packeddeque_churn_time = benchmark(|| packeddeque_churn(&mut packeddeque));
-
-    let vecdeque_churn_time = benchmark(|| vecdeque_churn(&mut vecdeque));
-
-    let linkedlist_churn_time = benchmark(|| linkedlist_churn(&mut linkedlist));
-
-    let fastlist_churn_time = benchmark(|| fastlist_churn(&mut fastlist));
-
-    println!("Steady-state churn ({CHURN_OPS} pop_front + push_back):");
-
-    println!("MyDeque      : {:?}", mydeque_churn_time);
-
-    println!("MyDequeAos   : {:?}", aosdeque_churn_time);
-
-    println!("MyDequePacked : {:?}", packeddeque_churn_time);
-
-    println!("VecDeque     : {:?}", vecdeque_churn_time);
-
-    println!("LinkedList   : {:?}", linkedlist_churn_time);
-
-    println!("FastList     : {:?}", fastlist_churn_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // Random positional remove + insert
-    // --------------------------------------------------------
-
-    let positions = make_random_positions(N, RANDOM_OPS);
-
-    let mut mydeque = make_mydeque();
-
-    let mut aosdeque = make_aosdeque();
-
-    let mut packeddeque = make_packeddeque();
-
-    let mut vecdeque = make_vecdeque();
-
-    let mut linkedlist = make_linkedlist();
-
-    let mut fastlist = make_fastlist();
-
-    let mydeque_random_time = benchmark(|| mydeque_random_remove_insert(&mut mydeque, &positions));
-
-    let aosdeque_random_time =
-        benchmark(|| aosdeque_random_remove_insert(&mut aosdeque, &positions));
-
-    let packeddeque_random_time =
-        benchmark(|| packeddeque_random_remove_insert(&mut packeddeque, &positions));
-
-    let linkedlist_random_time =
-        benchmark(|| linkedlist_random_remove_insert(&mut linkedlist, &positions));
-
-    let fastlist_random_time =
-        benchmark(|| fastlist_random_remove_insert(&mut fastlist, &positions));
-
-    let vecdeque_random_time =
-        benchmark(|| vecdeque_random_remove_insert(&mut vecdeque, &positions));
-
-    println!("Random positional remove + insert ({RANDOM_OPS} operations):");
-
-    println!("MyDeque      : {:?}", mydeque_random_time);
-
-    println!("MyDequeAos   : {:?}", aosdeque_random_time);
-
-    println!("MyDequePacked : {:?}", packeddeque_random_time);
-
-    println!("LinkedList   : {:?}", linkedlist_random_time);
-
-    println!("FastList     : {:?}", fastlist_random_time);
-
-    println!("VecDeque     : {:?}", vecdeque_random_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // Known-position read + write
-    // --------------------------------------------------------
-
-    let mut mydeque = make_mydeque();
-
-    let mut aosdeque = make_aosdeque();
-
-    let mut vecdeque = make_vecdeque();
-
-    let mut linkedlist = make_linkedlist();
-
-    let mut fastlist = make_fastlist();
-
-    let mut packeddeque = make_packeddeque();
-
-    let mydeque_update_time = benchmark(|| mydeque_cursor_update(&mut mydeque));
-
-    let aosdeque_update_time = benchmark(|| aosdeque_cursor_update(&mut aosdeque));
-
-    let packeddeque_update_time = benchmark(|| packeddeque_cursor_update(&mut packeddeque));
-
-    let linkedlist_update_time = benchmark(|| linkedlist_cursor_update(&mut linkedlist));
-
-    let fastlist_update_time = benchmark(|| fastlist_index_update(&mut fastlist));
-
-    let vecdeque_update_time = benchmark(|| vecdeque_index_update(&mut vecdeque));
-
-    println!("Known-position read + write ({CURSOR_UPDATE_OPS} operations):");
-
-    println!("MyDeque      : {:?}", mydeque_update_time);
-
-    println!("MyDequeAos   : {:?}", aosdeque_update_time);
-
-    println!("MyDequePacked : {:?}", packeddeque_update_time);
-
-    println!("LinkedList   : {:?}", linkedlist_update_time);
-
-    println!("FastList     : {:?}", fastlist_update_time);
-
-    println!("VecDeque     : {:?}", vecdeque_update_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // 64-byte T: iteration
-    // --------------------------------------------------------
-
-    let mydeque_blob = make_mydeque_blob();
-
-    let aosdeque_blob = make_aosdeque_blob();
-
-    let packeddeque_blob = make_packeddeque_blob();
-
-    let vecdeque_blob = make_vecdeque_blob();
-
-    let linkedlist_blob = make_linkedlist_blob();
-
-    let fastlist_blob = make_fastlist_blob();
-
-    let vec_blob = make_vec_blob();
-
-    let mydeque_blob_iter_time = benchmark(|| mydeque_blob_iter(&mydeque_blob));
-
-    let aosdeque_blob_iter_time = benchmark(|| aosdeque_blob_iter(&aosdeque_blob));
-
-    let packeddeque_blob_iter_time = benchmark(|| packeddeque_blob_iter(&packeddeque_blob));
-
-    let vecdeque_blob_iter_time = benchmark(|| vecdeque_blob_iter(&vecdeque_blob));
-
-    let linkedlist_blob_iter_time = benchmark(|| linkedlist_blob_iter(&linkedlist_blob));
-
-    let fastlist_blob_iter_time = benchmark(|| fastlist_blob_iter(&fastlist_blob));
-
-    let vec_blob_iter_time = benchmark(|| vec_blob_iter(&vec_blob));
-
-    println!("Iteration with 64-byte T (N = {LARGE_N}):");
-
-    println!("MyDeque      : {:?}", mydeque_blob_iter_time);
-
-    println!("MyDequeAos   : {:?}", aosdeque_blob_iter_time);
-
-    println!("MyDequePacked : {:?}", packeddeque_blob_iter_time);
-
-    println!("VecDeque     : {:?}", vecdeque_blob_iter_time);
-
-    println!("LinkedList   : {:?}", linkedlist_blob_iter_time);
-
-    println!("FastList     : {:?}", fastlist_blob_iter_time);
-
-    println!("Vec          : {:?}", vec_blob_iter_time);
-
-    println!();
-
-    // --------------------------------------------------------
-    // 64-byte T: end operations
-    // --------------------------------------------------------
-
-    let mydeque_blob_end_time = benchmark(mydeque_blob_push_back_pop_front);
-
-    let aosdeque_blob_end_time = benchmark(aosdeque_blob_push_back_pop_front);
-
-    let packeddeque_blob_end_time = benchmark(packeddeque_blob_push_back_pop_front);
-
-    let vecdeque_blob_end_time = benchmark(vecdeque_blob_push_back_pop_front);
-
-    let linkedlist_blob_end_time = benchmark(linkedlist_blob_push_back_pop_front);
-
-    let fastlist_blob_end_time = benchmark(fastlist_blob_push_back_pop_front);
-
-    println!("End operations with 64-byte T (N = {LARGE_N}):");
-
-    println!("MyDeque      : {:?}", mydeque_blob_end_time);
-
-    println!("MyDequeAos   : {:?}", aosdeque_blob_end_time);
-
-    println!("MyDequePacked : {:?}", packeddeque_blob_end_time);
-
-    println!("VecDeque     : {:?}", vecdeque_blob_end_time);
-
-    println!("LinkedList   : {:?}", linkedlist_blob_end_time);
-
-    println!("FastList     : {:?}", fastlist_blob_end_time);
-
-    println!();
+    let mut g = c.benchmark_group("middle_access");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_at_middle(&mut mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_at_middle(&mut packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_at_middle(&mut aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_index_middle(&vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_at_middle(&linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_at_middle(&fastlist)));
+    g.finish();
 }
+
+fn middle_insert_remove(c: &mut Criterion) {
+    let mut mydeque = make_mydeque();
+    let mut packeddeque = make_packeddeque();
+    let mut aosdeque = make_aosdeque();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("middle_insert_remove");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_insert_before_remove(&mut mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_insert_before_remove(&mut packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_insert_before_remove(&mut aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_insert_remove(&mut vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_insert_before_remove(&mut linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_insert_before_remove(&mut fastlist)));
+    g.finish();
+}
+
+fn churn(c: &mut Criterion) {
+    let mut mydeque = make_mydeque();
+    let mut packeddeque = make_packeddeque();
+    let mut aosdeque = make_aosdeque();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("churn");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_churn(&mut mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_churn(&mut packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_churn(&mut aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_churn(&mut vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_churn(&mut linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_churn(&mut fastlist)));
+    g.finish();
+}
+
+fn random_remove_insert(c: &mut Criterion) {
+    let positions = make_random_positions(N, RANDOM_OPS);
+    let mut mydeque = make_mydeque();
+    let mut packeddeque = make_packeddeque();
+    let mut aosdeque = make_aosdeque();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("random_remove_insert");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_random_remove_insert(&mut mydeque, &positions)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_random_remove_insert(&mut packeddeque, &positions)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_random_remove_insert(&mut aosdeque, &positions)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_random_remove_insert(&mut vecdeque, &positions)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_random_remove_insert(&mut linkedlist, &positions)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_random_remove_insert(&mut fastlist, &positions)));
+    g.finish();
+}
+
+fn cursor_update(c: &mut Criterion) {
+    let mut mydeque = make_mydeque();
+    let mut packeddeque = make_packeddeque();
+    let mut aosdeque = make_aosdeque();
+    let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+
+    let mut g = c.benchmark_group("cursor_update");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_cursor_update(&mut mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_cursor_update(&mut packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_cursor_update(&mut aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_index_update(&mut vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_cursor_update(&mut linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_index_update(&mut fastlist)));
+    g.finish();
+}
+
+fn blob_iter(c: &mut Criterion) {
+    let mydeque = make_mydeque_blob();
+    let packeddeque = make_packeddeque_blob();
+    let aosdeque = make_aosdeque_blob();
+    let vecdeque = make_vecdeque_blob();
+    let linkedlist = make_linkedlist_blob();
+    let fastlist = make_fastlist_blob();
+    let vec = make_vec_blob();
+
+    let mut g = c.benchmark_group("blob_iter");
+    g.bench_function("MyDeque", |b| b.iter(|| mydeque_blob_iter(&mydeque)));
+    g.bench_function("MyDequePacked", |b| b.iter(|| packeddeque_blob_iter(&packeddeque)));
+    g.bench_function("MyDequeAos", |b| b.iter(|| aosdeque_blob_iter(&aosdeque)));
+    g.bench_function("VecDeque", |b| b.iter(|| vecdeque_blob_iter(&vecdeque)));
+    g.bench_function("LinkedList", |b| b.iter(|| linkedlist_blob_iter(&linkedlist)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_blob_iter(&fastlist)));
+    g.bench_function("Vec", |b| b.iter(|| vec_blob_iter(&vec)));
+    g.finish();
+}
+
+fn blob_end_ops(c: &mut Criterion) {
+    let mut g = c.benchmark_group("blob_end_ops");
+    g.bench_function("MyDeque", |b| b.iter(mydeque_blob_push_back_pop_front));
+    g.bench_function("MyDequePacked", |b| b.iter(packeddeque_blob_push_back_pop_front));
+    g.bench_function("MyDequeAos", |b| b.iter(aosdeque_blob_push_back_pop_front));
+    g.bench_function("VecDeque", |b| b.iter(vecdeque_blob_push_back_pop_front));
+    g.bench_function("LinkedList", |b| b.iter(linkedlist_blob_push_back_pop_front));
+    g.bench_function("FastList", |b| b.iter(fastlist_blob_push_back_pop_front));
+    g.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(1));
+    targets =
+        end_ops,
+        iteration,
+        middle_access,
+        middle_insert_remove,
+        churn,
+        random_remove_insert,
+        cursor_update,
+        blob_iter,
+        blob_end_ops,
+}
+
+criterion_main!(benches);

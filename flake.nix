@@ -7,8 +7,8 @@
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
     };
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+    fenix = {
+      url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -33,7 +33,7 @@
               nixpkgs = {
                 hostPlatform = system;
                 overlays = with inputs; [
-                  rust-overlay.overlays.default
+                  fenix.overlays.default
                 ];
                 # config.allowUnfree = true;
               };
@@ -41,12 +41,7 @@
           ];
           config =
             let
-              craneLib = (crane.mkLib pkgs).overrideToolchain (
-                p:
-                p.rust-bin.nightly.latest.default.override {
-                  extensions = [ "rust-src" ];
-                }
-              );
+              craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.fenix.default.toolchain);
               src = craneLib.cleanCargoSource ./.;
               commonArgs = {
                 inherit src;
@@ -108,10 +103,15 @@
 
                 # Extra inputs can be added here; cargo and rustc are provided by default.
                 packages = [
-                  # pkgs.ripgrep
+                  pkgs.gcc
                 ];
               };
             };
         };
     };
+
+  nixConfig = {
+    extra-substituters = [ "https://fenix.cachix.org" ];
+    extra-trusted-public-keys = [ "fenix.cachix.org-1:ecJhr+RdYEdcVgUkjruiYhjbBloIEGov7bos90cZi0Q=" ];
+  };
 }

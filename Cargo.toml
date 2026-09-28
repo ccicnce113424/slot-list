@@ -3,5 +3,20 @@ name = "my-deque"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[lib]
+name = "my_deque"
+path = "src/lib.rs"
+
+[features]
+default = ["mimalloc"]
+# `cargo bench --no-default-features` 切回系统 malloc 做 A/B 对比。
+mimalloc = []
+
+[dev-dependencies]
+criterion = "0.8"
 fast-list = "0.1.8"
+mimalloc = "0.1"
+
+[[bench]]
+name = "deque"
+harness = false
