@@ -52,6 +52,9 @@ pub trait Storage<T>: sealed::Sealed {
         self.len() == 0
     }
 
+    /// 预留至少 `additional` 个槽位的容量（`len + additional`）。
+    fn reserve(&mut self, additional: usize);
+
     /// 追加一个未初始化的槽位并返回其下标。
     fn grow(&mut self) -> usize;
 
@@ -98,6 +101,12 @@ impl<T> Storage<T> for Soa<T> {
     #[inline]
     fn len(&self) -> usize {
         self.data.len()
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.data.reserve(additional);
+        self.prev.reserve(additional);
+        self.next.reserve(additional);
     }
 
     #[inline]
@@ -190,6 +199,11 @@ impl<T> Storage<T> for Packed<T> {
         self.links.len()
     }
 
+    fn reserve(&mut self, additional: usize) {
+        self.data.reserve(additional);
+        self.links.reserve(additional);
+    }
+
     #[inline]
     fn grow(&mut self) -> usize {
         self.data.push(MaybeUninit::uninit());
@@ -278,6 +292,10 @@ impl<T> Storage<T> for Aos<T> {
     #[inline]
     fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.nodes.reserve(additional);
     }
 
     #[inline]

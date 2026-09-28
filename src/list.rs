@@ -61,25 +61,47 @@ impl<T> List<T, Aos<T>> {
     }
 }
 
+impl<T, S: Storage<T> + Default> List<T, S> {
+    /// **本库扩展**：预留 `capacity` 个槽位的容量后创建空链表。
+    ///
+    /// 槽位在**连续内存**里，所以预留能避免构造期的反复 realloc
+    /// （对 SoA 布局尤其明显：一次预留省掉三个数组的 3×扩容）。
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut list = Self::default();
+
+        list.reserve(capacity);
+
+        list
+    }
+}
+
 impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
     // 基本查询
     // --------------------------------------------------------
 
     /// 元素个数。
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// 是否为空。
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// **本库扩展**（std 的链表没有容量概念）：预留 `additional` 个槽位的容量。
+    pub fn reserve(&mut self, additional: usize) {
+        self.storage.reserve(additional);
     }
 
     // --------------------------------------------------------
     // 内部：节点操作
     // --------------------------------------------------------
 
+    #[inline]
     fn move_forward(&self, index: usize, steps: usize) -> usize {
         let mut current = index;
 
@@ -96,6 +118,7 @@ impl<T, S: Storage<T>> List<T, S> {
         current
     }
 
+    #[inline]
     fn move_backward(&self, index: usize, steps: usize) -> usize {
         let mut current = index;
 
@@ -113,17 +136,19 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 第 `pos` 个 live 节点的下标；`pos` 必须 `< len`。
-    /// 从较近的一端出发，O(min(pos, len - 1 - pos))。
+    /// 从**步数更少**的一端出发：forward 走 `pos` 步，backward 走 `len-1-pos` 步。
+    #[inline]
     pub(crate) fn index_at(&self, pos: usize) -> usize {
         debug_assert!(pos < self.len);
 
-        if pos <= self.len / 2 {
+        if pos < self.len.div_ceil(2) {
             self.move_forward(self.head, pos)
         } else {
             self.move_backward(self.tail, self.len - 1 - pos)
         }
     }
 
+    #[inline]
     pub(crate) fn alloc_node(&mut self, value: T) -> usize {
         self.len += 1;
 
@@ -141,6 +166,7 @@ impl<T, S: Storage<T>> List<T, S> {
         index
     }
 
+    #[inline]
     pub(crate) fn free_node(&mut self, index: usize) -> T {
         self.len -= 1;
 
@@ -153,6 +179,7 @@ impl<T, S: Storage<T>> List<T, S> {
         value
     }
 
+    #[inline]
     pub(crate) fn insert_link(&mut self, pos: usize, prev: usize, next: usize) {
         self.storage.set_prev(pos, prev);
         self.storage.set_next(pos, next);
@@ -170,6 +197,7 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
+    #[inline]
     pub(crate) fn remove_link(&mut self, prev: usize, next: usize) {
         if prev != NIL {
             self.storage.set_next(prev, next);
@@ -188,6 +216,7 @@ impl<T, S: Storage<T>> List<T, S> {
     // 端操作
     // --------------------------------------------------------
 
+    #[inline]
     fn push_front_index(&mut self, value: T) -> usize {
         let index = self.alloc_node(value);
 
@@ -196,6 +225,7 @@ impl<T, S: Storage<T>> List<T, S> {
         index
     }
 
+    #[inline]
     fn push_back_index(&mut self, value: T) -> usize {
         let index = self.alloc_node(value);
 
@@ -205,16 +235,19 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::push_front`。
+    #[inline]
     pub fn push_front(&mut self, value: T) {
         let _ = self.push_front_index(value);
     }
 
     /// 对齐 `LinkedList::push_back`。
+    #[inline]
     pub fn push_back(&mut self, value: T) {
         let _ = self.push_back_index(value);
     }
 
     /// 对齐 `LinkedList::push_front_mut`：插入并返回新元素的引用。
+    #[inline]
     pub fn push_front_mut(&mut self, value: T) -> &mut T {
         let index = self.push_front_index(value);
 
@@ -222,6 +255,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::push_back_mut`：插入并返回新元素的引用。
+    #[inline]
     pub fn push_back_mut(&mut self, value: T) -> &mut T {
         let index = self.push_back_index(value);
 
@@ -229,6 +263,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::pop_front`。
+    #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
         if self.head == NIL {
             return None;
@@ -242,6 +277,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::pop_back`。
+    #[inline]
     pub fn pop_back(&mut self) -> Option<T> {
         if self.tail == NIL {
             return None;
@@ -259,6 +295,7 @@ impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
 
     /// 对齐 `LinkedList::front`。
+    #[inline]
     pub fn front(&self) -> Option<&T> {
         if self.head == NIL {
             return None;
@@ -268,6 +305,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::back`。
+    #[inline]
     pub fn back(&self) -> Option<&T> {
         if self.tail == NIL {
             return None;
@@ -277,6 +315,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::front_mut`。
+    #[inline]
     pub fn front_mut(&mut self) -> Option<&mut T> {
         if self.head == NIL {
             return None;
@@ -286,6 +325,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::back_mut`。
+    #[inline]
     pub fn back_mut(&mut self) -> Option<&mut T> {
         if self.tail == NIL {
             return None;
@@ -299,27 +339,32 @@ impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
 
     /// 对齐 `LinkedList::cursor_front`。
+    #[inline]
     pub fn cursor_front(&self) -> Cursor<'_, T, S> {
         Cursor::at(self, self.head, 0)
     }
 
     /// 对齐 `LinkedList::cursor_front_mut`。
+    #[inline]
     pub fn cursor_front_mut(&mut self) -> CursorMut<'_, T, S> {
         CursorMut::at(self, self.head, 0)
     }
 
     /// 对齐 `LinkedList::cursor_back`。
+    #[inline]
     pub fn cursor_back(&self) -> Cursor<'_, T, S> {
         Cursor::at(self, self.tail, self.len.saturating_sub(1))
     }
 
     /// 对齐 `LinkedList::cursor_back_mut`。
+    #[inline]
     pub fn cursor_back_mut(&mut self) -> CursorMut<'_, T, S> {
         CursorMut::at(self, self.tail, self.len.saturating_sub(1))
     }
 
     /// **本库扩展**（std 没有随机访问）：定位到第 `pos` 个元素。
     /// 从较近的一端出发，O(min(pos, len - 1 - pos))。
+    #[inline]
     pub fn at(&mut self, pos: usize) -> Option<CursorMut<'_, T, S>> {
         if pos >= self.len {
             return None;
@@ -335,11 +380,13 @@ impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
 
     /// 对齐 `LinkedList::iter`。
+    #[inline]
     pub fn iter(&self) -> Iter<'_, T, S> {
         Iter::new(self)
     }
 
     /// 对齐 `LinkedList::iter_mut`。
+    #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T, S> {
         IterMut::new(self)
     }
@@ -349,6 +396,7 @@ impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
 
     /// 对齐 `LinkedList::contains`。O(N)。
+    #[inline]
     pub fn contains(&self, value: &T) -> bool
     where
         T: PartialEq,
@@ -357,6 +405,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::retain`。O(N)。
+    #[inline]
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut T) -> bool,
@@ -420,6 +469,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     /// 对齐 `LinkedList::clear`。保留已分配的内存与 free-list。
+    #[inline]
     pub fn clear(&mut self) {
         while self.pop_front().is_some() {}
     }

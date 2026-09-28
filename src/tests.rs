@@ -434,6 +434,49 @@ fn check_traits<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
+// 容量预留（本库扩展）
+// ============================================================
+
+fn check_reserve<S: Storage<i32> + Default>() {
+    // 预留后构造，槽位地址在填满预留容量前不应改变。
+    let mut list: List<i32, S> = List::with_capacity(64);
+
+    assert!(list.is_empty());
+
+    let data_before = list.storage.layout().data;
+
+    for i in 0..64 {
+        list.push_back(i);
+    }
+
+    assert_eq!(
+        list.storage.layout().data,
+        data_before,
+        "预留容量内不应该重新分配"
+    );
+    assert_eq!(
+        list.iter().copied().collect::<Vec<_>>(),
+        (0..64).collect::<Vec<_>>()
+    );
+
+    // 创建后也能 reserve。
+    let mut list: List<i32, S> = List::default();
+
+    list.reserve(64);
+
+    let data_before = list.storage.layout().data;
+
+    for i in 0..64 {
+        list.push_front(i);
+    }
+
+    assert_eq!(list.storage.layout().data, data_before);
+    assert_eq!(list.len(), 64);
+    assert_eq!(list.front().copied(), Some(63));
+    assert_eq!(list.back().copied(), Some(0));
+}
+
+// ============================================================
 // free-list 复用
 // ============================================================
 
@@ -692,6 +735,11 @@ fn traits_stdlib() {
 #[test]
 fn free_list_reuse() {
     each_layout!(check_free_list_reuse);
+}
+
+#[test]
+fn reserve_capacity() {
+    each_layout!(check_reserve);
 }
 
 #[test]

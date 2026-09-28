@@ -35,6 +35,8 @@
 //! # 本库扩展（std 没有）
 //!
 //! - [`List::at`]：O(min(pos, len-1-pos)) 的随机定位，std 完全没有随机访问
+//! - [`List::with_capacity`] / [`List::reserve`]：预分配槽位容量
+//!   （节点在连续内存里，所以 std 的链表没有这个需求，我们有）
 //! - [`CursorMut::seek`] / [`CursorMut::move_steps`]：游标按位置/步长移动
 //! - [`CursorMut::is_head`] / [`CursorMut::is_tail`]：O(1) 端点判定
 //!
