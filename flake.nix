@@ -41,7 +41,12 @@
           ];
           config =
             let
-              craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.nightly.latest.default);
+              craneLib = (crane.mkLib pkgs).overrideToolchain (
+                p:
+                p.rust-bin.nightly.latest.default.override {
+                  extensions = [ "rust-src" ];
+                }
+              );
               src = craneLib.cleanCargoSource ./.;
               commonArgs = {
                 inherit src;

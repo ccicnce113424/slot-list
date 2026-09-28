@@ -1,9 +1,11 @@
+#![feature(linked_list_cursors)]
+
 mod my_deque;
 
 use my_deque::MyDeque;
 
 use std::{
-    collections::VecDeque,
+    collections::{LinkedList, VecDeque},
     hint::black_box,
     time::{Duration, Instant},
 };
@@ -57,6 +59,18 @@ fn vecdeque_push_back_pop_front() {
     }
 }
 
+fn linkedlist_push_back_pop_front() {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_back(black_box(i));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
 fn mydeque_push_front_pop_back() {
     let mut deque = MyDeque::new();
 
@@ -81,8 +95,20 @@ fn vecdeque_push_front_pop_back() {
     }
 }
 
+fn linkedlist_push_front_pop_back() {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_front(black_box(i));
+    }
+
+    while let Some(value) = list.pop_back() {
+        black_box(value);
+    }
+}
+
 // ============================================================
-// Pure iteration
+// Constructors
 // ============================================================
 
 fn make_mydeque() -> MyDeque<usize> {
@@ -105,9 +131,23 @@ fn make_vecdeque() -> VecDeque<usize> {
     deque
 }
 
+fn make_linkedlist() -> LinkedList<usize> {
+    let mut list = LinkedList::new();
+
+    for i in 0..N {
+        list.push_back(i);
+    }
+
+    list
+}
+
 fn make_vec() -> Vec<usize> {
     (0..N).collect()
 }
+
+// ============================================================
+// Pure iteration
+// ============================================================
 
 fn mydeque_iter(deque: &MyDeque<usize>) {
     let mut sum = 0usize;
@@ -129,6 +169,16 @@ fn vecdeque_iter(deque: &VecDeque<usize>) {
     black_box(sum);
 }
 
+fn linkedlist_iter(list: &LinkedList<usize>) {
+    let mut sum = 0usize;
+
+    for value in list.iter() {
+        sum = sum.wrapping_add(*value);
+    }
+
+    black_box(sum);
+}
+
 fn vec_iter(vec: &[usize]) {
     let mut sum = 0usize;
 
@@ -140,7 +190,15 @@ fn vec_iter(vec: &[usize]) {
 }
 
 // ============================================================
-// Random-ish positional access
+// Middle positional access
+//
+// Each lookup independently searches for the middle element.
+//
+// MyDeque:     at(middle)
+// VecDeque:    index[middle]
+// LinkedList:  iter().nth(middle)
+//
+// black_box(middle) prevents LLVM from trivially folding the access.
 // ============================================================
 
 fn mydeque_at_middle(deque: &mut MyDeque<usize>) {
@@ -148,7 +206,7 @@ fn mydeque_at_middle(deque: &mut MyDeque<usize>) {
     let middle = N / 2;
 
     for _ in 0..LOOKUPS {
-        let cursor = deque.at(middle).unwrap();
+        let cursor = deque.at(black_box(middle)).unwrap();
         sum = sum.wrapping_add(*cursor.value());
     }
 
@@ -160,21 +218,67 @@ fn vecdeque_index_middle(deque: &VecDeque<usize>) {
     let middle = N / 2;
 
     for _ in 0..LOOKUPS {
-        sum = sum.wrapping_add(deque[middle]);
+        sum = sum.wrapping_add(deque[black_box(middle)]);
+    }
+
+    black_box(sum);
+}
+
+fn linkedlist_at_middle(list: &LinkedList<usize>) {
+    let mut sum = 0usize;
+    let middle = N / 2;
+
+    for _ in 0..LOOKUPS {
+        let value = list.iter().nth(black_box(middle)).unwrap();
+        sum = sum.wrapping_add(*value);
     }
 
     black_box(sum);
 }
 
 // ============================================================
+// Cursor positioning
+//
+// Move once from the front to the middle.
+// This is intentionally NOT included in the local mutation
+// benchmark below.
+// ============================================================
+
+fn linkedlist_cursor_at_middle(
+    list: &mut LinkedList<usize>,
+) -> std::collections::linked_list::CursorMut<'_, usize> {
+    let mut cursor = list.cursor_front_mut();
+
+    for _ in 0..N / 2 {
+        cursor.move_next();
+    }
+
+    cursor
+}
+
+// ============================================================
 // Known-cursor insertion/removal
 //
-// We deliberately keep the cursor at roughly the same logical
-// position and repeatedly insert before it, then remove the
-// inserted node.
+// We intentionally use the same logical sequence for both:
 //
-// This measures the linked structure's O(1) local mutation,
-// without repeatedly calling at().
+//     insert_before
+//     move to inserted node
+//     remove inserted node
+//
+// MyDeque:
+//
+//     insert_before() returns a cursor to the inserted node,
+//     but we deliberately ignore that convenience and move the
+//     original cursor backward first.
+//
+// LinkedList:
+//
+//     insert_before() leaves the cursor where it was, so move_prev()
+//     reaches the inserted node, then remove_current() removes it
+//     and advances to the original node.
+//
+// This makes the benchmark compare the actual local mutation
+// mechanisms rather than one API having an accidental advantage.
 // ============================================================
 
 fn mydeque_insert_before_remove(deque: &mut MyDeque<usize>) {
@@ -182,8 +286,14 @@ fn mydeque_insert_before_remove(deque: &mut MyDeque<usize>) {
     let mut cursor = deque.at(middle).unwrap();
 
     for i in 0..MIDDLE_OPS {
-        let inserted = cursor.insert_before(black_box(i));
-        let (_, next_cursor) = inserted.remove();
+        // Insert before the current node.
+        cursor = cursor.insert_before(black_box(i));
+
+        // Return to the newly inserted node.
+        cursor = cursor.next().unwrap();
+
+        // Remove it. The returned cursor points at the old current node.
+        let (_, next_cursor) = cursor.remove();
 
         cursor = next_cursor.unwrap();
     }
@@ -191,12 +301,33 @@ fn mydeque_insert_before_remove(deque: &mut MyDeque<usize>) {
     black_box(cursor.pos());
 }
 
+fn linkedlist_insert_before_remove(list: &mut LinkedList<usize>) {
+    let mut cursor = linkedlist_cursor_at_middle(list);
+
+    for i in 0..MIDDLE_OPS {
+        // Insert before the current node.
+        cursor.insert_before(black_box(i));
+
+        // Move to the inserted node.
+        cursor.move_prev();
+
+        // Remove it. Cursor moves back to the original current node.
+        let value = cursor.remove_current().unwrap();
+
+        black_box(value);
+    }
+
+    black_box(cursor.index().unwrap());
+}
+
 fn vecdeque_insert_remove(deque: &mut VecDeque<usize>) {
     let middle = N / 2;
 
     for i in 0..MIDDLE_OPS {
         deque.insert(middle, black_box(i));
+
         let value = deque.remove(middle).unwrap();
+
         black_box(value);
     }
 }
@@ -209,32 +340,52 @@ fn main() {
     println!("N = {N}, rounds = {ROUNDS}");
     println!();
 
+    // --------------------------------------------------------
+    // End operations
+    // --------------------------------------------------------
+
     let mydeque_push_back_pop_front_time = benchmark(mydeque_push_back_pop_front);
 
     let vecdeque_push_back_pop_front_time = benchmark(vecdeque_push_back_pop_front);
+
+    let linkedlist_push_back_pop_front_time = benchmark(linkedlist_push_back_pop_front);
 
     let mydeque_push_front_pop_back_time = benchmark(mydeque_push_front_pop_back);
 
     let vecdeque_push_front_pop_back_time = benchmark(vecdeque_push_front_pop_back);
 
+    let linkedlist_push_front_pop_back_time = benchmark(linkedlist_push_front_pop_back);
+
+    println!("End operations:");
+
     println!(
-        "MyDeque  push_back + pop_front: {:?}",
+        "MyDeque    push_back + pop_front: {:?}",
         mydeque_push_back_pop_front_time
     );
     println!(
-        "VecDeque push_back + pop_front: {:?}",
+        "VecDeque   push_back + pop_front: {:?}",
         vecdeque_push_back_pop_front_time
     );
+    println!(
+        "LinkedList push_back + pop_front: {:?}",
+        linkedlist_push_back_pop_front_time
+    );
+
     println!();
 
     println!(
-        "MyDeque  push_front + pop_back: {:?}",
+        "MyDeque    push_front + pop_back: {:?}",
         mydeque_push_front_pop_back_time
     );
     println!(
-        "VecDeque push_front + pop_back: {:?}",
+        "VecDeque   push_front + pop_back: {:?}",
         vecdeque_push_front_pop_back_time
     );
+    println!(
+        "LinkedList push_front + pop_back: {:?}",
+        linkedlist_push_front_pop_back_time
+    );
+
     println!();
 
     // --------------------------------------------------------
@@ -243,18 +394,23 @@ fn main() {
 
     let mydeque = make_mydeque();
     let vecdeque = make_vecdeque();
+    let linkedlist = make_linkedlist();
     let vec = make_vec();
 
     let mydeque_iter_time = benchmark(|| mydeque_iter(&mydeque));
 
     let vecdeque_iter_time = benchmark(|| vecdeque_iter(&vecdeque));
 
+    let linkedlist_iter_time = benchmark(|| linkedlist_iter(&linkedlist));
+
     let vec_iter_time = benchmark(|| vec_iter(&vec));
 
     println!("Iteration:");
-    println!("MyDeque  iter: {:?}", mydeque_iter_time);
-    println!("VecDeque iter: {:?}", vecdeque_iter_time);
-    println!("Vec      iter: {:?}", vec_iter_time);
+    println!("MyDeque    iter: {:?}", mydeque_iter_time);
+    println!("VecDeque   iter: {:?}", vecdeque_iter_time);
+    println!("LinkedList iter: {:?}", linkedlist_iter_time);
+    println!("Vec        iter: {:?}", vec_iter_time);
+
     println!();
 
     // --------------------------------------------------------
@@ -263,34 +419,53 @@ fn main() {
 
     let mut mydeque = make_mydeque();
     let vecdeque = make_vecdeque();
+    let linkedlist = make_linkedlist();
 
     let mydeque_at_time = benchmark(|| mydeque_at_middle(&mut mydeque));
 
     let vecdeque_index_time = benchmark(|| vecdeque_index_middle(&vecdeque));
 
+    let linkedlist_at_time = benchmark(|| linkedlist_at_middle(&linkedlist));
+
     println!("Middle access ({LOOKUPS} lookups):");
-    println!("MyDeque  at():     {:?}", mydeque_at_time);
-    println!("VecDeque index:    {:?}", vecdeque_index_time);
+
+    println!("MyDeque    at():     {:?}", mydeque_at_time);
+
+    println!("VecDeque   index:    {:?}", vecdeque_index_time);
+
+    println!("LinkedList iter nth: {:?}", linkedlist_at_time);
+
     println!();
 
     // --------------------------------------------------------
-    // Local insertion/removal
+    // Known-cursor local insertion/removal
     // --------------------------------------------------------
 
     let mut mydeque = make_mydeque();
     let mut vecdeque = make_vecdeque();
+    let mut linkedlist = make_linkedlist();
 
     let mydeque_insert_remove_time = benchmark(|| mydeque_insert_before_remove(&mut mydeque));
+
+    let linkedlist_insert_remove_time =
+        benchmark(|| linkedlist_insert_before_remove(&mut linkedlist));
 
     let vecdeque_insert_remove_time = benchmark(|| vecdeque_insert_remove(&mut vecdeque));
 
     println!("Middle insert + remove ({MIDDLE_OPS} operations):");
+
     println!(
-        "MyDeque  cursor insert_before + remove: {:?}",
+        "MyDeque    cursor insert_before + remove: {:?}",
         mydeque_insert_remove_time
     );
+
     println!(
-        "VecDeque index insert + remove:          {:?}",
+        "LinkedList cursor insert_before + remove: {:?}",
+        linkedlist_insert_remove_time
+    );
+
+    println!(
+        "VecDeque   index insert + remove:          {:?}",
         vecdeque_insert_remove_time
     );
 }

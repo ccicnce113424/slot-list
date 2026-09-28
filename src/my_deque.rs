@@ -1,12 +1,15 @@
 use std::mem::MaybeUninit;
 
+/// 哨兵值：表示「没有指向任何节点」。
+const NIL: usize = usize::MAX;
+
 pub struct MyDeque<T> {
     data: Vec<MaybeUninit<T>>,
-    prev: Vec<Option<usize>>,
-    next: Vec<Option<usize>>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    free_head: Option<usize>,
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    head: usize,
+    tail: usize,
+    free_head: usize,
     len: usize,
 }
 
@@ -18,7 +21,7 @@ pub struct Cursor<'a, T> {
 
 pub struct Iter<'a, T> {
     deque: &'a MyDeque<T>,
-    index: Option<usize>,
+    index: usize,
 }
 
 impl<T> MyDeque<T> {
@@ -27,9 +30,9 @@ impl<T> MyDeque<T> {
             data: Vec::new(),
             prev: Vec::new(),
             next: Vec::new(),
-            head: None,
-            tail: None,
-            free_head: None,
+            head: NIL,
+            tail: NIL,
+            free_head: NIL,
             len: 0,
         }
     }
@@ -48,28 +51,29 @@ impl<T> MyDeque<T> {
     fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         unsafe { self.data.get_unchecked_mut(index) }
     }
-    fn prev(&self, index: usize) -> &Option<usize> {
+    fn prev(&self, index: usize) -> &usize {
         unsafe { self.prev.get_unchecked(index) }
     }
-    fn prev_mut(&mut self, index: usize) -> &mut Option<usize> {
+    fn prev_mut(&mut self, index: usize) -> &mut usize {
         unsafe { self.prev.get_unchecked_mut(index) }
     }
-    fn next(&self, index: usize) -> &Option<usize> {
+    fn next(&self, index: usize) -> &usize {
         unsafe { self.next.get_unchecked(index) }
     }
-    fn next_mut(&mut self, index: usize) -> &mut Option<usize> {
+    fn next_mut(&mut self, index: usize) -> &mut usize {
         unsafe { self.next.get_unchecked_mut(index) }
     }
 
     fn alloc_node(&mut self, value: T) -> usize {
         self.len += 1;
-        let index = if let Some(free_index) = self.free_head {
+        let index = if self.free_head != NIL {
+            let free_index = self.free_head;
             self.free_head = *self.next(free_index);
             free_index
         } else {
             self.data.push(MaybeUninit::uninit());
-            self.prev.push(None);
-            self.next.push(None);
+            self.prev.push(NIL);
+            self.next.push(NIL);
             self.data.len() - 1
         };
         self.data_mut(index).write(value);
@@ -79,41 +83,39 @@ impl<T> MyDeque<T> {
     fn free_node(&mut self, index: usize) -> T {
         self.len -= 1;
         *self.next_mut(index) = self.free_head;
-        self.free_head = Some(index);
+        self.free_head = index;
         unsafe { self.data_mut(index).assume_init_read() }
     }
 
-    fn insert_link(&mut self, pos: usize, prev: Option<usize>, next: Option<usize>) {
-        if let Some(prev_index) = prev {
-            *self.next_mut(prev_index) = Some(pos);
-            *self.prev_mut(pos) = Some(prev_index);
+    fn insert_link(&mut self, pos: usize, prev: usize, next: usize) {
+        *self.prev_mut(pos) = prev;
+        *self.next_mut(pos) = next;
+        if prev != NIL {
+            *self.next_mut(prev) = pos;
         } else {
-            self.head = Some(pos);
-            *self.prev_mut(pos) = None;
+            self.head = pos;
         }
-        if let Some(next_index) = next {
-            *self.prev_mut(next_index) = Some(pos);
-            *self.next_mut(pos) = Some(next_index);
+        if next != NIL {
+            *self.prev_mut(next) = pos;
         } else {
-            self.tail = Some(pos);
-            *self.next_mut(pos) = None;
+            self.tail = pos;
         }
     }
 
-    fn remove_link(&mut self, prev: Option<usize>, next: Option<usize>) {
-        if let Some(prev_index) = prev {
-            *self.next_mut(prev_index) = next;
+    fn remove_link(&mut self, prev: usize, next: usize) {
+        if prev != NIL {
+            *self.next_mut(prev) = next;
         } else {
             self.head = next;
         }
-        if let Some(next_index) = next {
-            *self.prev_mut(next_index) = prev;
+        if next != NIL {
+            *self.prev_mut(next) = prev;
         } else {
             self.tail = prev;
         }
     }
 
-    fn seek_index(&self, index: usize, offset: isize) -> Option<usize> {
+    fn seek_index(&self, index: usize, offset: isize) -> usize {
         if offset < 0 {
             self.move_backward(index, (-offset) as usize)
         } else {
@@ -121,27 +123,33 @@ impl<T> MyDeque<T> {
         }
     }
 
-    fn move_forward(&self, index: usize, steps: usize) -> Option<usize> {
+    fn move_forward(&self, index: usize, steps: usize) -> usize {
         let mut current_index = index;
         for _ in 0..steps {
             let next = *self.next(current_index);
-            current_index = next?;
+            if next == NIL {
+                return NIL;
+            }
+            current_index = next;
         }
-        Some(current_index)
+        current_index
     }
 
-    fn move_backward(&self, index: usize, steps: usize) -> Option<usize> {
+    fn move_backward(&self, index: usize, steps: usize) -> usize {
         let mut current_index = index;
         for _ in 0..steps {
             let prev = *self.prev(current_index);
-            current_index = prev?;
+            if prev == NIL {
+                return NIL;
+            }
+            current_index = prev;
         }
-        Some(current_index)
+        current_index
     }
 
     pub fn push_front(&mut self, value: T) -> Cursor<'_, T> {
         let new_index = self.alloc_node(value);
-        self.insert_link(new_index, None, self.head);
+        self.insert_link(new_index, NIL, self.head);
         Cursor {
             deque: self,
             index: new_index,
@@ -151,7 +159,7 @@ impl<T> MyDeque<T> {
 
     pub fn push_back(&mut self, value: T) -> Cursor<'_, T> {
         let new_index = self.alloc_node(value);
-        self.insert_link(new_index, self.tail, None);
+        self.insert_link(new_index, self.tail, NIL);
         Cursor {
             pos: self.len - 1,
             deque: self,
@@ -159,28 +167,42 @@ impl<T> MyDeque<T> {
         }
     }
     pub fn pop_front(&mut self) -> Option<T> {
-        let head_index = self.head?;
-        self.remove_link(None, *self.next(head_index));
+        if self.head == NIL {
+            return None;
+        }
+        let head_index = self.head;
+        self.remove_link(NIL, *self.next(head_index));
         Some(self.free_node(head_index))
     }
 
     pub fn pop_back(&mut self) -> Option<T> {
-        let tail_index = self.tail?;
-        self.remove_link(*self.prev(tail_index), None);
+        if self.tail == NIL {
+            return None;
+        }
+        let tail_index = self.tail;
+        self.remove_link(*self.prev(tail_index), NIL);
         Some(self.free_node(tail_index))
     }
     pub fn front(&mut self) -> Option<Cursor<'_, T>> {
-        self.head.map(|head_index| Cursor {
+        if self.head == NIL {
+            return None;
+        }
+        Some(Cursor {
+            index: self.head,
             deque: self,
-            index: head_index,
             pos: 0,
         })
     }
     pub fn back(&mut self) -> Option<Cursor<'_, T>> {
-        self.tail.map(|tail_index| Cursor {
-            pos: self.len - 1,
+        if self.tail == NIL {
+            return None;
+        }
+        let index = self.tail;
+        let pos = self.len - 1;
+        Some(Cursor {
+            pos,
             deque: self,
-            index: tail_index,
+            index,
         })
     }
     pub fn at(&mut self, pos: usize) -> Option<Cursor<'_, T>> {
@@ -219,43 +241,52 @@ impl<T> Cursor<'_, T> {
         unsafe { self.deque.data_mut(self.index).assume_init_mut() }
     }
     pub fn prev(self) -> Option<Self> {
-        self.deque.prev(self.index).map(|prev_index| Cursor {
+        let prev_index = *self.deque.prev(self.index);
+        if prev_index == NIL {
+            return None;
+        }
+        Some(Cursor {
             deque: self.deque,
             index: prev_index,
             pos: self.pos - 1,
         })
     }
     pub fn next(self) -> Option<Self> {
-        self.deque.next(self.index).map(|next_index| Cursor {
+        let next_index = *self.deque.next(self.index);
+        if next_index == NIL {
+            return None;
+        }
+        Some(Cursor {
             deque: self.deque,
             index: next_index,
             pos: self.pos + 1,
         })
     }
     pub fn move_steps(self, offset: isize) -> Option<Self> {
-        self.deque
-            .seek_index(self.index, offset)
-            .map(|index| Cursor {
-                deque: self.deque,
-                index,
-                pos: (self.pos as isize + offset) as usize,
-            })
+        let index = self.deque.seek_index(self.index, offset);
+        if index == NIL {
+            return None;
+        }
+        Some(Cursor {
+            deque: self.deque,
+            index,
+            pos: (self.pos as isize + offset) as usize,
+        })
     }
     pub fn seek(self, pos: usize) -> Option<Self> {
         let diff = pos as isize - self.pos as isize;
         self.move_steps(diff)
     }
     pub fn is_head(&self) -> bool {
-        self.deque.head == Some(self.index)
+        self.deque.head == self.index
     }
     pub fn is_tail(&self) -> bool {
-        self.deque.tail == Some(self.index)
+        self.deque.tail == self.index
     }
     pub fn insert_before(self, value: T) -> Self {
         let new_index = self.deque.alloc_node(value);
         let prev_index = *self.deque.prev(self.index);
-        self.deque
-            .insert_link(new_index, prev_index, Some(self.index));
+        self.deque.insert_link(new_index, prev_index, self.index);
         Cursor {
             deque: self.deque,
             index: new_index,
@@ -265,8 +296,7 @@ impl<T> Cursor<'_, T> {
     pub fn insert_after(self, value: T) -> Self {
         let new_index = self.deque.alloc_node(value);
         let next_index = *self.deque.next(self.index);
-        self.deque
-            .insert_link(new_index, Some(self.index), next_index);
+        self.deque.insert_link(new_index, self.index, next_index);
         Cursor {
             deque: self.deque,
             index: new_index,
@@ -277,21 +307,27 @@ impl<T> Cursor<'_, T> {
         let prev_index = *self.deque.prev(self.index);
         let next_index = *self.deque.next(self.index);
         self.deque.remove_link(prev_index, next_index);
-        (
-            self.deque.free_node(self.index),
-            next_index.map(|index| Cursor {
+        let value = self.deque.free_node(self.index);
+        let next_cursor = if next_index == NIL {
+            None
+        } else {
+            Some(Cursor {
                 deque: self.deque,
-                index,
+                index: next_index,
                 pos: self.pos,
-            }),
-        )
+            })
+        };
+        (value, next_cursor)
     }
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.index?;
+        if self.index == NIL {
+            return None;
+        }
+        let index = self.index;
         let item = self.deque.data(index);
         self.index = *self.deque.next(index);
         unsafe { Some(item.assume_init_ref()) }
@@ -310,21 +346,21 @@ mod tests {
 
         // 空 / 非空状态必须与 head / tail 一致。
         if deque.len == 0 {
-            assert!(deque.head.is_none());
-            assert!(deque.tail.is_none());
+            assert_eq!(deque.head, NIL);
+            assert_eq!(deque.tail, NIL);
         } else {
-            assert!(deque.head.is_some());
-            assert!(deque.tail.is_some());
+            assert_ne!(deque.head, NIL);
+            assert_ne!(deque.tail, NIL);
         }
 
         // 只要有 head，就必须没有前驱。
-        if let Some(head) = deque.head {
-            assert_eq!(deque.prev[head], None);
+        if deque.head != NIL {
+            assert_eq!(deque.prev[deque.head], NIL);
         }
 
         // 只要有 tail，就必须没有后继。
-        if let Some(tail) = deque.tail {
-            assert_eq!(deque.next[tail], None);
+        if deque.tail != NIL {
+            assert_eq!(deque.next[deque.tail], NIL);
         }
 
         // 沿 next 从 head 遍历：
@@ -332,10 +368,11 @@ mod tests {
         // 2. prev / next 必须互相一致
         // 3. 遍历出来的 live node 数量必须等于 len
         let mut current = deque.head;
-        let mut previous = None;
+        let mut previous = NIL;
         let mut live_count = 0;
 
-        while let Some(index) = current {
+        while current != NIL {
+            let index = current;
             assert!(index < deque.data.len());
             // assert!(deque.data[index].is_some());
 
@@ -343,12 +380,13 @@ mod tests {
             assert_eq!(deque.prev[index], previous);
 
             // 如果有 next，那么 next 的 prev 必须指回来。
-            if let Some(next) = deque.next[index] {
+            if deque.next[index] != NIL {
+                let next = deque.next[index];
                 assert!(next < deque.data.len());
-                assert_eq!(deque.prev[next], Some(index));
+                assert_eq!(deque.prev[next], index);
             }
 
-            previous = Some(index);
+            previous = index;
             current = deque.next[index];
 
             live_count += 1;
@@ -372,7 +410,8 @@ mod tests {
         let mut free_current = deque.free_head;
         let mut free_count = 0;
 
-        while let Some(index) = free_current {
+        while free_current != NIL {
+            let index = free_current;
             assert!(index < deque.data.len());
             // assert!(deque.data[index].is_none());
 
