@@ -1358,3 +1358,159 @@ fn iter_mut_scrambled_chain() {
     check_iter_mut_scrambled_chain::<Packed<i32>>();
     check_iter_mut_scrambled_chain::<Aos<i32>>();
 }
+
+// ============================================================
+// 两条**独特性**契约（不是性能指标，是语义保证）
+// ============================================================
+
+use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+/// 数分配次数的全局分配器（仅测试用）。
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: AllocLayout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc(l) }
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: AllocLayout) {
+        unsafe { System.dealloc(p, l) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: AllocLayout, n: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.realloc(p, l, n) }
+    }
+}
+
+#[global_allocator]
+static GA: Counting = Counting;
+
+fn count_alloc<F: FnMut()>(mut f: F) -> usize {
+    let before = ALLOCS.load(Ordering::Relaxed);
+
+    f();
+
+    ALLOCS.load(Ordering::Relaxed) - before
+}
+
+/// 规模：Miri 是解释执行 + 逐字节记录来源，1M 元素会跑成小时级；而这个属性
+/// （热路径零分配）**与规模无关**，所以 Miri 下用小规模。
+fn churn_scale() -> usize {
+    if cfg!(miri) { 64 } else { 1_000_000 }
+}
+
+/// **端操作不开分配**：容量备好之后，`pop_front` / `push_back` 走的是
+/// free-list 与现成槽位，一次 `malloc` 都不发生（对照：`LinkedList` 每个元素
+/// 一次分配；"链块"每 K 个元素一次）。这是"延迟可预测"的基础，
+/// 也是 [`List::with_capacity`] + 固定 24 B/槽 的直接推论。
+fn check_churn_does_not_allocate<S: Storage<usize> + Default>() {
+    let n = churn_scale();
+    let mut list: List<usize, S> = List::with_capacity(n);
+
+    for i in 0..n {
+        list.push_back(i);
+    }
+
+    let allocs = count_alloc(|| {
+        for i in 0..n {
+            list.pop_front();
+            list.push_back(i);
+        }
+    });
+
+    assert_eq!(allocs, 0, "热身后 churn 不该分配内存");
+    assert_eq!(list.len(), n);
+}
+
+#[test]
+fn churn_does_not_allocate() {
+    check_churn_does_not_allocate::<Soa<usize>>();
+    check_churn_does_not_allocate::<Packed<usize>>();
+    check_churn_does_not_allocate::<Aos<usize>>();
+
+    // 分配计数器本身的体检：std 的链表每个元素一次分配
+    let n = churn_scale();
+    let mut ll: std::collections::LinkedList<usize> = (0..n).collect();
+
+    let allocs = count_alloc(|| {
+        for i in 0..n {
+            ll.pop_front();
+            ll.push_back(i);
+        }
+    });
+
+    assert!(allocs > 0, "分配计数器没工作");
+}
+
+/// **状态可搬运**：整条链的全部状态就是「每槽 `(T, prev, next)` + `head` /
+/// `tail` / `free_head` / `free_tail` / `len`」，**没有任何指针**（这正是不变量
+/// "数组里每个值都是合法下标、`NIL` 从不写进数组"的用处）。所以把原始数组原样
+/// 搬进另一个容器、不做任何链接修正，语义必须完全一致（⇒ 可以直接序列化 /
+/// 放进共享内存 / mmap，不需要指针修正）。
+fn check_state_is_relocatable<S: Storage<i32> + Default>() {
+    let mut src: List<i32, S> = List::with_capacity(16);
+
+    for v in [10, 20, 30, 40, 50] {
+        src.push_back(v);
+    }
+
+    let removed = src.remove(1); // 留一个空闲槽，逼出非空 free 链
+    assert_eq!(removed, 20);
+    src.push_back(60);
+
+    let (head, tail, free_head, free_tail, len) =
+        (src.head, src.tail, src.free_head, src.free_tail, src.len);
+    let slots = src.storage.len();
+
+    let dump: Vec<(i32, usize, usize)> = (0..slots)
+        .map(|i| {
+            (
+                unsafe { *src.storage.data(i).assume_init_ref() },
+                src.storage.prev(i),
+                src.storage.next(i),
+            )
+        })
+        .collect();
+
+    // 全新的容器：只写数组与标量，不做任何"链接修正"
+    let mut dst: List<i32, S> = List::with_capacity(16);
+
+    while dst.storage.len() < slots {
+        dst.storage.grow();
+    }
+
+    for (i, &(data, prev, next)) in dump.iter().enumerate() {
+        dst.storage.data_mut(i).write(data);
+        dst.storage.set_prev(i, prev);
+        dst.storage.set_next(i, next);
+    }
+
+    dst.head = head;
+    dst.tail = tail;
+    dst.free_head = free_head;
+    dst.free_tail = free_tail;
+    dst.len = len;
+
+    assert_eq!(
+        src.iter().copied().collect::<Vec<_>>(),
+        dst.iter().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        src.iter().rev().copied().collect::<Vec<_>>(),
+        dst.iter().rev().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(src.free_head, dst.free_head);
+    assert_invariants(&dst);
+}
+
+#[test]
+fn state_is_relocatable() {
+    check_state_is_relocatable::<Soa<i32>>();
+    check_state_is_relocatable::<Packed<i32>>();
+    check_state_is_relocatable::<Aos<i32>>();
+}

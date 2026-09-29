@@ -59,6 +59,12 @@
 //! - [`CursorMut::seek`] / [`CursorMut::move_steps`]：游标按位置/步长移动
 //! - [`CursorMut::is_head`] / [`CursorMut::is_tail`]：O(1) 端点判定
 //!
+//! # 性能
+//!
+//! 数字、机制解释、`append` 两个 API 的选型矩阵，以及**已试过并否掉的优化**都在仓库
+//! 根目录的 **`PERFORMANCE.md`**；基准本体在 `benches/list.rs`，它的表头写着读数纪律
+//! （噪声底、缺页计数、交替 A/B）。
+//!
 //! # 有意不实现
 //!
 //! `PartialOrd` / `Ord` / `Hash`、`extract_if` / `retain_mut`、
