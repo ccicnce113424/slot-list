@@ -22,21 +22,55 @@ pub(crate) const NIL: usize = usize::MAX;
 /// 其 `prev` / `next` 字段地址分别是 `prev + i * prev_stride` /
 /// `next + i * next_stride`。
 #[doc(hidden)]
-pub struct Layout {
-    #[doc(hidden)]
-    pub data: *mut u8,
-    #[doc(hidden)]
-    pub data_stride: usize,
-    #[doc(hidden)]
-    pub data_offset: usize,
-    #[doc(hidden)]
-    pub prev: *const u8,
-    #[doc(hidden)]
-    pub prev_stride: usize,
-    #[doc(hidden)]
-    pub next: *const u8,
-    #[doc(hidden)]
-    pub next_stride: usize,
+pub struct Layout<T> {
+    data: *mut MaybeUninit<T>,
+    data_stride: usize,
+    data_offset: usize,
+    prev: *const usize,
+    prev_stride: usize,
+    next: *const usize,
+    next_stride: usize,
+}
+
+impl<T> Layout<T> {
+    /// 元素 `index` 的 `data` 槽地址。
+    ///
+    /// 三种布局的步长不同、`data` 还可能长在节点内部，所以只能按**字节**算地址
+    /// ——这也是基址用 `*mut u8` 风格指针的原因；但**元素类型**带在类型参数里，
+    /// 取址与解引用都由这里统一提供，使用处不必再写裸 cast。
+    #[inline]
+    pub(crate) unsafe fn data_at(&self, index: usize) -> *mut MaybeUninit<T> {
+        unsafe {
+            self.data
+                .cast::<u8>()
+                .add(index * self.data_stride + self.data_offset)
+                .cast::<MaybeUninit<T>>()
+        }
+    }
+
+    /// 元素 `index` 的 `next` 值。
+    #[inline]
+    pub(crate) unsafe fn next_at(&self, index: usize) -> usize {
+        unsafe {
+            *self
+                .next
+                .cast::<u8>()
+                .add(index * self.next_stride)
+                .cast::<usize>()
+        }
+    }
+
+    /// 元素 `index` 的 `prev` 值。
+    #[inline]
+    pub(crate) unsafe fn prev_at(&self, index: usize) -> usize {
+        unsafe {
+            *self
+                .prev
+                .cast::<u8>()
+                .add(index * self.prev_stride)
+                .cast::<usize>()
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -122,7 +156,7 @@ pub trait Storage<T>: sealed::Sealed {
     fn set_next(&mut self, index: usize, value: usize);
 
     #[doc(hidden)]
-    fn layout(&mut self) -> Layout;
+    fn layout(&mut self) -> Layout<T>;
 }
 
 // ============================================================
@@ -222,14 +256,14 @@ impl<T> Storage<T> for Soa<T> {
         unsafe { *self.next.get_unchecked_mut(index) = value };
     }
 
-    fn layout(&mut self) -> Layout {
+    fn layout(&mut self) -> Layout<T> {
         Layout {
-            data: self.data.as_mut_ptr() as *mut u8,
+            data: self.data.as_mut_ptr(),
             data_stride: size_of::<MaybeUninit<T>>(),
             data_offset: 0,
-            prev: self.prev.as_ptr() as *const u8,
+            prev: self.prev.as_ptr(),
             prev_stride: size_of::<usize>(),
-            next: self.next.as_ptr() as *const u8,
+            next: self.next.as_ptr(),
             next_stride: size_of::<usize>(),
         }
     }
@@ -334,16 +368,26 @@ impl<T> Storage<T> for Packed<T> {
         unsafe { self.links.get_unchecked_mut(index).next = value };
     }
 
-    fn layout(&mut self) -> Layout {
-        let links = self.links.as_ptr() as *const u8;
+    fn layout(&mut self) -> Layout<T> {
+        let links = self.links.as_ptr();
 
         Layout {
-            data: self.data.as_mut_ptr() as *mut u8,
+            data: self.data.as_mut_ptr(),
             data_stride: size_of::<MaybeUninit<T>>(),
             data_offset: 0,
-            prev: unsafe { links.add(offset_of!(Link, prev)) },
+            prev: unsafe {
+                links
+                    .cast::<u8>()
+                    .add(offset_of!(Link, prev))
+                    .cast::<usize>()
+            },
             prev_stride: size_of::<Link>(),
-            next: unsafe { links.add(offset_of!(Link, next)) },
+            next: unsafe {
+                links
+                    .cast::<u8>()
+                    .add(offset_of!(Link, next))
+                    .cast::<usize>()
+            },
             next_stride: size_of::<Link>(),
         }
     }
@@ -442,16 +486,27 @@ impl<T> Storage<T> for Aos<T> {
         unsafe { self.nodes.get_unchecked_mut(index).next = value };
     }
 
-    fn layout(&mut self) -> Layout {
-        let nodes = self.nodes.as_ptr() as *const u8;
+    fn layout(&mut self) -> Layout<T> {
+        let nodes = self.nodes.as_ptr();
 
         Layout {
-            data: self.nodes.as_mut_ptr() as *mut u8,
+            // 基址是节点数组本身，`data_offset` 再把地址挪到 `data` 字段
+            data: self.nodes.as_mut_ptr().cast::<MaybeUninit<T>>(),
             data_stride: size_of::<Node<T>>(),
             data_offset: offset_of!(Node<T>, data),
-            prev: unsafe { nodes.add(offset_of!(Node<T>, prev)) },
+            prev: unsafe {
+                nodes
+                    .cast::<u8>()
+                    .add(offset_of!(Node<T>, prev))
+                    .cast::<usize>()
+            },
             prev_stride: size_of::<Node<T>>(),
-            next: unsafe { nodes.add(offset_of!(Node<T>, next)) },
+            next: unsafe {
+                nodes
+                    .cast::<u8>()
+                    .add(offset_of!(Node<T>, next))
+                    .cast::<usize>()
+            },
             next_stride: size_of::<Node<T>>(),
         }
     }

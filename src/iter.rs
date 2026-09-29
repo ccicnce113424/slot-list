@@ -81,7 +81,7 @@ impl<T, S: Storage<T>> Clone for Iter<'_, T, S> {
 /// `next()` 里交出 `&'a mut T` 而不与迭代器自身状态冲突。安全性由
 /// `iter_mut(&mut self)` 的独占借用保证：迭代期间容器不会移动或重分配。
 pub struct IterMut<'a, T, S: Storage<T>> {
-    layout: Layout,
+    layout: Layout<T>,
     front: usize,
     back: usize,
     remaining: usize,
@@ -101,22 +101,17 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
-    /// 元素 `index` 的 `data` 地址。
+    /// 元素 `index` 的 `data` 槽地址。
     unsafe fn data(&self, index: usize) -> *mut MaybeUninit<T> {
-        unsafe {
-            self.layout
-                .data
-                .add(index * self.layout.data_stride + self.layout.data_offset)
-                as *mut MaybeUninit<T>
-        }
+        unsafe { self.layout.data_at(index) }
     }
 
     unsafe fn next_of(&self, index: usize) -> usize {
-        unsafe { *(self.layout.next.add(index * self.layout.next_stride) as *const usize) }
+        unsafe { self.layout.next_at(index) }
     }
 
     unsafe fn prev_of(&self, index: usize) -> usize {
-        unsafe { *(self.layout.prev.add(index * self.layout.prev_stride) as *const usize) }
+        unsafe { self.layout.prev_at(index) }
     }
 }
 
