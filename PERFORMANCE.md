@@ -11,10 +11,10 @@ free-list 串起来复用；三种内存布局（`SoaList` / `PackedList` / `Aos
 | 问题 | 结论（当日全套，1M 元素） |
 |---|---|
 | 端操作 `push`+`pop`（不预分配） | 比 `VecDeque` 慢 2.4~3.0×，与 `LinkedList` 同级（6.1~7.5 vs 5.8~6.0 ms）——这组由**缺页与拷贝量**支配（§3.1） |
-| 稳态端操作 `churn`（无分配） | **比 `LinkedList` 快 2.3×**（2.81 vs 6.45 ms），比 `VecDeque` 慢 1.63×（§3.4） |
-| 迭代 | 与 `LinkedList` 同级（1.14 vs 1.07 ms；~1.1 ns/元素 = 依赖加载下限）；**64 B 载荷下比它快 1.74×**（§3.2） |
+| 稳态端操作 `churn`（无分配） | **比 `LinkedList` 快 2.2×**（2.75 vs 6.15 ms），比 `VecDeque` 慢 1.6×（§3.4） |
+| 迭代 | 与 `LinkedList` 同级（1.21 vs 1.05 ms；~1.1 ns/元素 = 依赖加载下限）；**64 B 载荷下比它快 1.74×**（§3.2） |
 | 中间位置插删 | 与 `LinkedList` 同级、比 `VecDeque` 快 150×（后者每次要 memmove 50 万元素）（§3.3） |
-| 内存/槽 | **固定 24 B**（T=8）；`Aos` 在 T=64 时多 8 B（§2） |
+| 内存/槽 | **固定 16 B**（T=8，默认 `u32` 索引；换 `usize` 是 24 B）；三种布局在 T=64 上统一 72 B（§2） |
 | 与 std `LinkedList` 的关键差异 | ① 无每节点分配（`churn` / `blob_end_ops` 领先的原因）；② `append` 不是 O(1) 指针拼接（§3.6） |
 | 已确认到顶 | **在本库这个形状内**：迭代的"沿链走"、`append` 的拷贝（已到带宽）——三条路线都实现/建模过并否掉（§4）。想更快只能换形状：分块 ≈ `LinkedList<Vec<T>>`，全项更快，但没有元素级游标/稳定句柄（§4 末） |
 | 独特价值（性能之外） | **稳定句柄 `Slot`（O(1) 进入/删除/搬移，实测比按位置快约 4 万倍）**、热路径零分配（有测试）、状态可搬运（有测试）、布局可换——见 §8 |
@@ -46,14 +46,15 @@ free-list 串起来复用；三种内存布局（`SoaList` / `PackedList` / `Aos
 元素 i 的 next 值   = *(next 基址 + i * next_stride)
 ```
 
-| 布局 | 内存/槽（T=8 / T=64） | `data_stride` | `data_offset` | `prev`·`next` 步长 | 结构 |
+| 布局 | 内存/槽（T=8 / T=64，默认 `u32`） | `data_stride` | `data_offset` | `prev`·`next` 步长 | 结构 |
 |---|---|---|---|---|---|
-| `Soa<T>` | **24 / 72** B | 8 / 64 | 0 | 8 | 三个独立 `Vec` |
-| `Packed<T>` | **24 / 72** B | 8 / 64 | 0 | 16 | `data` + `Link{prev,next}` 交错 |
-| `Aos<T>` | **24 / 80** B | 24 / 80 | 0 | 24 / 80 | 一个 `Vec<Node<T>>` |
+| `Soa<T, I>` | **16 / 72** B | 8 / 64 | 0 | 4 | 三个独立 `Vec` |
+| `Packed<T, I>` | **16 / 72** B | 8 / 64 | 0 | 8（`Link<I>`） | `data` + `Link{prev,next}` 交错 |
+| `Aos<T, I>` | **16 / 72** B | 16 / 72 | 0 | 16 / 72 | 一个 `Vec<Node<T, I>>` |
 
-（`Aos` 在 T=64 时每槽多 8 B：`Node` = 64 + 8 + 8 已经越过 cache line，padding 无处可省；
-T=8/16/32/48 时三种布局大小相同。）
+（上表是**索引宽度 `u32`** 的实测值，也是默认；`I = usize` 时三种布局的每槽全部 +8 B
+——`Soa`/`Packed` 24 B、`Aos` 24 B（T=64 时 80 B，`Node` 越过 cache line 后 padding 无处可省）。
+`data_offset` 三种布局、两种宽度下实测都是 0。）
 
 关于 `Node<T>` 的字段次序（`repr(Rust)`）：
 
@@ -69,6 +70,10 @@ T=8/16/32/48 时三种布局大小相同。）
 
 ## 3. 全套结果
 
+> **2026-09-29 起索引宽度默认 `u32`**（`Ix` 参数，见 §4 第 5 条）：每槽 16 B、`append` −37%。
+> 下面各表已按新默认重测（1M 元素）；`iteration` 与 `churn` 的变化最明显，
+> 其余在 ±5% 噪声内。`§3.2` 的"三层拆解"与 `§3.6` 的带宽对账仍是 `usize` 时代量级。
+
 ### 3.1 端操作 `end_ops`（1M 次 push + 1M 次 pop）
 
 同一份 `push_back`/`pop_front` 与 `push_front`/`pop_back` 流程，五种实现：
@@ -78,7 +83,7 @@ T=8/16/32/48 时三种布局大小相同。）
 | `push_back` + `pop_front` | 6.08 ms | 6.44 ms | 6.13 ms | 2.53 ms | 5.79 ms |
 | `push_front` + `pop_back` | 7.49 ms | 6.24 ms | 5.64 ms | 2.10 ms | 5.99 ms |
 
-这一组**不预分配**，量的是"边扩边搬 + 每页首次触碰"：每槽 24 B（`VecDeque` 是 8 B）⇒ 页数
+这一组**不预分配**，量的是"边扩边搬 + 每页首次触碰"：每槽 16 B（`VecDeque` 是 8 B）⇒ 页数
 与拷贝量都是 3×，`VecDeque` 那 2.1~2.5 ms 的优势主要来自这里，不是代码快。组内布局差异
 （最大 ±23%）落在本组噪声底（±10~20%）内，别硬读。
 
@@ -86,7 +91,7 @@ T=8/16/32/48 时三种布局大小相同。）
 
 | 形态 | SoaList | PackedList | AosList | VecDeque | LinkedList | Vec |
 |---|---|---|---|---|---|---|
-| `iteration`（1M × 8 B，全量迭代） | 1.14 ms | 1.40 ms | 1.59 ms | 308.3 µs | 1.07 ms | 71.7 µs |
+| `iteration`（1M × 8 B，全量迭代） | 1.21 ms | **1.10 ms** | **1.32 ms** | 310.4 µs | 1.05 ms | 80.7 µs |
 | `blob_iter`（250k × 64 B） | 378.8 µs | 473.0 µs | 562.7 µs | 240.6 µs | 660.4 µs | 240.9 µs |
 
 把迭代拆成三层（内部探针，min/9 轮，ns/元素）：
@@ -128,7 +133,7 @@ T=8/16/32/48 时三种布局大小相同。）
 
 | 形态 | SoaList | PackedList | AosList | VecDeque | LinkedList |
 |---|---|---|---|---|---|
-| `churn`（1M 次 pop_front+push_back） | 2.81 ms | 2.81 ms | 2.85 ms | 1.73 ms | 6.45 ms |
+| `churn`（1M 次 pop_front+push_back） | 2.75 ms | 3.00 ms | 2.72 ms | 1.68 ms | 6.15 ms |
 | `random_remove_insert`（100 次随机位置删+插） | 28.55 ms | 32.44 ms | 37.52 ms | 4.60 ms | 32.18 ms |
 | `cursor_update`（链中点原地读写 1M 次） | 1.19 ms | 1.26 ms | 1.34 ms | 672.2 µs | 2.45 ms |
 
@@ -185,10 +190,10 @@ T=8/16/32/48 时三种布局大小相同。）
 
 - **下标改写免费**：`extend(map(|i| i + base))` 与 `extend_from_slice` 同速（甚至更快，
   省掉 memcpy 库调用）⇒ 加偏移不是开销来源。
-- 差距全是**搬的字节数**：每槽 24 B（data+prev+next）对 `Vec` 的 8 B；两边都因扩容把
+- 差距全是**搬的字节数**：每槽 16 B（data+prev+next，`u32` 索引）对 `Vec` 的 8 B；两边都因扩容把
   每个字节搬两遍（`realloc` 搬旧数据 + 追加拷贝）= 4× 载荷。所有测点落在同一带宽区间
   （21~31 GB/s），我们 per-byte 甚至略好。
-- 想追平只有两条（都实测）：索引降到 u32 ⇒ 16 B/槽、**−37%**；目标预置容量不扩容
+- 想追平只有两条（都实测）：索引降到 u32（**现在是默认**）⇒ 16 B/槽、**−37%**；目标预置容量不扩容
   ⇒ **−57%**（后者要求分配器保持页热）。
 
 **整块搬的代价几乎全在"目标要不要新页"**（同一形态，只换环境）：
@@ -264,7 +269,7 @@ T=8/16/32/48 时三种布局大小相同。）
 | 2 | 分块 + 块内顺序**由位置隐含**（= unrolled linked list） | 迭代 **8~13×**（实测 0.084~0.136 vs 1.10 ns/元素） | 插删要搬块内元素 ⇒ **下标不再稳定**；而且**不需要自己写**——见 §4 末 |
 | 3 | 维护顺行位图（每槽 1 bit：`next(i)==i+1`） | 迭代 **2.5×** | 每次链写入 +1 store ⇒ `churn` **2.80 → 5.66 ms（慢一倍）** |
 | 4 | 迭代器侧探路（段用尽时并行读 8 个 `next` 候选） | 独立探针 1.6× | crate 内实测 **2.40 vs 1.09 ns/元素（慢一倍）**，原因未定位 ⇒ 不发货 |
-| 5 | 索引降到 u32 | `append` **−37%**（T=8）／−10%（T=64）；内存 24→16 B/槽 | 槽位上限 4G；要参数化布局或新增布局 ⇒ 未做 |
+| 5 | 索引降到 u32 | **已做成默认**（`Ix` 参数）：`append` **−37%**（T=8，3.07 vs 4.86 ms）、内存 24→**16 B/槽**；`churn`/`iteration`/`middle_access` 持平（±1%） | 槽位上限 2.1G（`u32` 的最高位留给空闲标记）；踩过一个坑：`grow` 里的触顶 `assert!` 带 `{}` 参数会把格式化机器拖进去 ⇒ 内联器放弃内联 `alloc_slot` ⇒ **churn +47%**（循环里出现 `call`），改用 `#[cold]` helper 后归零 |
 | 6 | `append` 前先 `reserve` | 无可测收益 | std 的 `Vec::append` 内部本来就先 reserve；`reserve_exact` 反而更贵（实测 3.9→7.5 ms） |
 | 7 | `Aos` 字段次序（`data` 居中/前置） | 噪声内 | 见 §2：cache line 集合相同 |
 | 8 | 库内 `madvise(MADV_HUGEPAGE)` | 好时 8.2 → 1.1~1.4 ms | 本机 THP `madvise` 模式 + `nr_hugepages=0`，复测不稳定（5860 缺页）⇒ 只能靠环境变量 |
@@ -284,14 +289,14 @@ K=64，与我们的 `SoaList` 同机同期对照：
 | `at(N/2)`（走到中间） | 1.08 ns/元素 | **0.013** | 83× |
 | `churn`（`pop_front`+`push_back`） | 2.81 ns/op | **1.70** | 1.65× |
 | `end_ops`（push 1M + pop 1M，不预分配） | 3.04 ns/op | **0.93** | 3.3× |
-| 内存/槽 | 24 B | **~9 B** | 2.7× |
+| 内存/槽 | 16 B | **~9 B** | 1.8× |
 | 元素级游标 / 稳定槽位身份 | ✓ | ✗ | — |
 
 - "分块"就是 **unrolled linked list ≈ `LinkedList<Vec<T>>` 这一类**（块内连续 + 块间链）。
   迭代那 8~13× 不是某种自有设计的功劳，std 组合同样拿得到；`VecDeque` 当块反而更差
   （K=64 时迭代 0.303 vs `Vec` 块 0.094——deque 的内容可能跨环回卷，迭代器流不起来）。
 - 而且它在上面四项上**全面赢本库**：块内是裸数组（一次 `Vec::push` / `head += 1`），我们每次
-  端操作要改 4~8 个链接字段（两个邻居 + free-list 的 push/pop），内存还高三倍（24 vs ~9 B/槽）
+  端操作要改 4~8 个链接字段（两个邻居 + free-list 的 push/pop），内存还高 1.8 倍（16 vs ~9 B/槽）
   ⇒ 端到端输在**每槽字节数**，`churn` 输在**每操作字段数**。
 - 本库剩下的差异只有三条，全在**语义**而不是吞吐上：
   ① **元素级游标**（`at(pos)` / `insert_before` / `insert_after` / 幽灵位置 / 环形移动）；
@@ -309,9 +314,9 @@ K=64，与我们的 `SoaList` 同机同期对照：
 | `clear`：追链表 vs 扫描槽位（1M 槽位） | 密集 1.11 → 0.50 ms（扫描快 2.2×）；稀疏（1000 live）**1.42 µs → 464 µs（慢 327×）**；密集 + Drop glue 3.18 → 3.60 ms ⇒ **保留追链表** | `List::clear` 文档 + `clear_drop` 组 |
 | `Drop`：只走 live 链就地析构 vs 经 `clear`（1M） | `usize`（纯记账）**1.172 ms → 2.37 µs**；带 Drop glue Soa **3.13 → 1.96 ms（1.6×）**、Aos 2.84 → 2.38 ms | `List` 的 `Drop` 文档 + `clear_drop` 组 |
 | 迭代三层拆解（1M×`usize`，ns/元素） | `iter()` 1.08 / 自己沿链走 1.14 / 顺序扫槽位 **0.062**（Soa）；Aos 1.29 / 1.34 / 0.478 | 本文 §3.2 |
-| `append` 字节对账（mimalloc，1M⊕1M） | 我们 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **差距全在搬的字节数**（24 B/槽 vs 8 B/槽，各自因扩容搬两遍） | §3.6 |
+| `append` 字节对账（mimalloc，1M⊕1M） | 我们 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **差距全在搬的字节数**（16 B/槽 vs 8 B/槽，各自因扩容搬两遍） | §3.6 |
 | 下标改写（`map(\|i\| i + base)`）成本 | 与 `extend_from_slice` 同速（甚至更快）⇒ **加偏移免费** | §3.6 |
-| 尺寸固定开销 | 24 B/槽：T=8 时是载荷的 3×，T=64 时是 37% | §2 |
+| 尺寸固定开销 | 16 B/槽（`u32`）：T=8 时是载荷的 2×，T=64 时是 12.5% | §2 |
 
 ---
 
@@ -394,7 +399,7 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 
 2. **热路径零分配**：容量备好后 `pop_front`/`push_back` 一次 `malloc` 都不发生
    （测试 `churn_does_not_allocate`：三种布局 1M 次 churn = **0** 次；对照 `LinkedList`
-   1,000,000 次、链块 K=64 31,250 次）。配合固定 24 B/槽与 `with_capacity` ⇒ 内存与延迟
+   1,000,000 次、链块 K=64 31,250 次）。配合固定 16 B/槽与 `with_capacity` ⇒ 内存与延迟
    都可预测（`clear` 后槽位进 free-list 复用，不还给内核）。
 3. **状态可搬运、无指针**：整条链的全部状态 = 每槽 `(T, prev, next)` + `head`/`tail`/
    `free_head`/`free_tail`/`len`（测试 `state_is_relocatable`：原样搬进新容器，迭代与不变量
@@ -420,12 +425,12 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 | 组（规模） | 本库 `SoaList` | `FastList` | 倍数 | `LinkedList` | `VecDeque` |
 |---|---|---|---|---|---|
 | `end_ops/push_back_pop_front`（1M push + 1M pop） | **7.11 ms** | 12.54 ms | 1.8× | 5.37 ms | 2.58 ms |
-| `iteration`（1M 元素） | **1.135 ms** | 1.76 ms | 1.55× | 1.07 ms | 0.31 ms |
-| `middle_access`（100 次 N/2） | **54.1 ms** | 81.6 ms | 1.5× | 55.0 ms | 57 ns |
-| `middle_insert_remove`（N/2 处 1000 次插删） | **549 µs** | 828 µs | 1.5× | 496 µs | 88.3 ms |
-| `churn`（1M 次 pop+push） | **2.79 ms** | 5.28 ms | 1.9× | 6.03 ms | 1.71 ms |
+| `iteration`（1M 元素） | **1.21 ms** | 1.72 ms | 1.4× | 1.05 ms | 0.31 ms |
+| `middle_access`（100 次 N/2） | **54.4 ms** | 85.3 ms | 1.6× | 54.5 ms | 68 ns |
+| `middle_insert_remove`（N/2 处 1000 次插删） | **561 µs** | 821 µs | 1.5× | 489 µs | 96.6 ms |
+| `churn`（1M 次 pop+push） | **2.75 ms** | 5.09 ms | 1.9× | 6.15 ms | 1.68 ms |
 | `random_remove_insert`（100 个随机位置） | **28.8 ms** | 43.3 ms | 1.5× | 29.8 ms | 4.67 ms |
-| `slot_entry::by_handle`（100 次句柄入口） | **711 ns** | 44.6 ms | **6.3 万×** | — | — |
+| `slot_entry::by_handle`（100 次句柄入口） | **664 ns** | 43.5 ms | **6.5 万×** | — | — |
 | `slot_entry::by_pos`（100 次位置入口） | **29.0 ms** | 43.8 ms | 1.5× | — | — |
 
 读数注意：`end_ops` 量的是分配器（本文件 §1 的读数纪律，±20%），其余组 ±5%。
@@ -460,7 +465,7 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 | 有序遍历 / `retain` / `split_off` | ✓ | ✓ |
 | 按**值**查找 `contains` | ✓ | ✗（只有按句柄的 `contains_key`） |
 | 布局可选 | ✓ 三种（Soa / Packed / Aos） | ✗ 一种 |
-| 每槽内存（T=8） | **24 B**（data + prev + next，§2 已核对） | `LinkedListItem<usize>` = **32 B**（value + index + next + prev），**外加** slotmap 每槽的版本/占用元数据 |
+| 每槽内存（T=8） | **16 B**（data + prev + next，索引 `u32`，§2 已核对） | `LinkedListItem<usize>` = **32 B**（value + index + next + prev），**外加** slotmap 每槽的版本/占用元数据 |
 | 热路径零分配 | ✓ `churn_does_not_allocate` | ✓ 同一测试里也钉了（两边都是 0 次 malloc） |
 | 可见的 `unsafe` | 核心是 unchecked 读写 + 裸地址迭代器，靠 miri + 全套测试兜 | **0 处**（整包 `unsafe` 计数为 0）⇒ 审计/信任成本更低 |
 | 依赖 | 无（纯 std） | `slotmap`（+ 可选 `unstable` 特性开 `Walker`） |

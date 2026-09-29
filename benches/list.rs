@@ -1030,6 +1030,56 @@ fn fastlist_by_pos(list: &mut FastList<usize>, positions: &[usize]) {
 // Criterion groups
 // ============================================================
 
+// ============================================================
+// 索引宽度对照：`SoaList<usize, u32>` vs `SoaList<usize, usize>`
+//
+// 每槽开销 = `T` + 两条链接 ⇒ `T = 8` 时 16 B vs 24 B。谁受益取决于
+// 链接数组的访存占比：走链（`at(pos)`）与迭代最明显，端操作/句柄入口最小。
+// ============================================================
+
+bench_construct!(make_soa32, SoaList<usize, u32>);
+bench_construct!(make_soa64, SoaList<usize, usize>);
+bench_churn!(soa32_churn, SoaList<usize, u32>);
+bench_churn!(soa64_churn, SoaList<usize, usize>);
+bench_iter!(soa32_iter, SoaList<usize, u32>);
+bench_iter!(soa64_iter, SoaList<usize, usize>);
+bench_at_middle!(soa32_at_middle, SoaList<usize, u32>);
+bench_at_middle!(soa64_at_middle, SoaList<usize, usize>);
+bench_append!(soa32_append, SoaList<usize, u32>);
+bench_append!(soa64_append, SoaList<usize, usize>);
+
+fn index_width(c: &mut Criterion) {
+    let mut soa32 = make_soa32();
+    let mut soa64 = make_soa64();
+    let mut g = c.benchmark_group("index_width");
+
+    g.bench_function("churn/u32", |b| b.iter(|| soa32_churn(&mut soa32)));
+    g.bench_function("churn/usize", |b| b.iter(|| soa64_churn(&mut soa64)));
+    g.bench_function("iteration/u32", |b| b.iter(|| soa32_iter(&soa32)));
+    g.bench_function("iteration/usize", |b| b.iter(|| soa64_iter(&soa64)));
+    g.bench_function("middle_access/u32", |b| {
+        b.iter(|| soa32_at_middle(&mut soa32))
+    });
+    g.bench_function("middle_access/usize", |b| {
+        b.iter(|| soa64_at_middle(&mut soa64))
+    });
+    g.bench_function("append/u32", |b| {
+        b.iter_batched(
+            || (make_soa32(), make_soa32()),
+            |(a, b)| soa32_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("append/usize", |b| {
+        b.iter_batched(
+            || (make_soa64(), make_soa64()),
+            |(a, b)| soa64_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.finish();
+}
+
 fn end_ops(c: &mut Criterion) {
     let mut g = c.benchmark_group("end_ops/push_back_pop_front");
     g.bench_function("SoaList", |b| b.iter(soalist_push_back_pop_front));
@@ -1657,6 +1707,7 @@ criterion_group! {
         blob_end_ops,
         slot_entry,
         clear_drop,
+        index_width,
 }
 
 criterion_main!(benches);

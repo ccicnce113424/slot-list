@@ -1398,6 +1398,155 @@ fn check_drop_panic<S: Storage<PanicOnDrop> + Default>() {
 }
 
 /// `Drop` 中途 panic 的语义：泄漏剩余元素，但绝不重复析构（照 `Vec::clear` 的约定）。
+/// 索引宽度可调：每种宽度跑同一套不变量检查。`IterMut` 的裸地址链接读按宽度分派，
+/// 4 字节那条路只有窄索引才会走到 —— 不测就是未覆盖的 UB 面。
+fn check_index_width<S: Storage<i32> + Default>(count: usize) {
+    let mut list: List<i32, S> = List::with_capacity(4);
+
+    for i in 0..count as i32 {
+        list.push_back(i);
+    }
+
+    assert_invariants(&list);
+    assert_eq!(
+        list.iter().copied().collect::<Vec<_>>(),
+        (0..count as i32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        list.iter_mut().map(|v| *v).collect::<Vec<_>>(),
+        (0..count as i32).collect::<Vec<_>>()
+    );
+
+    // 删几个再插回去：free 链 + 空闲标记位都要在窄整数上正确（标记位是 Ix 的最高位）
+    for _ in 0..count / 4 {
+        let value = list.pop_front().unwrap();
+
+        list.push_back(value);
+    }
+
+    list.remove(0);
+    list.push_front(-1);
+    assert_invariants(&list);
+
+    assert_eq!(list.iter_mut().count(), count);
+}
+
+#[test]
+fn index_widths_all_behave() {
+    // 上限：u8 ⇒ 128、u16 ⇒ 32768 ⇒ 这里分别用 127 / 1000 个元素
+    check_index_width::<Soa<i32, u8>>(127);
+    check_index_width::<Soa<i32, u16>>(1000);
+    check_index_width::<Soa<i32, u32>>(1000);
+    check_index_width::<Soa<i32, u64>>(1000);
+    check_index_width::<Soa<i32, usize>>(1000);
+
+    check_index_width::<Packed<i32, u8>>(127);
+    check_index_width::<Packed<i32, u32>>(1000);
+    check_index_width::<Aos<i32, u8>>(127);
+    check_index_width::<Aos<i32, u16>>(1000);
+    check_index_width::<Aos<i32, u32>>(1000);
+}
+
+/// 每槽字节数只由 `T` 与索引宽度决定。
+#[test]
+fn per_slot_bytes_by_index_width() {
+    fn per_slot<T, I: Ix>() -> usize {
+        let mut storage: Soa<T, I> = Soa::new();
+
+        storage.grow();
+
+        let layout = storage.layout();
+
+        layout.data_stride + layout.prev_stride + layout.next_stride
+    }
+
+    assert_eq!(per_slot::<usize, usize>(), 24);
+    assert_eq!(per_slot::<usize, u64>(), 24);
+    assert_eq!(per_slot::<usize, u32>(), 16);
+    assert_eq!(per_slot::<usize, u16>(), 12);
+    assert_eq!(per_slot::<usize, u8>(), 10);
+    assert_eq!(per_slot::<[u64; 8], u32>(), 64 + 4 + 4);
+
+    // 默认宽度就是 u32 ⇒ 三种布局在 T=8 上都是 16 B/槽
+    let mut soa: Soa<usize> = Soa::new();
+    let mut packed: Packed<usize> = Packed::new();
+    let mut aos: Aos<usize> = Aos::new();
+
+    soa.grow();
+    packed.grow();
+    aos.grow();
+
+    for (name, bytes) in [
+        (
+            "Soa",
+            soa.layout().data_stride + soa.layout().prev_stride + soa.layout().next_stride,
+        ),
+        (
+            "Packed",
+            packed.layout().data_stride + packed.layout().prev_stride,
+        ),
+        // Aos 的 data 就在 Node 里 ⇒ 每槽就是 Node 的大小（strides 都是它，别重复算）
+        ("Aos", aos.layout().data_stride),
+    ] {
+        assert_eq!(bytes, 16, "{name} 的默认每槽字节数（T=8, Ix=u32）");
+    }
+}
+
+/// `Packed` 触顶同样要 panic。
+#[test]
+#[should_panic(expected = "槽位数超出索引宽度上限")]
+fn packed_index_caps_out() {
+    let mut list = PackedList::<u8, u8>::new();
+
+    for i in 0..=128u8 {
+        list.push_back(i);
+    }
+}
+
+/// `Aos` 触顶同样要 panic。
+#[test]
+#[should_panic(expected = "槽位数超出索引宽度上限")]
+fn aos_index_caps_out() {
+    let mut list = AosList::<u8, u8>::new();
+
+    for i in 0..=128u8 {
+        list.push_back(i);
+    }
+}
+
+/// 触顶要**响亮地 panic**，不能静默截断（否则就是内存错乱）。
+#[test]
+#[should_panic(expected = "槽位数超出索引宽度上限")]
+fn narrow_index_caps_out() {
+    let mut list = SoaList::<u8, u8>::new();
+
+    for i in 0..=128u8 {
+        list.push_back(i);
+    }
+}
+
+/// `PhantomData<T>`（`List::marker`）带来的两条**编译期**性质：能编过即成立。
+///
+/// - 对 `T` **协变**（与三种 `Storage` 一致）⇒ `&'static` 版本能当 `&'a` 版本用；
+///   若哪天换成 `PhantomData<fn(T) -> T>` 之类，`covariant` 就编不过了。
+/// - `Send` / `Sync` 跟着 `T` 走；`List<MutexGuard<'_>, _>` 之类仍然正确地不是 `Send`。
+#[test]
+fn auto_traits_and_variance() {
+    fn assert_send_sync<X: Send + Sync>() {}
+
+    assert_send_sync::<SoaList<usize>>();
+    assert_send_sync::<PackedList<usize>>();
+    assert_send_sync::<AosList<usize>>();
+
+    fn covariant<'a>(list: SoaList<&'static str>) -> SoaList<&'a str> {
+        list
+    }
+
+    let list: SoaList<&'static str> = SoaList::new();
+
+    assert!(covariant(list).is_empty());
+}
+
 #[test]
 fn drop_panic_leaks_rest() {
     check_drop_panic::<Soa<PanicOnDrop>>();

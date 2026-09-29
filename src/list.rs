@@ -46,11 +46,26 @@ pub struct List<T, S: Storage<T>> {
     /// live 元素个数。
     pub(crate) len: usize,
     pub(crate) storage: S,
+    /// 只为"用上 `T`"而存在：`List` 是对**任意** `S: Storage<T>` 定义的，而 `T` 只出现在
+    /// 这条 bound 里——Rust **不把 where 子句里的出现算作"被使用"**，删掉这个字段就是
+    /// `error[E0392]: type parameter `T` is never used`（实测；注意 `SoaList<T> = List<T, Soa<T>>`
+    /// 这种**具体别名**里 `T` 会经由 `Soa<T>` 进到字段类型，所以别名不受影响，受影响的是
+    /// 泛型定义本身）。
+    ///
+    /// 选 `PhantomData<T>` 而不是别的 marker，是因为它的含义恰好与真实情况一致：
+    ///
+    /// - **拥有 `T`**：`List<T, S>` 析构时确实会析构 `T`（[`Drop`](List#impl-Drop) 走 live 链
+    ///   逐个 `assume_init_drop`），dropck 需要知道这一点；
+    /// - **对 `T` 协变**：与三种 `Storage`（`Vec<MaybeUninit<T>>` / `Link<T>` / `Node<T>`）一致
+    ///   ⇒ `SoaList<&'static str>` 能当 `SoaList<&'a str>` 用；
+    /// - **auto traits 跟着 `T`**：`List<T, S>: Send` 当且仅当 `T: Send`（`Sync` 同理）。
+    ///
+    /// 后两条有编译期测试（`tests::auto_traits_and_variance`）。
     marker: PhantomData<T>,
 }
 
-impl<T> List<T, Soa<T>> {
-    /// 空链表（SoA 布局）。
+impl<T, I: crate::Ix> List<T, Soa<T, I>> {
+    /// 空链表（SoA 布局；索引宽度由 `Soa` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
             storage: Soa::new(),
@@ -64,8 +79,8 @@ impl<T> List<T, Soa<T>> {
     }
 }
 
-impl<T> List<T, Packed<T>> {
-    /// 空链表（Packed 布局）。
+impl<T, I: crate::Ix> List<T, Packed<T, I>> {
+    /// 空链表（Packed 布局；索引宽度由 `Packed` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
             storage: Packed::new(),
@@ -79,8 +94,8 @@ impl<T> List<T, Packed<T>> {
     }
 }
 
-impl<T> List<T, Aos<T>> {
-    /// 空链表（AoS 布局）。
+impl<T, I: crate::Ix> List<T, Aos<T, I>> {
+    /// 空链表（AoS 布局；索引宽度由 `Aos` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
             storage: Aos::new(),

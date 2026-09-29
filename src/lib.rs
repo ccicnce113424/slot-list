@@ -29,11 +29,14 @@
 //!
 //! 三种内存布局共用**同一份实现**：
 //!
-//! | 别名 | 布局 | 结构 |
-//! |---|---|---|
-//! | [`SoaList`] | [`Soa`] | `data` / `prev` / `next` 三个独立 `Vec` |
-//! | [`PackedList`] | [`Packed`] | `data` 一个 `Vec`，`prev`/`next` 打包成 `Link` |
-//! | [`AosList`] | [`Aos`] | 三者放进一个 `Node` |
+//! | 别名 | 布局 | 每槽（T=8 / T=64） | 结构 |
+//! |---|---|---|---|
+//! | [`SoaList`] | [`Soa`] | 16 / 72 B | `data` / `prev` / `next` 三个独立 `Vec` |
+//! | [`PackedList`] | [`Packed`] | 16 / 72 B | `data` 一个 `Vec`，`prev`/`next` 放进同一个 `Link` |
+//! | [`AosList`] | [`Aos`] | 16 / 72 B | 三者放进一个 `Node` |
+//!
+//! 别名第二个参数是**索引宽度**（[`Ix`]），默认 `u32`：每槽比 `usize` 省 1/3，
+//! `append` 快 37%，其余持平；代价是槽位上限 2.1G（见 [`Ix::MAX_SLOTS`]）。
 //!
 //! 三者都是 [`List<T, S>`] 的别名，所有逻辑只写一遍，布局差异由
 //! [`Storage`] 策略提供。
@@ -117,13 +120,19 @@ pub use cursor::{Cursor, CursorMut};
 pub use iter::{IntoIter, Iter, IterMut};
 pub use list::List;
 pub use slot::Slot;
-pub use storage::{Aos, Packed, Soa, Storage};
+pub use storage::{Aos, Ix, Packed, Soa, Storage};
 
 /// SoA 布局：`data` / `prev` / `next` 三个独立 `Vec`。
-pub type SoaList<T> = List<T, Soa<T>>;
+///
+/// 第二个参数是**索引宽度**（[`Ix`]：`u8` / `u16` / `u32` / `u64` / `usize`），
+/// 直接决定每槽多少字节：`T = 8` 时 `usize` 是 24 B/槽、`u32` 是 **16 B**、`u16` 是 12 B。
+/// 代价是槽位数上限（`u32` ⇒ 2.1G、`u16` ⇒ 32k、`u8` ⇒ 128，超过就 panic）。
+pub type SoaList<T, I = u32> = List<T, Soa<T, I>>;
 
 /// Packed 布局：`data` 一个 `Vec`，`prev`/`next` 交错放在另一个 `Vec`。
-pub type PackedList<T> = List<T, Packed<T>>;
+/// 第二个参数是索引宽度（同 [`SoaList`]）。
+pub type PackedList<T, I = u32> = List<T, Packed<T, I>>;
 
 /// AoS 布局：`data` / `prev` / `next` 放进单个 `Node`。
-pub type AosList<T> = List<T, Aos<T>>;
+/// 第二个参数是索引宽度（同 [`SoaList`]）。
+pub type AosList<T, I = u32> = List<T, Aos<T, I>>;

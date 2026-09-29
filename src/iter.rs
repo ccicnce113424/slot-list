@@ -111,24 +111,39 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
+    /// 按链接宽度读一个下标并加宽。
+    ///
+    /// **不能**直接 `cast::<usize>()` 解引用：链接可能是 4 字节（`Soa<T, u32>`），
+    /// 地址只有 4 字节对齐 ⇒ 未对齐读是 UB（miri 会报）。宽度在迭代器生命周期内不变，
+    /// 所以 `match` 的判别式是循环不变量（LLVM 会把它提出循环，分支也可预测）。
+    #[inline(always)]
+    unsafe fn read_ix(ptr: *const u8, width: usize) -> usize {
+        unsafe {
+            match width {
+                1 => ptr.read() as usize,
+                2 => ptr.cast::<u16>().read_unaligned() as usize,
+                4 => ptr.cast::<u32>().read_unaligned() as usize,
+                _ => ptr.cast::<u64>().read_unaligned() as usize,
+            }
+        }
+    }
+
     unsafe fn next_of(&self, slot: usize) -> usize {
         unsafe {
-            *self
-                .layout
-                .next
-                .add(slot * self.layout.next_stride)
-                .cast::<usize>()
+            Self::read_ix(
+                self.layout.next.add(slot * self.layout.next_stride),
+                self.layout.ix_width,
+            )
         }
     }
 
     /// 只对 **live** 槽位调用（`Layout` 读的是裸值：空闲槽的 `prev` 是空闲标记位）。
     unsafe fn prev_of(&self, slot: usize) -> usize {
         unsafe {
-            *self
-                .layout
-                .prev
-                .add(slot * self.layout.prev_stride)
-                .cast::<usize>()
+            Self::read_ix(
+                self.layout.prev.add(slot * self.layout.prev_stride),
+                self.layout.ix_width,
+            )
         }
     }
 }
