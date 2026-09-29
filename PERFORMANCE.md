@@ -268,6 +268,7 @@ T=8/16/32/48 时三种布局大小相同。）
 | 6 | `append` 前先 `reserve` | 无可测收益 | std 的 `Vec::append` 内部本来就先 reserve；`reserve_exact` 反而更贵（实测 3.9→7.5 ms） |
 | 7 | `Aos` 字段次序（`data` 居中/前置） | 噪声内 | 见 §2：cache line 集合相同 |
 | 8 | 库内 `madvise(MADV_HUGEPAGE)` | 好时 8.2 → 1.1~1.4 ms | 本机 THP `madvise` 模式 + `nr_hugepages=0`，复测不稳定（5860 缺页）⇒ 只能靠环境变量 |
+| 9 | `clear` 改成**按内存顺序扫 `data`**、用 `is_free` 判断（不追链） | 密集（无 Drop glue）**2.2×**（1.11 → 0.50 ms） | **稀疏（1M 槽位、1000 live）1.42 µs → 464 µs，慢 327×**；带 Drop glue 连密集也慢 12%（3.18 → 3.60 ms）；复杂度 O(live) → O(slots) ⇒ 否 |
 
 ---
 
@@ -304,6 +305,8 @@ K=64，与我们的 `SoaList` 同机同期对照：
 | 项目 | 数字 | 出处 |
 |---|---|---|
 | `clear` vs "一直 `pop` 到空" | 8 B **1.2×**、64 B **2.9×**、512 B **24.5×**（带 Drop glue 时 64 B 只剩 1.6×） | `List::clear` 文档 |
+| `clear`：追链表 vs 扫描槽位（1M 槽位） | 密集 1.11 → 0.50 ms（扫描快 2.2×）；稀疏（1000 live）**1.42 µs → 464 µs（慢 327×）**；密集 + Drop glue 3.18 → 3.60 ms ⇒ **保留追链表** | `List::clear` 文档 + `clear_drop` 组 |
+| `Drop`：只走 live 链就地析构 vs 经 `clear`（1M） | `usize`（纯记账）**1.172 ms → 2.37 µs**；带 Drop glue Soa **3.13 → 1.96 ms（1.6×）**、Aos 2.84 → 2.38 ms | `List` 的 `Drop` 文档 + `clear_drop` 组 |
 | 迭代三层拆解（1M×`usize`，ns/元素） | `iter()` 1.08 / 自己沿链走 1.14 / 顺序扫槽位 **0.062**（Soa）；Aos 1.29 / 1.34 / 0.478 | 本文 §3.2 |
 | `append` 字节对账（mimalloc，1M⊕1M） | 我们 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **差距全在搬的字节数**（24 B/槽 vs 8 B/槽，各自因扩容搬两遍） | §3.6 |
 | 下标改写（`map(\|i\| i + base)`）成本 | 与 `extend_from_slice` 同速（甚至更快）⇒ **加偏移免费** | §3.6 |
@@ -350,8 +353,10 @@ cargo test                         # 正确性（20 项，含不变量逐槽校�
 cargo miri test                    # 严格 provenance（迭代器走裸地址）
 ```
 
-本文件里的"内部探针"数字来自临时探针（`#[test]` + `Instant`，min/9 轮），跑完即删；
-机制与结论写在这里与 crate 文档里（`List::clear`、`Storage::append`、`benches/list.rs`）。
+本文件里的"内部探针"数字多数来自临时探针（`#[test]` + `Instant`，min/9 轮），跑完即删；
+`clear` / `Drop` 的对照（`cargo bench -- 'clear_drop'`）已经**常驻**成 `clear_drop` 组：
+密集 / 稀疏 / `clear` 后重填 / 析构，三种布局 × 无 glue 与带 64 B Drop glue。
+机制与结论写在这里与 crate 文档里（`List::clear`、`List` 的 `Drop`、`Storage::append`、`benches/list.rs`）。
 
 ---
 

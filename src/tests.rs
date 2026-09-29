@@ -1362,6 +1362,49 @@ fn reserve_capacity() {
     each_layout!(check_reserve);
 }
 
+/// 第 0 个元素的析构会 panic，用来钉住"析构中途 panic"的行为。
+struct PanicOnDrop {
+    count: Rc<Cell<usize>>,
+    id: usize,
+}
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        self.count.set(self.count.get() + 1);
+
+        if self.id == 0 {
+            panic!("析构里 panic");
+        }
+    }
+}
+
+fn check_drop_panic<S: Storage<PanicOnDrop> + Default>() {
+    let count = Rc::new(Cell::new(0));
+    let mut list: List<PanicOnDrop, S> = List::default();
+
+    for id in 0..10 {
+        list.push_back(PanicOnDrop {
+            count: Rc::clone(&count),
+            id,
+        });
+    }
+
+    let before = count.get();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(list)));
+
+    assert!(result.is_err(), "`T::drop` 里的 panic 必须传播出去");
+    // 按 `Vec` 的约定：头一个 panic，剩下 9 个**泄漏**（既不析构，也绝不重复析构）。
+    assert_eq!(count.get(), before + 1);
+}
+
+/// `Drop` 中途 panic 的语义：泄漏剩余元素，但绝不重复析构（照 `Vec::clear` 的约定）。
+#[test]
+fn drop_panic_leaks_rest() {
+    check_drop_panic::<Soa<PanicOnDrop>>();
+    check_drop_panic::<Packed<PanicOnDrop>>();
+    check_drop_panic::<Aos<PanicOnDrop>>();
+}
+
 #[test]
 fn drop_semantics() {
     check_drop::<Soa<Tracked>>();

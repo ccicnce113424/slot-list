@@ -21,7 +21,7 @@
 //! # 各组怎么读、数字与机制
 //!
 //! 全部在仓库根目录的 **`PERFORMANCE.md`**：三种布局的内存/地址表（实测核对）、
-//! 全套结果、`append` 两个 API 的字节对账与选型矩阵、内部探针（`clear` / 迭代三层 /
+//! 全套结果、`append` 两个 API 的字节对账与选型矩阵、内部探针（`clear` / `Drop` / 迭代三层 /
 //! 带宽对账），以及**已试过并否掉的优化**（分块布局、顺行位图、迭代器探路、u32 索引、
 //! `reserve`、`madvise` …），每条都带实测数字与代价。
 
@@ -35,7 +35,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use slot_list::{AosList, PackedList, Slot, SoaList};
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Bencher, Criterion, criterion_group, criterion_main};
 
 use std::{
     collections::{LinkedList, VecDeque},
@@ -1267,6 +1267,215 @@ fn blob_end_ops(c: &mut Criterion) {
     g.finish();
 }
 
+// ============================================================
+// clear / Drop 探针
+//
+// 量两件事（都是用 `iter_batched` 把"造数据/析构"挪出计时区）：
+//
+// 结论（1M 槽位、Soa）：`clear` 保留追链表。扫描版只在"没有 Drop glue 且几乎满"时
+// 快 2.2×，稀疏时慢 327×（1.42 µs → 464 µs）、带 Drop glue 时连密集也慢 12%；
+// `Drop` 只走 live 链就地析构则全面胜出——无 glue 1.172 ms → 2.37 µs，带 glue
+// Soa 3.13 → 1.96 ms（1.6×）。明细见 PERFORMANCE.md §4/§5。
+//
+// 1. `clear`：追链表 vs "按内存顺序扫一遍 data、用 `is_free` 判断"。
+//    两种写法的代价模型完全不同——追链表是 O(live) 次**随机**槽位访问，
+//    扫描是 O(slots) 次**顺序**访问。dense 看上限、sparse 看下限。
+// 2. `Drop`：析构整条链表本来只需要"走 live 链、就地析构"，但现在它经由
+//    `clear`，会顺带把每个槽位挂回 free 链——对一个马上要丢掉的结构是白做。
+// ============================================================
+macro_rules! bench_clear_drop {
+    ($ty:ty, $maker:ident, $dense:ident, $sparse:ident, $refill:ident, $dropper:ident) => {
+        /// 密集：`slots == len == N`。
+        fn $dense(b: &mut Bencher) {
+            b.iter_batched(
+                || $maker(),
+                |mut list| {
+                    list.clear();
+
+                    list
+                },
+                BatchSize::PerIteration,
+            );
+        }
+
+        /// 稀疏：1M 个槽位里只剩 1000 个 live（free 链上挂着 999_000 个）。
+        fn $sparse(b: &mut Bencher) {
+            b.iter_batched(
+                || {
+                    let mut list = $maker();
+
+                    while list.len() > 1000 {
+                        list.pop_front();
+                    }
+
+                    list
+                },
+                |mut list| {
+                    list.clear();
+
+                    list
+                },
+                BatchSize::PerIteration,
+            );
+        }
+
+        /// `clear` 之后重新填满：free 链的**顺序**决定复用时的局部性。
+        /// 全程只在已分配的槽位里搬，不进分配器。
+        fn $refill(b: &mut Bencher) {
+            b.iter_batched(
+                || {
+                    let mut list = $maker();
+
+                    list.clear();
+
+                    list
+                },
+                |mut list| {
+                    for i in 0..N {
+                        list.push_back(black_box(i));
+                    }
+
+                    list
+                },
+                BatchSize::PerIteration,
+            );
+        }
+
+        /// 析构整条链表：理想代价 = O(live) 次就地析构，不做 free 链维护。
+        fn $dropper(b: &mut Bencher) {
+            b.iter_batched(|| $maker(), drop, BatchSize::PerIteration);
+        }
+    };
+}
+
+bench_clear_drop!(
+    SoaList,
+    make_soalist,
+    soalist_clear_dense,
+    soalist_clear_sparse,
+    soalist_refill,
+    soalist_drop
+);
+bench_clear_drop!(
+    PackedList,
+    make_packedlist,
+    packedlist_clear_dense,
+    packedlist_clear_sparse,
+    packedlist_refill,
+    packedlist_drop
+);
+bench_clear_drop!(
+    AosList,
+    make_aoslist,
+    aoslist_clear_dense,
+    aoslist_clear_sparse,
+    aoslist_refill,
+    aoslist_drop
+);
+
+/// 带 Drop glue 的 64 B 载荷。
+///
+/// 用 `usize` 量不出 `Drop`/`clear` 的真实差别：没有 glue 时整条析构链会被
+/// LLVM 直接消掉（实测"析构 1M 个 `usize`"只要 1.86 µs）。这里让 `drop` 里
+/// 真的读一下字段，把析构钉住。
+struct Drop64([u64; 8]);
+
+impl Drop64 {
+    #[inline]
+    fn new(value: usize) -> Self {
+        Self([value as u64; 8])
+    }
+}
+
+impl Drop for Drop64 {
+    #[inline]
+    fn drop(&mut self) {
+        black_box(self.0[0]);
+    }
+}
+
+macro_rules! make_drop64_list {
+    ($name:ident, $ty:ty) => {
+        fn $name() -> $ty {
+            let mut list: $ty = <$ty>::new();
+
+            for i in 0..N {
+                list.push_back(Drop64::new(i));
+            }
+
+            list
+        }
+    };
+}
+
+make_drop64_list!(make_soalist_drop64, SoaList<Drop64>);
+make_drop64_list!(make_packedlist_drop64, PackedList<Drop64>);
+make_drop64_list!(make_aoslist_drop64, AosList<Drop64>);
+
+macro_rules! bench_clear_drop_glue {
+    ($ty:ty, $maker:ident, $dense:ident, $dropper:ident) => {
+        fn $dense(b: &mut Bencher) {
+            b.iter_batched(
+                || $maker(),
+                |mut list| {
+                    list.clear();
+
+                    list
+                },
+                BatchSize::PerIteration,
+            );
+        }
+
+        fn $dropper(b: &mut Bencher) {
+            b.iter_batched(|| $maker(), drop, BatchSize::PerIteration);
+        }
+    };
+}
+
+bench_clear_drop_glue!(
+    SoaList<Drop64>,
+    make_soalist_drop64,
+    soalist_glue_clear_dense,
+    soalist_glue_drop
+);
+bench_clear_drop_glue!(
+    PackedList<Drop64>,
+    make_packedlist_drop64,
+    packedlist_glue_clear_dense,
+    packedlist_glue_drop
+);
+bench_clear_drop_glue!(
+    AosList<Drop64>,
+    make_aoslist_drop64,
+    aoslist_glue_clear_dense,
+    aoslist_glue_drop
+);
+
+fn clear_drop(c: &mut Criterion) {
+    let mut g = c.benchmark_group("clear_drop");
+
+    g.bench_function("dense/SoaList", soalist_clear_dense);
+    g.bench_function("dense/PackedList", packedlist_clear_dense);
+    g.bench_function("dense/AosList", aoslist_clear_dense);
+    g.bench_function("sparse/SoaList", soalist_clear_sparse);
+    g.bench_function("sparse/PackedList", packedlist_clear_sparse);
+    g.bench_function("sparse/AosList", aoslist_clear_sparse);
+    g.bench_function("refill/SoaList", soalist_refill);
+    g.bench_function("refill/PackedList", packedlist_refill);
+    g.bench_function("refill/AosList", aoslist_refill);
+    g.bench_function("drop/SoaList", soalist_drop);
+    g.bench_function("drop/PackedList", packedlist_drop);
+    g.bench_function("drop/AosList", aoslist_drop);
+    g.bench_function("gluedense/SoaList", soalist_glue_clear_dense);
+    g.bench_function("gluedense/PackedList", packedlist_glue_clear_dense);
+    g.bench_function("gluedense/AosList", aoslist_glue_clear_dense);
+    g.bench_function("gluedrop/SoaList", soalist_glue_drop);
+    g.bench_function("gluedrop/PackedList", packedlist_glue_drop);
+    g.bench_function("gluedrop/AosList", aoslist_glue_drop);
+
+    g.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -1286,6 +1495,7 @@ criterion_group! {
         blob_iter,
         blob_end_ops,
         slot_entry,
+        clear_drop,
 }
 
 criterion_main!(benches);

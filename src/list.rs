@@ -752,6 +752,22 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 实测（min/9 轮，`clear` 相对 pop 到空）：8 B 载荷 1.2×、64 B **2.9×**、
     /// 512 B **24.5×**——收益随 `T` 变大而增长（省掉的是每元素一次搬值）；带 Drop
     /// glue 时 drop 调用本身占大头，64 B 只剩 1.6×。
+    ///
+    /// # 为什么不做成"按内存顺序扫 `data`、用 `is_free` 判断"
+    ///
+    /// 试过（`benches/list.rs` 的 `clear_drop` 组，1M 槽位）：
+    ///
+    /// | 形状 | 追链表 | 扫描 | |
+    /// |---|---|---|---|
+    /// | 密集 `slots == len == 1M` | 1.150 ms | **500 µs** | 扫描快 2.3× |
+    /// | 稀疏 `slots = 1M, len = 1000` | **1.42 µs** | 464 µs | 扫描慢 **327×** |
+    /// | 密集 + Drop glue（64 B） | **3.215 ms** | 3.597 ms | 扫描慢 12% |
+    /// | `clear` 后重填（复用局部性） | 2.343 ms | 2.346 ms | 无差别 |
+    ///
+    /// 扫描只有在"没有 Drop glue **且** 几乎满"时才赢，却把复杂度从 O(live)
+    /// 换成 O(slots)：`clear` 一个刚排空的 deque 会从微秒级掉到几百微秒。带
+    /// Drop glue 时（真实载荷）连密集形状都输——析构本身把带宽吃完，扫描多读的
+    /// 那遍 `prev`（`is_free`）就是纯亏。free 链顺序换成升序也没换来复用收益。
     #[inline]
     pub fn clear(&mut self) {
         while self.len > 0 {
@@ -860,8 +876,32 @@ impl<'a, T, S: Storage<T>> IntoIterator for &'a mut List<T, S> {
     }
 }
 
+/// 析构：只走 live 链、**就地**析构，不碰 free 链。
+///
+/// 不走 [`clear`](List::clear) 的原因：`clear` 还要把每个槽位挂回 free 链
+/// （`mark_free` + `set_next` + 端点归位），而这里整个存储马上要跟着释放，
+/// 那份维护是纯亏。实测（1M 元素、`clear_drop` 组）：
+///
+/// | 载荷 | 经 `clear` | 只析构 | |
+/// |---|---|---|---|
+/// | `usize`（无 glue，纯记账） | 1.172 ms | **1.86 µs** | 消掉白做 |
+/// | `Drop64`（有 glue，Soa） | 3.134 ms | **2.117 ms** | 快 1.48× |
+/// | `Drop64`（有 glue，Aos） | 2.835 ms | 2.509 ms | 快 1.13× |
+///
+/// 这一条对 `into_iter()` 半途丢弃同样有效（[`IntoIter`] 是 `pop_front` 的
+/// 薄包装，剩余元素最终由这里收尾）。
+///
+/// 按 `len` 计数而不是"走到 NIL"：链尾的 `next` 是哑元（自环，或空闲期的残留）。
 impl<T, S: Storage<T>> Drop for List<T, S> {
     fn drop(&mut self) {
-        self.clear();
+        let mut slot = self.head;
+
+        for _ in 0..self.len {
+            let next = self.storage.next(slot);
+
+            unsafe { self.storage.data_mut(slot).assume_init_drop() };
+
+            slot = next;
+        }
     }
 }
