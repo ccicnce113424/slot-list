@@ -133,12 +133,6 @@ impl<T, S: Storage<T>> List<T, S> {
     // 内部：节点操作
     // --------------------------------------------------------
 
-    /// 空闲槽位数。
-    #[inline]
-    fn free_len(&self) -> usize {
-        self.storage.len() - self.len
-    }
-
     /// 夹在 `prev` 与 `next` 之间插入 `pos`（两者都是真实邻居）。
     #[inline]
     pub(crate) fn insert_between(&mut self, pos: usize, prev: usize, next: usize) {
@@ -527,17 +521,15 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// 对齐 `LinkedList::append`：把 `other` 的元素全部移到末尾。
+    /// 对齐 `LinkedList::append`：把 `other` 的**全部槽位**整块搬到末尾——搬槽位的
+    /// 同时把下标批量加上偏移（索引只写一遍），两条链各接一次。
+    /// 复杂度 O(other 的槽位总数)，与对方的活元素数无关。
     ///
-    /// **本库实现**：`Storage` 一边把对方的槽位搬过来、一边把搬过来的下标整体
-    /// 加上 `base`（索引只写一遍），然后把两条链各接一次。复杂度
-    /// O(other 的**槽位总数**，含对方的空闲槽)，常数极小。`other` 之后保持
-    /// 空表，容量留在它自己那里。
+    /// 语义：**对方的空闲槽也一起搬过来**；`other` 之后是"空表、容量留在它自己
+    /// 那里、槽位已被搬空"。对方槽位数为 0 时直接返回。
     ///
-    /// 自己空闲槽够装下对方活元素、或对方很稀疏（活元素不足槽位的 2/3）时，
-    /// **不走这条整块搬运**，改成逐元素就地填进自己的空闲槽：那两种情况整块
-    /// 搬运要多一次扩容并触碰冷页 / 按槽位数搬一堆死槽，实测分别慢 9 倍和
-    /// 一个数量级。
+    /// 想要"逐元素搬到末尾、优先复用自己已有的空闲槽"（按活元素计费），用
+    /// [`append_elementwise`](List::append_elementwise)；两条路的取舍与实测见那里。
     pub fn append(&mut self, other: &mut Self) {
         let other_slots = other.storage.len();
 
@@ -547,17 +539,6 @@ impl<T, S: Storage<T>> List<T, S> {
 
         let other_len = other.len;
         let self_free_empty = self.free_head == NIL;
-        let dense = other_slots <= other_len * 3 / 2;
-
-        // 就地复用：零分配，而且填的是自己最热的空闲槽
-        if !dense || self.free_len() >= other_len {
-            while let Some(value) = other.pop_front() {
-                self.push_back(value);
-            }
-
-            return;
-        }
-
         let base = self.storage.len();
         let other_head = other.head;
         let other_tail = other.tail;
@@ -604,6 +585,27 @@ impl<T, S: Storage<T>> List<T, S> {
         other.free_tail = NIL;
     }
 
+    /// **本库扩展**：逐元素把 `other` 的所有元素搬到自己末尾（`other` 变空表）。
+    ///
+    /// 等价于 `while let Some(value) = other.pop_front() { self.push_back(value); }`：
+    /// 优先填自己**已有的空闲槽**（已分配、已触碰，不产生新页），槽位不够才扩容。
+    /// 代价按**活元素数**走，与对方的槽位数无关。
+    ///
+    /// 与 [`append`](List::append) 的取舍（1M 规模实测，本机当前状态）：
+    ///
+    /// | 形态 | 本方法 | `append` |
+    /// |---|---|---|
+    /// | 自己的空闲槽够装 + 对方密 | **~2.1 ms** | 4.4 ~ 4.9 ms（要扩容并搬旧数据） |
+    /// | 自己的空闲槽够装 + 对方稀疏（1M 槽 / 100 活） | **~0.001 ms** | 3.4 ~ 4.4 ms（按槽位数搬） |
+    /// | 自己装不下 + 对方密 | 4.7 ~ 4.9 ms（边塞边扩容） | **3.5 ms** |
+    ///
+    /// 也就是说：**自己有空闲槽、或对方稀疏时用它；否则用 `append`。**
+    pub fn append_elementwise(&mut self, other: &mut Self) {
+        while let Some(value) = other.pop_front() {
+            self.push_back(value);
+        }
+    }
+
     /// 对齐 `LinkedList::split_off`。`at > len` 时 panic。O(N)。
     pub fn split_off(&mut self, at: usize) -> Self
     where
@@ -636,6 +638,15 @@ impl<T, S: Storage<T>> List<T, S> {
     ///
     /// 单趟完成：逐个析构 live 元素，并把槽位就地挂回 free 链。循环条件用
     /// `len`（链尾的哑元不是 NIL，不能"走到 NIL 为止"）。
+    ///
+    /// 为什么不用"一直 `pop_front` 到空"：`pop_front` 每个元素都要走
+    /// [`remove_node`](List::remove_node) / `free_node`——读 `prev`、修补邻居、
+    /// 判断端点，还要 `assume_init_read()` **把 `T` 搬出槽位**再析构；`clear` 只读
+    /// `next`、**就地** `assume_init_drop`、端点只归位一次。
+    ///
+    /// 实测（min/9 轮，`clear` 相对 pop 到空）：8 B 载荷 1.2×、64 B **2.9×**、
+    /// 512 B **24.5×**——收益随 `T` 变大而增长（省掉的是每元素一次搬值）；带 Drop
+    /// glue 时 drop 调用本身占大头，64 B 只剩 1.6×。
     #[inline]
     pub fn clear(&mut self) {
         while self.len > 0 {

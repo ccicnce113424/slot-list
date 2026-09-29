@@ -712,54 +712,28 @@ fn check_append<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![2, 1, 0, 1, 2, 3, 4]
     );
-}
 
-/// `append` 的**就地复用**分支：自己空闲槽够装下对方活元素、或对方太稀疏时，
-/// 不该整块搬（不扩容，也不把对方的槽位搬过来）。
-fn check_append_reuse<S: Storage<i32> + Default>() {
-    // a: 10 槽 / 4 活（6 空闲）；b: 3 槽 / 3 活
-    let mut a: List<i32, S> = (0..10).collect();
+    // 自己接不下（空闲槽 0 < 对方 9 个活元素）⇒ 整块连接
+    let mut a: List<i32, S> = (0..4).collect();
+    let mut b: List<i32, S> = (300..310).collect();
 
-    for _ in 0..6 {
-        a.pop_front();
-    }
+    b.pop_front();
 
-    let mut b: List<i32, S> = (200..203).collect();
+    let len_before = a.len();
     let a_slots = a.storage.len();
     let b_slots = b.storage.len();
 
-    assert_eq!(a.storage.len() - a.len(), 6);
-    assert_eq!(b.len(), 3);
+    assert!(a.storage.len() - a.len() < b.len());
 
     a.append(&mut b);
 
-    assert_eq!(
-        a.iter().copied().collect::<Vec<_>>(),
-        vec![6, 7, 8, 9, 200, 201, 202]
-    );
-    assert_eq!(a.storage.len(), a_slots, "就地复用不该扩容");
-    assert_eq!(a.storage.len() - a.len(), 6 - 3);
-    assert!(b.is_empty());
-    assert_eq!(b.storage.len(), b_slots, "就地复用时对方的槽位留在对方那里");
+    assert_eq!(a.len(), len_before + 9);
+    assert_eq!(a.storage.len(), a_slots + b_slots);
+    assert_eq!(b.storage.len(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 对方是"空表但带槽位"：两条路都不该出错，这里走就地复用（空转）
-    let mut b: List<i32, S> = (0..5).collect();
-
-    b.clear();
-
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
-
-    a.append(&mut b);
-
-    assert_eq!(a.storage.len(), a_slots);
-    assert_eq!(b.storage.len(), b_slots);
-    assert_invariants(&a);
-    assert_invariants(&b);
-
-    // 对方很稀疏（大量空闲槽）⇒ 即使自己没空闲槽也不整块搬
+    // 对方很稀疏：整块连接照**槽位数**搬（36 个死槽也跟着过来）
     let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (0..40).collect();
 
@@ -781,30 +755,122 @@ fn check_append_reuse<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![0, 1, 2, 3, 36, 37, 38, 39]
     );
-    assert!(
-        a.storage.len() < a_slots + b_slots,
-        "稀疏的对方不该按槽位数整块搬过来"
+    assert_eq!(
+        a.storage.len(),
+        a_slots + b_slots,
+        "整块连接会把对方的槽位（含死槽）一起接过来"
     );
-    assert_eq!(b.storage.len(), b_slots);
+    assert_eq!(b.storage.len(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 空闲槽不够 + 对方够密 ⇒ 整块搬运
+    // 对方是"空表但带槽位"：整块连接会把那些空槽也接过来
+    let mut a: List<i32, S> = (0..4).collect();
+    let mut b: List<i32, S> = (0..5).collect();
+
+    b.clear();
+
+    let a_slots = a.storage.len();
+    let b_slots = b.storage.len();
+
+    a.append(&mut b);
+
+    assert_eq!(a.len(), 4);
+    assert_eq!(a.storage.len(), a_slots + b_slots, "空槽也被整块接过来");
+    assert_eq!(b.storage.len(), 0);
+    assert_invariants(&a);
+    assert_invariants(&b);
+}
+
+/// `append_elementwise`：逐元素搬，优先填自己已有的空闲槽（不扩容、不搬对方槽位）。
+fn check_append_elementwise<S: Storage<i32> + Default>() {
+    // a: 10 槽 / 4 活（6 空闲）；b: 3 槽 / 3 活 ⇒ 全部塞进空闲槽
+    let mut a: List<i32, S> = (0..10).collect();
+
+    for _ in 0..6 {
+        a.pop_front();
+    }
+
+    let mut b: List<i32, S> = (200..203).collect();
+    let a_slots = a.storage.len();
+    let b_slots = b.storage.len();
+
+    assert_eq!(a.storage.len() - a.len(), 6);
+    assert_eq!(b.len(), 3);
+
+    a.append_elementwise(&mut b);
+
+    assert_eq!(
+        a.iter().copied().collect::<Vec<_>>(),
+        vec![6, 7, 8, 9, 200, 201, 202]
+    );
+    assert_eq!(a.storage.len(), a_slots, "复用空闲槽，不该扩容");
+    assert_eq!(a.storage.len() - a.len(), 6 - 3);
+    assert!(b.is_empty());
+    assert_eq!(b.storage.len(), b_slots, "对方的槽位留在对方那里");
+    assert_invariants(&a);
+    assert_invariants(&b);
+
+    // 对方稀疏（1M 槽位只剩 100 活的情形在基准里量）：只搬活元素，不碰对方的死槽
+    let mut a: List<i32, S> = (0..8).collect();
+
+    for _ in 0..4 {
+        a.pop_front();
+    }
+
+    let mut b: List<i32, S> = (0..40).collect();
+
+    for _ in 0..36 {
+        b.pop_front();
+    }
+
+    let a_slots = a.storage.len();
+    let b_slots = b.storage.len();
+
+    a.append_elementwise(&mut b);
+
+    assert_eq!(
+        a.iter().copied().collect::<Vec<_>>(),
+        vec![4, 5, 6, 7, 36, 37, 38, 39]
+    );
+    assert_eq!(a.storage.len(), a_slots, "只搬活元素，不动对方的死槽");
+    assert_eq!(b.storage.len(), b_slots, "死槽留在对方那里");
+    assert_invariants(&a);
+    assert_invariants(&b);
+
+    // 自己装不下 ⇒ 边塞边扩容，仍然正确
+    let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (300..310).collect();
 
     b.pop_front();
 
     let len_before = a.len();
+
+    a.append_elementwise(&mut b);
+
+    assert_eq!(a.len(), len_before + 9);
+    assert_eq!(
+        a.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 301, 302, 303, 304, 305, 306, 307, 308, 309]
+    );
+    assert!(b.is_empty());
+    assert_invariants(&a);
+    assert_invariants(&b);
+
+    // 对方是"空表但带槽位"：什么都不做（对方槽位留在对方那里）
+    let mut a: List<i32, S> = (0..5).collect();
+    let mut b: List<i32, S> = (0..5).collect();
+
+    b.clear();
+
     let a_slots = a.storage.len();
     let b_slots = b.storage.len();
 
-    assert!(a.storage.len() - a.len() < b.len());
+    a.append_elementwise(&mut b);
 
-    a.append(&mut b);
-
-    assert_eq!(a.len(), len_before + 9);
-    assert_eq!(a.storage.len(), a_slots + b_slots);
-    assert_eq!(b.storage.len(), 0);
+    assert_eq!(a.len(), 5);
+    assert_eq!(a.storage.len(), a_slots);
+    assert_eq!(b.storage.len(), b_slots);
     assert_invariants(&a);
     assert_invariants(&b);
 }
@@ -832,6 +898,37 @@ fn check_append_drop<S: Storage<Tracked> + Default>() {
         // 12 个元素，搬移过程中不该析构任何一个；只有被 pop 的那个已析构
         assert_eq!(count.get(), 1);
         assert_eq!(a.len(), 11);
+
+        drop(a);
+        assert_eq!(count.get(), 12);
+    }
+
+    assert_eq!(count.get(), 12);
+}
+
+/// `append_elementwise` 之后所有权同样完整移交（逐元素搬，不重复析构）。
+fn check_append_elementwise_drop<S: Storage<Tracked> + Default>() {
+    let count = Rc::new(Cell::new(0));
+
+    {
+        let mut a: List<Tracked, S> = List::default();
+        let mut b: List<Tracked, S> = List::default();
+
+        for _ in 0..5 {
+            a.push_back(Tracked(Rc::clone(&count)));
+        }
+
+        for _ in 0..7 {
+            b.push_back(Tracked(Rc::clone(&count)));
+        }
+
+        drop(b.pop_front());
+
+        a.append_elementwise(&mut b);
+
+        assert_eq!(count.get(), 1);
+        assert_eq!(a.len(), 11);
+        assert!(b.is_empty());
 
         drop(a);
         assert_eq!(count.get(), 12);
@@ -1204,8 +1301,8 @@ fn append_bulk() {
 }
 
 #[test]
-fn append_reuse() {
-    each_layout!(check_append_reuse);
+fn append_elementwise() {
+    each_layout!(check_append_elementwise);
 }
 
 #[test]
@@ -1213,6 +1310,9 @@ fn append_drop_semantics() {
     check_append_drop::<Soa<Tracked>>();
     check_append_drop::<Packed<Tracked>>();
     check_append_drop::<Aos<Tracked>>();
+    check_append_elementwise_drop::<Soa<Tracked>>();
+    check_append_elementwise_drop::<Packed<Tracked>>();
+    check_append_elementwise_drop::<Aos<Tracked>>();
 }
 
 #[test]
