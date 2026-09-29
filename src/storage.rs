@@ -4,7 +4,7 @@
 //!
 //! - [`Soa`]：三个独立 `Vec`（array of structs 的反面，structure of arrays）
 //! - [`Packed`]：`data` 一个 `Vec`，`prev`/`next` 打包成 [`Link`] 交错存放
-//! - [`Aos`]：三者放进一个 [`Node`]（array of structs）
+//! - [`Aos`]：三者放进一个 `Node`（array of structs）
 
 use std::mem::{MaybeUninit, offset_of, size_of};
 
@@ -25,13 +25,37 @@ pub(crate) const NIL: usize = usize::MAX;
 ///
 /// 为什么放在 `prev` 的最高位：
 ///
-/// - **写入次数最少**：live 槽位的 `prev` 由链接写入覆盖（那些值天然没有这一位），
-///   空闲槽位只被 free 链用到 `next` ⇒ 这一位**只在"变空闲"那一次**需要显式写，
-///   链接写入路径上没有任何 read-modify-write；
+/// - **写入最省**：live 槽位的 `prev` 由链接写入覆盖（那些值天然没有这一位），空闲槽位
+///   只被 free 链用到 `next` ⇒ 这一位**只在"变空闲"那一次**写，链接写入路径上没有任何
+///   额外操作（实测：把这次写改成**直接赋值** `prev = FREE_BIT` 想省下一次 load，
+///   反而让 `churn` 稳定慢 7~8%——两轮交替 A/B、对照 `VecDeque` 持平——所以保留读-改-写）；
 /// - **`append` 的整段 `+= base` 自己会带着它走**：`2^63 | v` 加 `base` 仍是
 ///   `2^63 | (v + base)`，只要不溢出 `u64` 就不需要特例（`v + base < 2^63`，而
 ///   槽位数远小于此 ⇒ 实际永远成立，`debug_assert` 兜底）；
-/// - **读值处一律掩码**：`Storage::prev` 返回掩码后的下标，`is_free` 只看那一位。
+/// - **读 `prev` 只在 live 槽位上**（这是契约，不是建议）：因为空闲槽的 `prev` 就是
+///   这个标记位本身（`append` 后是 `FREE_BIT | base`），掩码反而要每个读取点多付一条
+///   and、还拖长"取地址"的依赖链。所以 [`Storage::prev`] **直接返回原值**，并在
+///   debug 构建里用 `debug_assert` 钉住"调用它的槽位必须是 live"（release 零成本）。
+///
+/// # 为什么是"读-改-写"而不是"直接赋值"（有汇编对账）
+///
+/// 试过改成 `prev = FREE_BIT` 想省掉那次 load：**`churn` 稳定慢 7~8%**
+/// （两轮交替 A/B、同一次运行带 `VecDeque`/`LinkedList` 对照，四组测量一致）。
+/// 原因在编码，不在数据通路：
+///
+/// ```text
+/// prev |= FREE_BIT  →  orb    $-128, 7(%rdi,%rsi,8)          1 条指令 /  5 字节
+/// prev  = FREE_BIT  →  movabsq $-9223372036854775808, %rax
+///                      movq   %rax, (%rdi,%rsi,8)            2 条指令 / 14 字节
+/// ```
+///
+/// `2^63` 正好是**最高字节的最高位** ⇒ `or` 吃一个字节立即数就够了；而"写一个值"
+/// 没有这种编码，必须先 `movabs` 把 64 位立即数物化出来。省下的那次 load 抵不过
+/// 多出来的 9 字节指令和一个 uop——这与 `xor eax, eax` 对 `mov eax, 0` 是同一类
+/// **前端/编码**效应，不是"`or` 比 `mov` 便宜"。
+///
+/// 反过来，把它当**布尔**用（`raw & FREE_BIT != 0`）没有这个问题：LLVM 会化成
+/// `mov %rdi,%rax; shr $63,%rax`（2 条指令、无立即数）。
 ///
 /// 代价：每个"变成空闲"的槽位一次 read-modify-write（`pop`/`remove`/`clear` 等
 /// 每条回收路径一次）。
@@ -179,9 +203,16 @@ pub trait Storage<T>: sealed::Sealed {
     fn is_free(&self, slot: usize) -> bool;
 
     /// 把槽位标记成空闲（挂回 free 链时调用）。重复标记是幂等的。
+    ///
+    /// 实现里是**直接赋值** `prev = FREE_BIT`（旧值无意义、不需要读）——`append` 的
+    /// 整段 `+= base` 会把它变成 `FREE_BIT | base`，标记位仍在。
     fn mark_free(&mut self, slot: usize);
 
-    /// 槽位的前驱下标。**返回值已掩掉空闲标记位**。
+    /// 槽位的前驱下标。
+    ///
+    /// **契约：只在 `!is_free(slot)` 的槽位上调用**（空闲槽的 `prev` 就是空闲标记位本身，
+    /// 没有意义）。因此这里**不做掩码**——掩码会让每个读取点多一条 and、并拖长取地址的
+    /// 依赖链；越界误用由 debug 构建的 `debug_assert` 抓住。
     fn prev(&self, slot: usize) -> usize;
     fn next(&self, slot: usize) -> usize;
     fn set_prev(&mut self, slot: usize, value: usize);
@@ -268,6 +299,8 @@ impl<T> Storage<T> for Soa<T> {
 
     #[inline]
     fn is_free(&self, slot: usize) -> bool {
+        // 当**布尔**用时不必担心立即数：LLVM 会化成 `mov %rdi,%rax; shr $63,%rax`
+        // （2 条指令、没有 `movabs`，实测见 FREE_BIT 的文档）。
         unsafe { *self.prev.get_unchecked(slot) & FREE_BIT != 0 }
     }
 
@@ -278,8 +311,8 @@ impl<T> Storage<T> for Soa<T> {
 
     #[inline]
     fn prev(&self, slot: usize) -> usize {
-        // 掩掉空闲标记位：调用方要的是下标
-        unsafe { *self.prev.get_unchecked(slot) & !FREE_BIT }
+        debug_assert!(!self.is_free(slot), "只能在 live 槽位上读 prev");
+        unsafe { *self.prev.get_unchecked(slot) }
     }
 
     #[inline]
@@ -401,7 +434,8 @@ impl<T> Storage<T> for Packed<T> {
 
     #[inline]
     fn prev(&self, slot: usize) -> usize {
-        unsafe { self.links.get_unchecked(slot).prev & !FREE_BIT }
+        debug_assert!(!self.is_free(slot), "只能在 live 槽位上读 prev");
+        unsafe { self.links.get_unchecked(slot).prev }
     }
 
     #[inline]
@@ -519,7 +553,7 @@ impl<T> Storage<T> for Aos<T> {
 
     #[inline]
     fn prev(&self, slot: usize) -> usize {
-        unsafe { self.nodes.get_unchecked(slot).prev & !FREE_BIT }
+        unsafe { self.nodes.get_unchecked(slot).prev }
     }
 
     #[inline]

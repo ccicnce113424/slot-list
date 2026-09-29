@@ -121,15 +121,14 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
+    /// 只对 **live** 槽位调用（`Layout` 读的是裸值：空闲槽的 `prev` 是空闲标记位）。
     unsafe fn prev_of(&self, slot: usize) -> usize {
-        // 掩掉空闲标记位（`Layout` 读的是裸值）
         unsafe {
             *self
                 .layout
                 .prev
                 .add(slot * self.layout.prev_stride)
                 .cast::<usize>()
-                & !crate::storage::FREE_BIT
         }
     }
 }
