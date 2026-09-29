@@ -17,60 +17,64 @@ use std::mem::{MaybeUninit, offset_of, size_of};
 /// 的前提。
 pub(crate) const NIL: usize = usize::MAX;
 
-/// [`IterMut`](crate::IterMut) 需要的裸地址布局：
-/// 元素 `i` 的数据地址是 `data + i * data_stride + data_offset`，
-/// 其 `prev` / `next` 字段地址分别是 `prev + i * prev_stride` /
-/// `next + i * next_stride`。
+/// [`Iter`](crate::Iter) / [`IterMut`](crate::IterMut) 需要的裸地址布局。
+///
+/// 三种 `Storage` 把同样的三个逻辑字段放在完全不同的位置，迭代器又必须用裸地址
+/// 走链（这样 `next()` 才能交出 `&'a mut T` 而不与自身状态打架），所以这里用
+/// 「**基址 + 步长 + 偏移**」把三者统一描述成同一个公式（下标是槽位下标）：
+///
+/// ```text
+/// 元素 i 的 data 地址 = data.cast::<u8>() + i * data_stride + data_offset
+/// 元素 i 的 prev 值   = *(prev.cast::<u8>() + i * prev_stride)
+/// 元素 i 的 next 值   = *(next.cast::<u8>() + i * next_stride)
+/// ```
+///
+/// 字段（基址一律是**字节指针** `u8`，所以每次取址只需**一次** cast：`u8` → 目标
+/// 类型。若把基址标成 `*mut MaybeUninit<T>`，反而要先 `cast::<u8>()` 做字节算术、
+/// 再 cast 回来——两次）：
+/// - `data`：元素 0 的 `data` 槽**基址**（槽位可能未初始化，读之前要
+///   `assume_init_*`）；
+/// - `data_stride`：相邻元素的 `data` 相隔多少字节（= 一个"元素"有多大）；
+/// - `data_offset`：从 `data` 基址挪到元素 0 的 `data` 字段还要加多少字节
+///   （只有把字段塞进节点里的布局才非 0，而且用 `offset_of!` 说出来，
+///   不依赖"`data` 恰好在开头"这个假设）；
+/// - `prev` / `next`：元素 0 的链接字段基址（三种布局的链接**都是 `usize`**，
+///   所以类型固定，变的只有步长）；
+/// - `prev_stride` / `next_stride`：相邻元素的链接字段相隔多少字节——Packed 里
+///   两个链接打包成 `Link`，Aos 里它们和 `data` 同处一个 `Node<T>`，所以这里的
+///   步长是"元素"大小而不是 8。
+///
+/// 三个布局具体怎么落到这些字段上（`T = usize`，括号里是 `T = [u64; 8]`）：
+///
+/// | 布局 | `data` 基址 / `data_stride` / `data_offset` | `prev`·`next` 基址 / 步长 |
+/// |---|---|---|
+/// | `Soa<T>` | 数据数组首址 / `size_of::<T>()` 8（64）/ 0 | 各自数组首址 / 8 |
+/// | `Packed<T>` | 数据数组首址 / 8（64）/ 0 | `links + offset_of!(Link, …)` 0·8 / 16 |
+/// | `Aos<T>` | 节点数组首址 / `size_of::<Node<T>>()` 24（80）/ `offset_of!(Node<T>, data)` 0 | `nodes + offset_of!(Node<T>, …)` 8·16（64·72）/ 24（80） |
+///
+/// ```text
+/// Soa     data  [d0][d1][d2]…      prev [p0][p1]…      next [n0][n1]…
+///                ↑ stride 8               ↑ stride 8           ↑ stride 8
+/// Packed  data  [d0][d1]…          links [(p0,n0)][(p1,n1)]…
+///                                          ↑ prev=links+0, next=links+8, stride 16
+/// Aos     nodes [(d0,p0,n0)][(d1,p1,n1)]…
+///                 ↑ data=nodes+0, prev=nodes+8, next=nodes+16, stride 24
+/// ```
+///
+/// 地址能这么算，靠的是三条不变量：① 指针来自同一个容器自己的 `Vec`，而 `Layout`
+/// 只在迭代器持有 `&'a mut List` 的那段独占期里用（中途不会 realloc / 搬家）；
+/// ② 下标只落在已分配的槽位内；③ 数组里每个 `prev`/`next` 都是**合法下标**
+/// （两端是"指向自己的哑元"，见 crate 文档），所以可以无条件读、也可以无条件
+/// `+= base`——这正是 [`Storage::append`] 整块搬运的前提。
 #[doc(hidden)]
-pub struct Layout<T> {
-    data: *mut MaybeUninit<T>,
-    data_stride: usize,
-    data_offset: usize,
-    prev: *const usize,
-    prev_stride: usize,
-    next: *const usize,
-    next_stride: usize,
-}
-
-impl<T> Layout<T> {
-    /// 元素 `index` 的 `data` 槽地址。
-    ///
-    /// 三种布局的步长不同、`data` 还可能长在节点内部，所以只能按**字节**算地址
-    /// ——这也是基址用 `*mut u8` 风格指针的原因；但**元素类型**带在类型参数里，
-    /// 取址与解引用都由这里统一提供，使用处不必再写裸 cast。
-    #[inline]
-    pub(crate) unsafe fn data_at(&self, index: usize) -> *mut MaybeUninit<T> {
-        unsafe {
-            self.data
-                .cast::<u8>()
-                .add(index * self.data_stride + self.data_offset)
-                .cast::<MaybeUninit<T>>()
-        }
-    }
-
-    /// 元素 `index` 的 `next` 值。
-    #[inline]
-    pub(crate) unsafe fn next_at(&self, index: usize) -> usize {
-        unsafe {
-            *self
-                .next
-                .cast::<u8>()
-                .add(index * self.next_stride)
-                .cast::<usize>()
-        }
-    }
-
-    /// 元素 `index` 的 `prev` 值。
-    #[inline]
-    pub(crate) unsafe fn prev_at(&self, index: usize) -> usize {
-        unsafe {
-            *self
-                .prev
-                .cast::<u8>()
-                .add(index * self.prev_stride)
-                .cast::<usize>()
-        }
-    }
+pub struct Layout {
+    pub(crate) data: *mut u8,
+    pub(crate) data_stride: usize,
+    pub(crate) data_offset: usize,
+    pub(crate) prev: *const u8,
+    pub(crate) prev_stride: usize,
+    pub(crate) next: *const u8,
+    pub(crate) next_stride: usize,
 }
 
 #[doc(hidden)]
@@ -156,7 +160,7 @@ pub trait Storage<T>: sealed::Sealed {
     fn set_next(&mut self, index: usize, value: usize);
 
     #[doc(hidden)]
-    fn layout(&mut self) -> Layout<T>;
+    fn layout(&mut self) -> Layout;
 }
 
 // ============================================================
@@ -256,14 +260,14 @@ impl<T> Storage<T> for Soa<T> {
         unsafe { *self.next.get_unchecked_mut(index) = value };
     }
 
-    fn layout(&mut self) -> Layout<T> {
+    fn layout(&mut self) -> Layout {
         Layout {
-            data: self.data.as_mut_ptr(),
+            data: self.data.as_mut_ptr() as *mut u8,
             data_stride: size_of::<MaybeUninit<T>>(),
             data_offset: 0,
-            prev: self.prev.as_ptr(),
+            prev: self.prev.as_ptr() as *const u8,
             prev_stride: size_of::<usize>(),
-            next: self.next.as_ptr(),
+            next: self.next.as_ptr() as *const u8,
             next_stride: size_of::<usize>(),
         }
     }
@@ -368,26 +372,16 @@ impl<T> Storage<T> for Packed<T> {
         unsafe { self.links.get_unchecked_mut(index).next = value };
     }
 
-    fn layout(&mut self) -> Layout<T> {
-        let links = self.links.as_ptr();
+    fn layout(&mut self) -> Layout {
+        let links = self.links.as_ptr() as *const u8;
 
         Layout {
-            data: self.data.as_mut_ptr(),
+            data: self.data.as_mut_ptr() as *mut u8,
             data_stride: size_of::<MaybeUninit<T>>(),
             data_offset: 0,
-            prev: unsafe {
-                links
-                    .cast::<u8>()
-                    .add(offset_of!(Link, prev))
-                    .cast::<usize>()
-            },
+            prev: unsafe { links.add(offset_of!(Link, prev)) },
             prev_stride: size_of::<Link>(),
-            next: unsafe {
-                links
-                    .cast::<u8>()
-                    .add(offset_of!(Link, next))
-                    .cast::<usize>()
-            },
+            next: unsafe { links.add(offset_of!(Link, next)) },
             next_stride: size_of::<Link>(),
         }
     }
@@ -486,27 +480,17 @@ impl<T> Storage<T> for Aos<T> {
         unsafe { self.nodes.get_unchecked_mut(index).next = value };
     }
 
-    fn layout(&mut self) -> Layout<T> {
-        let nodes = self.nodes.as_ptr();
+    fn layout(&mut self) -> Layout {
+        let nodes = self.nodes.as_ptr() as *const u8;
 
         Layout {
             // 基址是节点数组本身，`data_offset` 再把地址挪到 `data` 字段
-            data: self.nodes.as_mut_ptr().cast::<MaybeUninit<T>>(),
+            data: self.nodes.as_mut_ptr() as *mut u8,
             data_stride: size_of::<Node<T>>(),
             data_offset: offset_of!(Node<T>, data),
-            prev: unsafe {
-                nodes
-                    .cast::<u8>()
-                    .add(offset_of!(Node<T>, prev))
-                    .cast::<usize>()
-            },
+            prev: unsafe { nodes.add(offset_of!(Node<T>, prev)) },
             prev_stride: size_of::<Node<T>>(),
-            next: unsafe {
-                nodes
-                    .cast::<u8>()
-                    .add(offset_of!(Node<T>, next))
-                    .cast::<usize>()
-            },
+            next: unsafe { nodes.add(offset_of!(Node<T>, next)) },
             next_stride: size_of::<Node<T>>(),
         }
     }

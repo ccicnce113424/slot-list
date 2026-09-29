@@ -972,14 +972,14 @@ fn check_reserve<S: Storage<i32> + Default>() {
 
     assert!(list.is_empty());
 
-    let data_before = unsafe { list.storage.layout().data_at(0) };
+    let data_before = list.storage.layout().data;
 
     for i in 0..64 {
         list.push_back(i);
     }
 
     assert_eq!(
-        unsafe { list.storage.layout().data_at(0) },
+        list.storage.layout().data,
         data_before,
         "预留容量内不应该重新分配"
     );
@@ -993,13 +993,13 @@ fn check_reserve<S: Storage<i32> + Default>() {
 
     list.reserve(64);
 
-    let data_before = unsafe { list.storage.layout().data_at(0) };
+    let data_before = list.storage.layout().data;
 
     for i in 0..64 {
         list.push_front(i);
     }
 
-    assert_eq!(unsafe { list.storage.layout().data_at(0) }, data_before);
+    assert_eq!(list.storage.layout().data, data_before);
     assert_eq!(list.len(), 64);
     assert_eq!(list.front().copied(), Some(63));
     assert_eq!(list.back().copied(), Some(0));
