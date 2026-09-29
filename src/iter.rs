@@ -1,6 +1,6 @@
-use std::iter::FusedIterator;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
+use core::iter::FusedIterator;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 
 use crate::list::List;
 use crate::storage::{Layout, Storage};

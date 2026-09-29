@@ -1525,6 +1525,247 @@ fn narrow_index_caps_out() {
     }
 }
 
+// ============================================================
+// 四个"补齐"的 API：capacity/shrink、裸状态（可搬运）、游标 std 对齐
+// ============================================================
+
+/// `into_raw` / `from_raw`：**不析构元素**、原样放回、顺序与槽位身份都不变。
+fn check_raw_roundtrip<S: Storage<i32> + Default>() {
+    let mut list: List<i32, S> = List::with_capacity(8);
+
+    for value in [10, 20, 30, 40, 50] {
+        list.push_back(value);
+    }
+
+    assert_eq!(list.remove(1), 20);
+    assert_eq!(list.pop_front(), Some(10));
+
+    let slots_before: Vec<usize> = list.iter_slots().map(|(slot, _)| slot.to_usize()).collect();
+    let free_before: Vec<usize> = list.free_slots().map(|slot| slot.to_usize()).collect();
+
+    assert_eq!(free_before.len(), 2, "两个槽位应当回到 free 链");
+    assert_eq!(list.capacity(), 5);
+    assert_eq!(list.len(), 3);
+
+    let raw = list.into_raw();
+
+    assert_eq!(raw.len(), 3);
+    assert_eq!(raw.capacity(), 5);
+    assert!(raw.head_slot().is_some());
+    assert!(raw.tail_slot().is_some());
+    assert_eq!(
+        raw.free_head_slot().map(|s| s.to_usize()),
+        free_before.first().copied()
+    );
+    assert_eq!(
+        raw.free_tail_slot().map(|s| s.to_usize()),
+        free_before.last().copied()
+    );
+
+    let mut list = unsafe { List::<i32, S>::from_raw(raw) };
+
+    assert_eq!(
+        list.iter_slots()
+            .map(|(slot, _)| slot.to_usize())
+            .collect::<Vec<_>>(),
+        slots_before
+    );
+    assert_eq!(
+        list.free_slots()
+            .map(|slot| slot.to_usize())
+            .collect::<Vec<_>>(),
+        free_before
+    );
+    assert_invariants(&list);
+    assert_eq!(list.pop_back(), Some(50));
+    assert_invariants(&list);
+}
+
+/// `into_raw` 只释放数组、**不析构 `T`**（`Vec::into_raw_parts` 的语义）。
+#[test]
+fn into_raw_does_not_drop_elements() {
+    let count = Rc::new(Cell::new(0));
+
+    {
+        let mut list: SoaList<Tracked> = SoaList::new();
+
+        for _ in 0..5 {
+            list.push_back(Tracked(Rc::clone(&count)));
+        }
+
+        let raw = list.into_raw();
+
+        assert_eq!(count.get(), 0, "`into_raw` 不该析构元素");
+
+        drop(raw);
+
+        assert_eq!(count.get(), 0, "丢掉 `RawList` 也不该析构元素");
+    }
+}
+
+/// 裸部件 + `from_fields` 组成一次完整的"序列化 → 反序列化"。
+#[test]
+fn raw_parts_roundtrip() {
+    // 1) 取状态
+    let mut soa: SoaList<i32, u32> = SoaList::with_capacity(8);
+
+    for value in [1, 2, 3, 4, 5, 6] {
+        soa.push_back(value);
+    }
+
+    assert_eq!(soa.remove(2), 3);
+
+    let expected: Vec<i32> = soa.iter().copied().collect();
+    let expected_slots: Vec<usize> = soa.iter_slots().map(|(s, _)| s.to_usize()).collect();
+    let expected_free: Vec<usize> = soa.free_slots().map(|s| s.to_usize()).collect();
+
+    let raw = soa.into_raw();
+
+    // 2) 序列化：数组逐字节拷出去 + 记住五个数字
+    let (data, prev, next) = raw.storage().as_parts();
+    let (data, prev, next) = (data.to_vec(), prev.to_vec(), next.to_vec());
+    let fields = (
+        raw.head_slot(),
+        raw.tail_slot(),
+        raw.free_head_slot(),
+        raw.free_tail_slot(),
+        raw.len(),
+    );
+    drop(raw);
+
+    // 3) 反序列化：装回存储、再拼回 List
+    let storage = unsafe { Soa::<i32, u32>::from_parts(data, prev, next) };
+    let (head, tail, free_head, free_tail, len) = fields;
+    let list = unsafe {
+        List::<i32, Soa<i32, u32>>::from_raw(RawList::from_fields(
+            storage, head, tail, free_head, free_tail, len,
+        ))
+    };
+
+    assert_invariants(&list);
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), expected);
+    assert_eq!(
+        list.iter_slots()
+            .map(|(s, _)| s.to_usize())
+            .collect::<Vec<_>>(),
+        expected_slots
+    );
+    assert_eq!(
+        list.free_slots().map(|s| s.to_usize()).collect::<Vec<_>>(),
+        expected_free
+    );
+}
+
+/// `capacity` / `shrink_to_fit`：槽位数与句柄在收缩前后**不变**。
+fn check_capacity<S: Storage<i32> + Default>() {
+    let mut list: List<i32, S> = List::with_capacity(64);
+
+    for value in 0..10 {
+        list.push_back(value);
+    }
+
+    assert_eq!(list.remove(0), 0);
+
+    let slots_before: Vec<usize> = list.iter_slots().map(|(s, _)| s.to_usize()).collect();
+    let capacity = list.capacity();
+
+    assert_eq!(capacity, 10);
+    assert!(list.len() <= list.capacity());
+
+    list.shrink_to_fit();
+
+    assert_eq!(list.capacity(), capacity, "收缩只还多余容量，槽位数不变");
+    assert_eq!(list.len(), 9);
+    assert_eq!(
+        list.iter_slots()
+            .map(|(s, _)| s.to_usize())
+            .collect::<Vec<_>>(),
+        slots_before,
+        "句柄不受收缩影响"
+    );
+    assert_invariants(&list);
+}
+
+#[test]
+fn capacity_and_shrink() {
+    check_capacity::<Soa<i32>>();
+    check_capacity::<Packed<i32>>();
+    check_capacity::<Aos<i32>>();
+}
+
+#[test]
+fn raw_state_roundtrips() {
+    check_raw_roundtrip::<Soa<i32>>();
+    check_raw_roundtrip::<Packed<i32>>();
+    check_raw_roundtrip::<Aos<i32>>();
+}
+
+/// 游标的 std 对齐四件套，对着 `Vec` 模型比。
+#[test]
+fn cursor_std_parity() {
+    let mut list: SoaList<i32> = (1..=3).collect();
+    let other: SoaList<i32> = (10..=12).collect();
+
+    // 游标在作用域里持有 `list` 的可变借用；出了这个块才能再直接读 `list`
+    {
+        // splice_before：按原顺序接到 2 之前，游标仍在 2
+        let mut cursor = list.at(1).unwrap();
+
+        cursor.splice_before(other);
+
+        assert_eq!(*cursor.current().unwrap(), 2);
+        assert_eq!(
+            cursor.as_list().iter().copied().collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 2, 3]
+        );
+
+        // splice_after：接在 2 之后，顺序保持
+        let other: SoaList<i32> = (20..=21).collect();
+
+        cursor.splice_after(other);
+
+        assert_eq!(*cursor.current().unwrap(), 2);
+        assert_eq!(
+            cursor.as_list().iter().copied().collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 2, 20, 21, 3]
+        );
+
+        // remove_current_as_list：摘成单元素表，游标移到 20
+        let one = cursor.remove_current_as_list().unwrap();
+
+        assert_eq!(one.iter().copied().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(*cursor.current().unwrap(), 20);
+        assert_eq!(
+            cursor.as_list().iter().copied().collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 20, 21, 3]
+        );
+
+        // split_after：20 之后的部分摘走
+        let tail = cursor.split_after();
+
+        assert_eq!(tail.iter().copied().collect::<Vec<_>>(), vec![21, 3]);
+        assert_eq!(
+            cursor.as_list().iter().copied().collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 20]
+        );
+        assert_eq!(*cursor.current().unwrap(), 20);
+
+        // split_before：20 之前的部分摘走，游标现在指着链头
+        let head = cursor.split_before();
+
+        assert_eq!(
+            head.iter().copied().collect::<Vec<_>>(),
+            vec![1, 10, 11, 12]
+        );
+        assert_eq!(cursor.index(), Some(0));
+        assert_eq!(*cursor.current().unwrap(), 20);
+    }
+
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![20]);
+    assert_invariants(&list);
+}
+
 /// `PhantomData<T>`（`List::marker`）带来的两条**编译期**性质：能编过即成立。
 ///
 /// - 对 `T` **协变**（与三种 `Storage` 一致）⇒ `&'static` 版本能当 `&'a` 版本用；

@@ -1,5 +1,5 @@
-use std::fmt;
-use std::marker::PhantomData;
+use core::fmt;
+use core::marker::PhantomData;
 
 use crate::cursor::{Cursor, CursorMut};
 use crate::iter::{IntoIter, Iter, IterMut};
@@ -132,6 +132,24 @@ impl<T, S: Storage<T>> List<T, S> {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// 已分配的槽位总数（live + free）。`len() <= capacity()`，差值是空闲槽数。
+    ///
+    /// 和 `Vec::capacity` 一样是"不会重新分配就能放的槽位数"，但语义是**槽位**而不是元素：
+    /// 槽位会被 free 链复用，所以 `capacity()` 在 `push`/`pop` 之间不会变。
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.storage.slots()
+    }
+
+    /// 把底层 `Vec` 的**多余容量**还给分配器（`Vec::shrink_to_fit`）。
+    ///
+    /// **不是** `Vec::shrink_to_fit` 的语义：那里会缩到 `len()`，而这里**槽位数不变**
+    /// —— 空闲槽是 free 链的一部分，也是 [`Slot`](crate::Slot) 句柄指向的东西，
+    /// 丢掉它们会让句柄失效、把链打断。所以这条只是把"已分配但没用上的容量"还给分配器。
+    pub fn shrink_to_fit(&mut self) {
+        self.storage.shrink_to_fit();
     }
 
     /// 是否为空。
@@ -550,6 +568,32 @@ impl<T, S: Storage<T>> List<T, S> {
             .map(|slot| crate::cursor::pos_of_slot(self, slot))
     }
 
+    /// 遍历 **free 链**（`free_head` → `free_tail`，**LIFO 顺序**：最近被回收的在前面）。
+    ///
+    /// 配合 [`iter_slots`](Self::iter_slots) 就能取到整条链的全部状态（值 + 链接 + 空闲顺序），
+    /// 自己序列化 / 落盘 / 放进共享内存。恢复见 [`into_raw`](Self::into_raw) 与各布局的
+    /// `from_parts`。
+    pub fn free_slots(&self) -> impl Iterator<Item = Slot> + '_ {
+        let mut remaining = self.storage.slots() - self.len;
+        let mut slot = self.free_head;
+
+        core::iter::from_fn(move || {
+            if remaining == 0 || slot == NIL {
+                return None;
+            }
+
+            remaining -= 1;
+
+            let current = slot;
+            let next = self.storage.next(slot);
+
+            // 自环 = free 链的链尾（单元素链也是自环）
+            slot = if next == current { NIL } else { next };
+
+            Some(Slot(current))
+        })
+    }
+
     /// **本库扩展**：边迭代边给出每个元素的稳定句柄 `(Slot, &T)`。
     ///
     /// 想把"链表顺序"和"自己的哈希表"接起来时用它：句柄可以当 key 存起来，
@@ -754,6 +798,50 @@ impl<T, S: Storage<T>> List<T, S> {
         self.unlink_slot(slot)
     }
 
+    /// 取出整条链的**可搬运状态**（不析构任何元素）。
+    ///
+    /// 这是 `PERFORMANCE.md` §8 那条"状态可搬运、无指针"承诺的公开入口：整条链的状态
+    /// 就是槽位数组（[`Soa::into_parts`](crate::Soa::into_parts) 等）加上五个数字
+    /// （[`RawList`] 的取值器），**没有任何指针**，所以可以直接序列化 / 放进共享内存 /
+    /// `mmap`，**不需要指针修正**。
+    ///
+    /// ```
+    /// # use slot_list::SoaList;
+    /// let mut list: SoaList<u32> = SoaList::new();
+    /// list.extend([1, 2, 3]);
+    /// let removed = list.pop_front().unwrap();
+    /// assert_eq!(removed, 1);          // 留一个空闲槽，free 链非空
+    ///
+    /// let raw = list.into_raw();
+    /// // 现在可以：raw.storage().as_parts() 写盘、raw.head_slot()/free_slots 记元数据
+    /// assert_eq!(raw.len(), 2);
+    /// assert_eq!(raw.capacity(), 3);
+    ///
+    /// let list = unsafe { SoaList::from_raw(raw) };   // 原样放回
+    /// assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![2, 3]);
+    /// ```
+    pub fn into_raw(self) -> RawList<T, S> {
+        RawList {
+            inner: core::mem::ManuallyDrop::new(self),
+        }
+    }
+
+    /// 把 [`into_raw`](Self::into_raw) 取出的状态放回去。
+    ///
+    /// # Safety
+    ///
+    /// `raw` 必须描述一条**自洽**的链：链接都是合法下标、空闲槽带空闲标记位、
+    /// `len` 等于 live 槽数、`head`/`tail`/`free_head`/`free_tail` 与实际一致
+    /// （要么来自 [`into_raw`](Self::into_raw)，要么按同样规则重建）。
+    /// live 槽的 `data` 必须已初始化。不满足是 UB，不会 panic。
+    pub unsafe fn from_raw(raw: RawList<T, S>) -> Self {
+        // `RawList` 有 `Drop`（只放数组），所以先把它冻住再按位取出内部值。
+        let raw = core::mem::ManuallyDrop::new(raw);
+        let inner = unsafe { core::ptr::read(&raw.inner) };
+
+        core::mem::ManuallyDrop::into_inner(inner)
+    }
+
     /// 对齐 `LinkedList::clear`。保留已分配的容量与槽位。
     ///
     /// 单趟完成：逐个析构 live 元素，并把槽位就地挂回 free 链。循环条件用
@@ -805,6 +893,113 @@ impl<T, S: Storage<T>> List<T, S> {
 // ============================================================
 // std 风格 trait 实现
 // ============================================================
+
+/// 整条链的**可搬运状态**：槽位数组 + 五个数字（`head`/`tail`/`free_head`/`free_tail`/`len`）。
+///
+/// 由 [`List::into_raw`] 取出、[`List::from_raw`] 放回。它**不是**值的所有者：
+/// 丢掉 `RawList` 只释放槽位数组，**不会析构 `T`**（和 `Vec::into_raw_parts` 一样，
+/// 元素在 `MaybeUninit` 里，本来就不由存储析构）。要拿回元素就先放回 `List`。
+///
+/// 取值器给全了序列化需要的全部信息：数组从 `storage()` 拿
+/// （[`Soa::as_parts`](crate::Soa::as_parts) / [`Packed::as_parts`](crate::Packed::as_parts) /
+/// [`Aos::as_parts`](crate::Aos::as_parts)），五个数字从这里拿。
+pub struct RawList<T, S: Storage<T>> {
+    inner: core::mem::ManuallyDrop<List<T, S>>,
+}
+
+impl<T, S: Storage<T>> RawList<T, S> {
+    /// live 元素个数（与取出时的 `List::len()` 相同）。
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len
+    }
+
+    /// 是否没有 live 元素。
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 槽位总数（live + free）。
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.storage.slots()
+    }
+
+    /// 槽位数组（`Vec` 的所有权仍在 `RawList` 里）。
+    #[inline]
+    pub fn storage(&self) -> &S {
+        &self.inner.storage
+    }
+
+    /// 槽位数组（可写）——想就地改写（比如序列化前压缩）时用。
+    ///
+    /// **改坏不变量 = 之后放回 `List` 时 UB**（链接必须是合法下标、空闲槽要带标记位）。
+    #[inline]
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.inner.storage
+    }
+
+    /// 链头槽位；空表是 `None`。
+    #[inline]
+    pub fn head_slot(&self) -> Option<Slot> {
+        (self.inner.head != NIL).then_some(Slot(self.inner.head))
+    }
+
+    /// 链尾槽位；空表是 `None`。
+    #[inline]
+    pub fn tail_slot(&self) -> Option<Slot> {
+        (self.inner.tail != NIL).then_some(Slot(self.inner.tail))
+    }
+
+    /// free 链链头（最近被回收的槽位）。
+    #[inline]
+    pub fn free_head_slot(&self) -> Option<Slot> {
+        (self.inner.free_head != NIL).then_some(Slot(self.inner.free_head))
+    }
+
+    /// free 链链尾（最早被回收、还没被复用的槽位）。
+    #[inline]
+    pub fn free_tail_slot(&self) -> Option<Slot> {
+        (self.inner.free_tail != NIL).then_some(Slot(self.inner.free_tail))
+    }
+
+    /// 按五个字面量重建（反序列化用）。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`List::from_raw`]：链接、标记位、`len` 与 `head`/`tail` 必须自洽。
+    pub unsafe fn from_fields(
+        storage: S,
+        head: Option<Slot>,
+        tail: Option<Slot>,
+        free_head: Option<Slot>,
+        free_tail: Option<Slot>,
+        len: usize,
+    ) -> Self {
+        RawList {
+            inner: core::mem::ManuallyDrop::new(List {
+                storage,
+                head: head.map_or(NIL, |slot| slot.0),
+                tail: tail.map_or(NIL, |slot| slot.0),
+                free_head: free_head.map_or(NIL, |slot| slot.0),
+                free_tail: free_tail.map_or(NIL, |slot| slot.0),
+                len,
+                marker: PhantomData,
+            }),
+        }
+    }
+}
+
+impl<T, S: Storage<T>> Drop for RawList<T, S> {
+    fn drop(&mut self) {
+        // 只放掉槽位数组。元素是 `MaybeUninit<T>`，`S` 自己从不析构它们
+        // ⇒ 这里既不会丢元素的值语义，也不会漏掉数组那块内存。
+        let storage = unsafe { core::ptr::read(&self.inner.storage) };
+
+        drop(storage);
+    }
+}
 
 impl<T, S: Storage<T> + Default> Default for List<T, S> {
     fn default() -> Self {

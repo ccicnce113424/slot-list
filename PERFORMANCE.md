@@ -401,10 +401,13 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
    （测试 `churn_does_not_allocate`：三种布局 1M 次 churn = **0** 次；对照 `LinkedList`
    1,000,000 次、链块 K=64 31,250 次）。配合固定 16 B/槽与 `with_capacity` ⇒ 内存与延迟
    都可预测（`clear` 后槽位进 free-list 复用，不还给内核）。
-3. **状态可搬运、无指针**：整条链的全部状态 = 每槽 `(T, prev, next)` + `head`/`tail`/
-   `free_head`/`free_tail`/`len`（测试 `state_is_relocatable`：原样搬进新容器，迭代与不变量
-   全一致）⇒ 可以直接序列化 / 放进共享内存 / `mmap`，**不需要指针修正**。这是不变量
-   "数组里每个值都是合法下标、`NIL` 从不写进数组"换来的。
+3. **状态可搬运、无指针（现在是公开 API）**：整条链的全部状态 = 每槽 `(T, prev, next)` +
+   `head`/`tail`/`free_head`/`free_tail`/`len`（测试 `state_is_relocatable`：原样搬进新容器，
+   迭代与不变量全一致）⇒ 可以直接序列化 / 放进共享内存 / `mmap`，**不需要指针修正**。
+   入口：[`List::into_raw`] / [`List::from_raw`]（配 `RawList` 的取值器）+ 各布局的
+   `as_parts` / `into_parts` / `from_parts`（`Link`/`Node` 已公开）+ 逐槽的
+   `iter_slots()`（live）/ `free_slots()`（free 链，LIFO）。
+   这是不变量"数组里每个值都是合法下标、`NIL` 从不写进数组"换来的。
 4. **布局是参数**：`Soa`/`Packed`/`Aos` 共用同一份实现，`Layout` 用「基址 + 步长 + 偏移」
    把三种布局统一成迭代器要的裸地址。这既是本仓库能做横向基准的原因，也让"换布局"变成
    一次类型参数改动（三种布局的实测取舍见 §2、§3）。
@@ -461,6 +464,7 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 | `move_to_front` / `move_to_back` | ✓ O(1) 内建 | ✗ 要 `insert_*` + `remove` 两步，且**产生新 index ⇒ 旧句柄失效** |
 | 整段搬运 `append` | ✓ O(1) 槽位重编号 + 下标整段偏移 | ✗ 只有 `extend`（逐个 push） |
 | 附带数据 | ✗ 无内建（但 `Slot` 是普通下标，能直接当任何 map/数组的键） | ✓ `new_data::<V>()` / `new_data_sparse::<V>()`（slotmap 的 `SecondaryMap`，键就是句柄） |
+| 整条链状态进出口 | ✓ `into_raw` / `from_raw` + `as_parts` / `from_parts` + `iter_slots` / `free_slots`（可落盘 / 共享内存，有 round-trip 测试） | ✗ 只能靠 `iter()` 逐个抄 |
 | 无序遍历 | ✓ `iter_slots() -> (Slot, &T)` | ✓ `iter_unordered() -> &LinkedListItem<T>` |
 | 有序遍历 / `retain` / `split_off` | ✓ | ✓ |
 | 按**值**查找 `contains` | ✓ | ✗（只有按句柄的 `contains_key`） |
@@ -468,7 +472,7 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 | 每槽内存（T=8） | **16 B**（data + prev + next，索引 `u32`，§2 已核对） | `LinkedListItem<usize>` = **32 B**（value + index + next + prev），**外加** slotmap 每槽的版本/占用元数据 |
 | 热路径零分配 | ✓ `churn_does_not_allocate` | ✓ 同一测试里也钉了（两边都是 0 次 malloc） |
 | 可见的 `unsafe` | 核心是 unchecked 读写 + 裸地址迭代器，靠 miri + 全套测试兜 | **0 处**（整包 `unsafe` 计数为 0）⇒ 审计/信任成本更低 |
-| 依赖 | 无（纯 std） | `slotmap`（+ 可选 `unstable` 特性开 `Walker`） |
+| 依赖 / `no_std` | 无依赖；关掉 `std` feature 即 `no_std` + `alloc` | `slotmap`（+ 可选 `unstable` 开 `Walker`）；只用 `core`，未声明 `no_std` |
 | 派生实现 | `Clone` / `Debug` / `PartialEq` / `Eq` / `Default` / `FromIterator` / `Extend` / `IntoIterator` | 只有 `Debug` |
 
 **结论**：同一数据结构的两种取舍，不是替代关系。

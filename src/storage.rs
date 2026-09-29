@@ -6,7 +6,8 @@
 //! - [`Packed`]：`data` 一个 `Vec`，`prev`/`next` 打包成 [`Link`] 交错存放
 //! - [`Aos`]：三者放进一个 `Node`（array of structs）
 
-use std::mem::{MaybeUninit, offset_of, size_of};
+use alloc::vec::Vec;
+use core::mem::{MaybeUninit, offset_of, size_of};
 
 /// 「这一侧没有邻居」。
 ///
@@ -245,6 +246,12 @@ pub trait Storage<T>: sealed::Sealed {
     /// 预留至少 `additional` 个槽位的容量（`len + additional`）。
     fn reserve(&mut self, additional: usize);
 
+    /// 把底层 `Vec` 的**多余容量**还给分配器。**槽位数不变**（空闲槽是 free 链的一部分，
+    /// 也是句柄指向的东西，不能丢）⇒ 不变量、`Slot` 句柄、链结构全都不动。
+    fn shrink_to_fit(&mut self) {
+        // 默认：无操作（自定义布局可以不支持）
+    }
+
     /// 追加一个新槽位并返回其下标。
     ///
     /// 两条链接先初始化成指向自己的自环：调用方随后就会重写需要的那几条，
@@ -346,6 +353,36 @@ impl<T, I: Ix> Soa<T, I> {
     }
 }
 
+impl<T, I: Ix> Soa<T, I> {
+    /// 裸部件（只读）：`(data, prev, next)`，三者长度相等 = 槽位数。
+    ///
+    /// **这是"状态可搬运"的入口**：整条链的全部状态 = 这些数组 + 那五个数字
+    /// （[`List::into_raw`](crate::List::into_raw)），序列化 / 落盘 / 共享内存都从这里取。
+    pub fn as_parts(&self) -> (&[MaybeUninit<T>], &[I], &[I]) {
+        (&self.data, &self.prev, &self.next)
+    }
+
+    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    pub fn into_parts(self) -> (Vec<MaybeUninit<T>>, Vec<I>, Vec<I>) {
+        (self.data, self.prev, self.next)
+    }
+
+    /// 从裸部件装回去。
+    ///
+    /// # Safety
+    ///
+    /// 调用者保证：三个数组长度相等；每个 `prev`/`next` 都是**合法槽位下标**
+    /// （不变量：`NIL` 从不写进数组，两端哑元是自环）；**空闲槽的 `prev` 最高位是
+    /// 空闲标记**（[`Ix::FREE_BIT`]），否则 `is_free` 判错、`assume_init_drop` 会踩
+    /// 未初始化数据；live 槽的 `data` 必须已初始化。不满足是 UB，不会 panic。
+    pub unsafe fn from_parts(data: Vec<MaybeUninit<T>>, prev: Vec<I>, next: Vec<I>) -> Self {
+        debug_assert_eq!(data.len(), prev.len(), "from_parts: data/prev 长度不等");
+        debug_assert_eq!(data.len(), next.len(), "from_parts: data/next 长度不等");
+
+        Self { data, prev, next }
+    }
+}
+
 impl<T, I: Ix> Default for Soa<T, I> {
     fn default() -> Self {
         Self::new()
@@ -370,6 +407,12 @@ impl<T, I: Ix> Storage<T> for Soa<T, I> {
         self.data.reserve(additional);
         self.prev.reserve(additional);
         self.next.reserve(additional);
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.data.shrink_to_fit();
+        self.prev.shrink_to_fit();
+        self.next.shrink_to_fit();
     }
 
     #[inline]
@@ -472,10 +515,16 @@ impl<T, I: Ix> Storage<T> for Soa<T, I> {
 // Packed：data 一个 Vec，prev/next 打包成 Link
 // ============================================================
 
-#[derive(Clone, Copy)]
-struct Link<I> {
-    prev: I,
-    next: I,
+/// `Packed` 布局里一条槽位的两条链接。
+///
+/// 公开是因为**裸部件 API**（`Packed::as_parts` / `from_parts`）要把它交出去 ——
+/// 想自己序列化 / 从共享内存恢复整条链，就需要能读写这个类型。
+#[derive(Clone, Copy, Debug)]
+pub struct Link<I> {
+    /// 前驱槽位下标（空闲槽的最高位是空闲标记，见 [`Ix::FREE_BIT`]）。
+    pub prev: I,
+    /// 后继槽位下标。
+    pub next: I,
 }
 
 /// 下标宽度可调（`prev`/`next` 共处一个 `Link`，所以两个字段一起窄）。
@@ -490,6 +539,30 @@ impl<T, I: Ix> Packed<T, I> {
             data: Vec::new(),
             links: Vec::new(),
         }
+    }
+}
+
+impl<T, I: Ix> Packed<T, I> {
+    /// 裸部件（只读）：`(data, links)`，两个数组长度相等 = 槽位数。
+    pub fn as_parts(&self) -> (&[MaybeUninit<T>], &[Link<I>]) {
+        (&self.data, &self.links)
+    }
+
+    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    pub fn into_parts(self) -> (Vec<MaybeUninit<T>>, Vec<Link<I>>) {
+        (self.data, self.links)
+    }
+
+    /// 从裸部件装回去。
+    ///
+    /// # Safety
+    ///
+    /// 要求与 [`Soa::from_parts`] 相同：两个数组长度相等；每个 `prev`/`next` 都是合法槽位
+    /// 下标；空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
+    pub unsafe fn from_parts(data: Vec<MaybeUninit<T>>, links: Vec<Link<I>>) -> Self {
+        debug_assert_eq!(data.len(), links.len(), "from_parts: data/links 长度不等");
+
+        Self { data, links }
     }
 }
 
@@ -516,6 +589,11 @@ impl<T, I: Ix> Storage<T> for Packed<T, I> {
 
         self.data.reserve(additional);
         self.links.reserve(additional);
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.data.shrink_to_fit();
+        self.links.shrink_to_fit();
     }
 
     #[inline]
@@ -616,10 +694,23 @@ impl<T, I: Ix> Storage<T> for Packed<T, I> {
 // AoS：全部字段放进一个 Node
 // ============================================================
 
-struct Node<T, I> {
-    data: MaybeUninit<T>,
-    prev: I,
-    next: I,
+/// `Aos` 布局里的一个槽位：元素与两条链接同处一条 cache line。
+///
+/// 公开的理由同 [`Link`]（裸部件 API）。
+pub struct Node<T, I> {
+    /// 元素；空闲槽这里是未初始化的（**不要** `assume_init`）。
+    pub data: MaybeUninit<T>,
+    /// 前驱槽位下标（空闲槽的最高位是空闲标记，见 [`Ix::FREE_BIT`]）。
+    pub prev: I,
+    /// 后继槽位下标。
+    pub next: I,
+}
+
+impl<T, I> Node<T, I> {
+    /// 组装一个槽位。
+    pub fn new(data: MaybeUninit<T>, prev: I, next: I) -> Self {
+        Self { data, prev, next }
+    }
 }
 
 /// 下标宽度可调（`prev`/`next` 就在节点里，和 `data` 同一条 cache line）。
@@ -630,6 +721,28 @@ pub struct Aos<T, I = u32> {
 impl<T, I: Ix> Aos<T, I> {
     pub const fn new() -> Self {
         Self { nodes: Vec::new() }
+    }
+}
+
+impl<T, I: Ix> Aos<T, I> {
+    /// 裸部件（只读）：`nodes`（每个节点自带元素与两条链接）。
+    pub fn as_parts(&self) -> &[Node<T, I>] {
+        &self.nodes
+    }
+
+    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    pub fn into_parts(self) -> Vec<Node<T, I>> {
+        self.nodes
+    }
+
+    /// 从裸部件装回去。
+    ///
+    /// # Safety
+    ///
+    /// 要求与 [`Soa::from_parts`] 相同：每个节点里的 `prev`/`next` 都是合法槽位下标；
+    /// 空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
+    pub unsafe fn from_parts(nodes: Vec<Node<T, I>>) -> Self {
+        Self { nodes }
     }
 }
 
@@ -655,6 +768,10 @@ impl<T, I: Ix> Storage<T> for Aos<T, I> {
         }
 
         self.nodes.reserve(additional);
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.nodes.shrink_to_fit();
     }
 
     #[inline]

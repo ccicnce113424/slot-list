@@ -8,8 +8,10 @@ name = "slot_list"
 path = "src/lib.rs"
 
 [features]
-default = ["mimalloc"]
-# `cargo bench --no-default-features` 切回系统 malloc 做 A/B 对比。
+default = ["std", "mimalloc"]
+# 关掉它就是 `no_std` + `alloc`（`cargo check --no-default-features`）。
+std = []
+# 只影响基准：`cargo bench --no-default-features` 切回系统 malloc 做 A/B 对比。
 mimalloc = []
 
 [dev-dependencies]

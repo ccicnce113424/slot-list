@@ -324,6 +324,88 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
+    /// 对齐 `CursorMut::remove_current_as_list`：把当前元素摘下来、当成一条**单元素链表**返回
+    /// （游标语义与 [`remove_current`](Self::remove_current) 一致）。
+    ///
+    /// 与 std 的差别：std 把**节点本身**接过去（`O(1)`、句柄不变），这里是"摘下来再
+    /// `push_back` 到新表" ⇒ 元素拿到**新槽位**，旧句柄作废。
+    pub fn remove_current_as_list(&mut self) -> Option<List<T, S>>
+    where
+        S: Default,
+    {
+        let value = self.remove_current()?;
+
+        let mut out = List::default();
+
+        out.push_back(value);
+
+        Some(out)
+    }
+
+    /// 对齐 `CursorMut::splice_before`：把 `list` 的元素**按原顺序**接到当前元素之前
+    /// （幽灵位置 = 追加到末尾）。
+    ///
+    /// 与 std 的差别：std 是 `O(1)` 搬链（还要求两条链同分配器），这里是逐个
+    /// `insert_before`，`O(list.len())`，且元素拿到**本表的新槽位**（旧句柄作废）。
+    pub fn splice_before(&mut self, list: List<T, S>) {
+        for value in list {
+            self.insert_before(value);
+        }
+    }
+
+    /// 对齐 `CursorMut::splice_after`：接到当前元素之后，**顺序保持**。
+    ///
+    /// （`insert_after` 每次都紧贴游标插，所以逆序喂进去才等于把 `list` 原样接在后面。）
+    pub fn splice_after(&mut self, list: List<T, S>) {
+        for value in list.into_iter().rev() {
+            self.insert_after(value);
+        }
+    }
+
+    /// 对齐 `CursorMut::split_before`：把当前元素**之前**的部分摘成一条新链表；游标留在
+    /// 剩下的表头（原当前元素成为链头）。幽灵位置（尾部）⇒ 整条表都摘走。
+    ///
+    /// **复杂度不一样**：std 是 `O(1)`（切指针），我们是 `O(pos)` —— 槽位同处一块存储，
+    /// 摘一半必须搬元素；**搬走的元素拿到新表的槽位，旧句柄作废**。
+    pub fn split_before(&mut self) -> List<T, S>
+    where
+        S: Default,
+    {
+        let at = self.index().unwrap_or(self.list.len);
+
+        let mut out = List::default();
+
+        for _ in 0..at {
+            // `at <= len` 由 `index()` 保证
+            let value = self.list.pop_front().expect("at <= len");
+
+            out.push_back(value);
+        }
+
+        if self.slot == NIL {
+            self.pos = 0;
+        } else if self.pos != POS_UNKNOWN {
+            // 当前元素现在是链头
+            self.pos = 0;
+        }
+
+        out
+    }
+
+    /// 对齐 `CursorMut::split_after`：把当前元素**之后**的部分摘成一条新链表
+    /// （游标与剩余部分不动）。复杂度同样是 `O(len - pos)`，不是 std 的 `O(1)`。
+    pub fn split_after(&mut self) -> List<T, S>
+    where
+        S: Default,
+    {
+        let at = self
+            .index()
+            .map_or(self.list.len, |pos| pos + 1)
+            .min(self.list.len);
+
+        self.list.split_off(at)
+    }
+
     /// 对齐 `CursorMut::remove_current`：返回被删元素，游标移到下一个
     /// （删的是尾元素则移到幽灵位置）。幽灵位置返回 `None`。
     pub fn remove_current(&mut self) -> Option<T> {

@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
 //! 一个双向链表，节点全部放在**预分配的连续区域**里：**槽位下标就是元素的身份**
 //! （`slot`，在元素存活期内不变），删除后的槽位用 free-list 串起来复用（LIFO）。
 //! 这就是名字 **`slot-list`** 的由来。
@@ -41,6 +43,18 @@
 //! 三者都是 [`List<T, S>`] 的别名，所有逻辑只写一遍，布局差异由
 //! [`Storage`] 策略提供。
 //!
+//! # `no_std`
+//!
+//! 关掉默认的 `std` feature 就是 `no_std` + `alloc`（`cargo check --no-default-features`）：
+//! 库本身只用 `core` 与 `alloc::vec::Vec`，没有别的依赖。
+//!
+//! # 状态可搬运（可序列化 / 共享内存）
+//!
+//! 整条链的状态 = 槽位数组 + 五个数字，**没有指针**，所以可以直接落盘或放进共享内存。
+//! 公开入口是 [`List::into_raw`] / [`List::from_raw`]（配 [`RawList`] 的取值器）与各布局的
+//! `as_parts` / `into_parts` / `from_parts`；想逐槽取状态还有
+//! [`List::iter_slots`]（live）与 [`List::free_slots`]（free 链，LIFO）。
+//!
 //! # 与 `std::collections::LinkedList` 的对齐
 //!
 //! 公开 API 与语义都对齐 `LinkedList`：
@@ -52,12 +66,25 @@
 //! - `cursor_front` / `cursor_front_mut` / `cursor_back` / `cursor_back_mut`
 //! - `iter` / `iter_mut` / `IntoIterator`（`&`、`&mut`、所有权）
 //! - `contains`、`retain`、`append`、`split_off`、`remove`
+//! - 游标的 std 对齐四件套：`remove_current_as_list` / `splice_before` /
+//!   `splice_after` / `split_before` / `split_after`（**复杂度与 std 不同**，见下）
 //! - `Clone`、`Debug`、`PartialEq`、`Eq`、`FromIterator`、`Extend`
 //! - 游标：[`Cursor`] / [`CursorMut`]，含“幽灵”位置、环形移动、
 //!   `insert_before` / `insert_after` / `remove_current` / `push_*` / `pop_*`
 //!   / `peek_*` / `as_cursor` / `as_list`
 //!
-//! 语义差异：`append` 不是 std 的 O(1) 指针拼接，而是把对方整段槽位搬过来
+//! 语义差异（都源于"槽位是同一块连续存储"这一个事实）：
+//!
+//! | 操作 | std | 本库 |
+//! |---|---|---|
+//! | `append` | O(1) 指针拼接 | O(对方槽位数)：整段搬过来 + 下标加偏移（不变量让索引只写一遍） |
+//! | `split_before` / `split_after` / `split_off` | O(1) 切指针 | **O(N) 搬元素**，且**搬走的元素拿到新槽位**（旧 `Slot` 句柄作废） |
+//! | `splice_before` / `splice_after` | O(1) | O(搬入的元素数)，逐个插入 |
+//! | `remove_current_as_list` | O(1) 搬节点 | O(1)，但元素**换新槽位** |
+//!
+//! `append` 的细节：
+//!
+//! 不是 std 的 O(1) 指针拼接，而是把对方整段槽位搬过来
 //! （下标**一边搬一边加偏移**，索引只写一遍），O(other 的槽位总数)；
 //! **对方的空闲槽也一起接过来**。想要"逐元素搬到末尾、优先复用自己已有的空闲
 //! 槽"（按活元素计费，对方稀疏时特别划算），用 [`List::append_elementwise`]。
@@ -107,6 +134,7 @@
 //! `CursorMut::splice_before` / `splice_after` / `split_before` /
 //! `split_after` / `remove_current_as_list`、分配器 API（`new_in`）。
 
+extern crate alloc;
 mod cursor;
 mod iter;
 mod list;
@@ -118,7 +146,7 @@ mod tests;
 
 pub use cursor::{Cursor, CursorMut};
 pub use iter::{IntoIter, Iter, IterMut};
-pub use list::List;
+pub use list::{List, RawList};
 pub use slot::Slot;
 pub use storage::{Aos, Ix, Packed, Soa, Storage};
 
