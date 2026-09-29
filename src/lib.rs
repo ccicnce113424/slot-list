@@ -1,6 +1,26 @@
-//! 一个双向链表，节点全部放在**预分配的连续区域**里：下标即指针，删除后的
-//! 槽位用 free-list 串起来复用（LIFO）。这就是名字 **`slot-list`** 的由来——
-//! 每个节点就是连续区域里的一个 slot，`List::at` 直接按下标定位。
+//! 一个双向链表，节点全部放在**预分配的连续区域**里：**槽位下标就是元素的身份**
+//! （`slot`，在元素存活期内不变），删除后的槽位用 free-list 串起来复用（LIFO）。
+//! 这就是名字 **`slot-list`** 的由来。
+//!
+//! # 两个"位置"：逻辑位置 `pos` 与物理槽位 `slot`
+//!
+//! 内部变量与文档里把这两个词彻底分开，**它们之间没有换算公式**：
+//!
+//! | | 逻辑位置 `pos` | 物理槽位 `slot` |
+//! |---|---|---|
+//! | 含义 | 元素在链上的次序（第几个） | 元素在连续内存里的下标（= 身份） |
+//! | 范围 | `0 .. len()` | `0 .. storage.slots()` |
+//! | 稳定性 | 每次插入/删除都会变 | **元素存活期内不变**（可当句柄用） |
+//! | 怎么拿到 | 从端点走链；`Cursor::index()` | 目前**没有公开入口**（若需要句柄，先看
+//!   `fast-list` / `slotmap`：这一格它们已经做了，`fast-list` 的 `contains_key` 即 ABA 校验；
+//!   设计取舍与同机数字见 `PERFORMANCE.md` §8） |
+//! | 换算 | `slot_at(pos)`：走链 `O(min(pos, len-1-pos))` | `pos_of(slot)`：走链 `O(len)`（未提供） |
+//!
+//! 公开 API 里带"位置"的都指**逻辑位置**：[`List::at`] / [`List::remove`] /
+//! [`Cursor::index`]（与 std 的 `Cursor::index` 一致：返回逻辑位置，幽灵位置为 `None`）/
+//! [`CursorMut::seek`] / [`CursorMut::move_steps`]。物理槽位今天只作为内部标识存在：
+//! `head` / `tail` / `free_head` / `free_tail` 与 `storage` 里的下标，**不公开**
+//! （句柄 API 的设计与取舍见仓库根目录的 `PERFORMANCE.md` §8）。
 //!
 //! 三种内存布局共用**同一份实现**：
 //!
@@ -48,7 +68,7 @@
 //!   `remaining` 计数，`retain` / `clear` 按 `len` 收尾；
 //! - **四个端点字段在链为空时都归位 `NIL`**（`head`/`tail` 看 `len == 0`，
 //!   `free_head`/`free_tail` 看 free 链变空）：这样"空不空"就是读一个字段，
-//!   而不必算 `storage.len() - len`——后者每次 free/alloc 都要跑，实测
+//!   而不必算 `storage.slots() - len`——后者每次 free/alloc 都要跑，实测
 //!   `churn` 慢 3~6%；归位只在"变空"那一次写两个字段。
 //!
 //! # 本库扩展（std 没有）
@@ -74,6 +94,7 @@
 mod cursor;
 mod iter;
 mod list;
+mod slot;
 pub mod storage;
 
 #[cfg(test)]
@@ -82,6 +103,7 @@ mod tests;
 pub use cursor::{Cursor, CursorMut};
 pub use iter::{IntoIter, Iter, IterMut};
 pub use list::List;
+pub use slot::Slot;
 pub use storage::{Aos, Packed, Soa, Storage};
 
 /// SoA 布局：`data` / `prev` / `next` 三个独立 `Vec`。

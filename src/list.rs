@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 
 use crate::cursor::{Cursor, CursorMut};
 use crate::iter::{IntoIter, Iter, IterMut};
+use crate::slot::Slot;
 use crate::storage::{Aos, NIL, Packed, Soa, Storage};
 
 /// 双向链表：`Vec` 下标 + free-list 的实现，内存布局由 `S` 决定。
@@ -24,7 +25,7 @@ use crate::storage::{Aos, NIL, Packed, Soa, Storage};
 ///
 /// **四个端点字段在链为空时都归位 [`NIL`]**：`head` / `tail` 由 `len == 0`
 /// 触发，`free_head` / `free_tail` 由"free 链变空"触发。于是"空不空"就是读
-/// 一个字段（1 次 load + 比较），而不是算 `storage.len() - len`（2 次 load +
+/// 一个字段（1 次 load + 比较），而不是算 `storage.slots() - len`（2 次 load +
 /// 减法）——后者每次 free/alloc 都跑，`churn` 基准上实测慢 3~6%（三个布局
 /// 一致，对照组反向漂移）。归位本身只在"变空"那一次写两个字段，很便宜。
 ///
@@ -142,7 +143,7 @@ impl<T, S: Storage<T>> List<T, S> {
         self.storage.set_next(pos, next);
     }
 
-    /// 把 `pos` 插成链头。调用前 `pos` 已经算进 `len`（[`alloc_node`](Self::alloc_node) 干过）。
+    /// 把 `pos` 插成链头。调用前 `pos` 已经算进 `len`（[`alloc_slot`](Self::alloc_slot) 干过）。
     #[inline]
     pub(crate) fn insert_front(&mut self, pos: usize) {
         if self.len == 1 {
@@ -156,6 +157,10 @@ impl<T, S: Storage<T>> List<T, S> {
 
             self.storage.set_prev(head, pos);
             self.storage.set_next(pos, head);
+            // 链头的 `prev` 是哑元（没人读它指向谁），但**必须写**：它同时是
+            // "槽位是 live 的"标记位所在位置，留着 free 链上的旧值会让这个
+            // 新链头看起来还是空闲的。
+            self.storage.set_prev(pos, pos);
             self.head = pos;
         }
     }
@@ -180,10 +185,10 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 从 free 链头摘一个槽位。调用前 free 链必须非空。
     #[inline]
     fn pop_free(&mut self) -> usize {
-        let index = self.free_head;
-        let next = self.storage.next(index);
+        let slot = self.free_head;
+        let next = self.storage.next(slot);
 
-        if next == index {
+        if next == slot {
             // 只剩它一个（自环终止）⇒ 链空了：归位
             self.free_head = NIL;
             self.free_tail = NIL;
@@ -191,43 +196,46 @@ impl<T, S: Storage<T>> List<T, S> {
             self.free_head = next;
         }
 
-        index
+        slot
     }
 
     /// 把槽位挂回 free 链头。
     #[inline]
-    fn push_free(&mut self, index: usize) {
+    fn push_free(&mut self, slot: usize) {
+        // 唯一需要显式改标记位的地方：从这里起它不再是 live 槽位
+        self.storage.mark_free(slot);
+
         if self.free_head == NIL {
             // 原本是空链：它同时也是链尾，`next` 写自环（NIL 决不能进数组）
-            self.free_tail = index;
-            self.storage.set_next(index, index);
+            self.free_tail = slot;
+            self.storage.set_next(slot, slot);
         } else {
-            self.storage.set_next(index, self.free_head);
+            self.storage.set_next(slot, self.free_head);
         }
 
-        self.free_head = index;
+        self.free_head = slot;
     }
 
     #[inline]
-    pub(crate) fn alloc_node(&mut self, value: T) -> usize {
-        let index = if self.free_head == NIL {
+    pub(crate) fn alloc_slot(&mut self, value: T) -> usize {
+        let slot = if self.free_head == NIL {
             self.storage.grow()
         } else {
             self.pop_free()
         };
 
         self.len += 1;
-        self.storage.data_mut(index).write(value);
+        self.storage.data_mut(slot).write(value);
 
-        index
+        slot
     }
 
     #[inline]
-    pub(crate) fn free_node(&mut self, index: usize) -> T {
-        let value = unsafe { self.storage.data_mut(index).assume_init_read() };
+    pub(crate) fn free_slot(&mut self, slot: usize) -> T {
+        let value = unsafe { self.storage.data_mut(slot).assume_init_read() };
 
         self.len -= 1;
-        self.push_free(index);
+        self.push_free(slot);
 
         if self.len == 0 {
             // 空表：端点归位（读 `head`/`tail` 的地方都能沿用旧形状）
@@ -238,32 +246,47 @@ impl<T, S: Storage<T>> List<T, S> {
         value
     }
 
-    /// 摘掉一个 live 节点并回收它（两端都可能是链头 / 链尾，所以要判断）。
+    /// 把 live 槽位从链上摘下来（**不改 `len`、不回收**）。两端都可能是链头 / 链尾，
+    /// 所以要判断。给"移动元素"（[`move_to_front`](Self::move_to_front)）与
+    /// `unlink_slot` 共用。
     #[inline]
-    pub(crate) fn remove_node(&mut self, index: usize) -> T {
-        let prev = self.storage.prev(index);
-        let next = self.storage.next(index);
+    fn detach(&mut self, slot: usize) {
+        let prev = self.storage.prev(slot);
+        let next = self.storage.next(slot);
 
-        if index == self.head {
-            // 空表时会被 `free_node` 归位成 NIL
+        if slot == self.head {
+            // 空表时会被 `free_slot` 归位成 NIL
             self.head = next;
         } else {
             self.storage.set_next(prev, next);
         }
 
-        if index == self.tail {
+        if slot == self.tail {
             self.tail = prev;
         } else {
             self.storage.set_prev(next, prev);
         }
+    }
 
-        self.free_node(index)
+    /// 摘掉一个 live 节点并回收它。
+    #[inline]
+    pub(crate) fn unlink_slot(&mut self, slot: usize) -> T {
+        self.detach(slot);
+        self.free_slot(slot)
+    }
+
+    /// 句柄校验：在范围内**且**不是空闲槽。**不碰 `data`**（空闲槽的 `data` 未初始化）。
+    #[inline]
+    fn live_slot(&self, slot: Slot) -> Option<usize> {
+        let slot = slot.0;
+
+        (slot < self.storage.slots() && !self.storage.is_free(slot)).then_some(slot)
     }
 
     /// 沿链向前走 `steps` 步。调用方保证 `steps < len`。
     #[inline]
-    fn move_forward(&self, index: usize, steps: usize) -> usize {
-        let mut current = index;
+    fn move_forward(&self, slot: usize, steps: usize) -> usize {
+        let mut current = slot;
 
         for _ in 0..steps {
             current = self.storage.next(current);
@@ -274,8 +297,8 @@ impl<T, S: Storage<T>> List<T, S> {
 
     /// 沿链向后走 `steps` 步。调用方保证 `steps < len`。
     #[inline]
-    fn move_backward(&self, index: usize, steps: usize) -> usize {
-        let mut current = index;
+    fn move_backward(&self, slot: usize, steps: usize) -> usize {
+        let mut current = slot;
 
         for _ in 0..steps {
             current = self.storage.prev(current);
@@ -287,7 +310,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 第 `pos` 个 live 节点的下标；`pos` 必须 `< len`。
     /// 从**步数更少**的一端出发：forward 走 `pos` 步，backward 走 `len-1-pos` 步。
     #[inline]
-    pub(crate) fn index_at(&self, pos: usize) -> usize {
+    pub(crate) fn slot_at(&self, pos: usize) -> usize {
         debug_assert!(pos < self.len);
 
         if pos < self.len.div_ceil(2) {
@@ -302,49 +325,49 @@ impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
 
     #[inline]
-    fn push_front_index(&mut self, value: T) -> usize {
-        let index = self.alloc_node(value);
+    fn push_front_slot(&mut self, value: T) -> usize {
+        let slot = self.alloc_slot(value);
 
-        self.insert_front(index);
+        self.insert_front(slot);
 
-        index
+        slot
     }
 
     #[inline]
-    fn push_back_index(&mut self, value: T) -> usize {
-        let index = self.alloc_node(value);
+    fn push_back_slot(&mut self, value: T) -> usize {
+        let slot = self.alloc_slot(value);
 
-        self.insert_back(index);
+        self.insert_back(slot);
 
-        index
+        slot
     }
 
     /// 对齐 `LinkedList::push_front`。
     #[inline]
     pub fn push_front(&mut self, value: T) {
-        let _ = self.push_front_index(value);
+        let _ = self.push_front_slot(value);
     }
 
     /// 对齐 `LinkedList::push_back`。
     #[inline]
     pub fn push_back(&mut self, value: T) {
-        let _ = self.push_back_index(value);
+        let _ = self.push_back_slot(value);
     }
 
     /// 对齐 `LinkedList::push_front_mut`：插入并返回新元素的引用。
     #[inline]
     pub fn push_front_mut(&mut self, value: T) -> &mut T {
-        let index = self.push_front_index(value);
+        let slot = self.push_front_slot(value);
 
-        unsafe { self.storage.data_mut(index).assume_init_mut() }
+        unsafe { self.storage.data_mut(slot).assume_init_mut() }
     }
 
     /// 对齐 `LinkedList::push_back_mut`：插入并返回新元素的引用。
     #[inline]
     pub fn push_back_mut(&mut self, value: T) -> &mut T {
-        let index = self.push_back_index(value);
+        let slot = self.push_back_slot(value);
 
-        unsafe { self.storage.data_mut(index).assume_init_mut() }
+        unsafe { self.storage.data_mut(slot).assume_init_mut() }
     }
 
     /// 对齐 `LinkedList::pop_front`。
@@ -354,12 +377,12 @@ impl<T, S: Storage<T>> List<T, S> {
             return None;
         }
 
-        let index = self.head;
+        let slot = self.head;
 
         // 链头节点的 `prev` 是哑元，不用（也没有什么可）更新；摘空了会被归位
-        self.head = self.storage.next(index);
+        self.head = self.storage.next(slot);
 
-        Some(self.free_node(index))
+        Some(self.free_slot(slot))
     }
 
     /// 对齐 `LinkedList::pop_back`。
@@ -369,11 +392,11 @@ impl<T, S: Storage<T>> List<T, S> {
             return None;
         }
 
-        let index = self.tail;
+        let slot = self.tail;
 
-        self.tail = self.storage.prev(index);
+        self.tail = self.storage.prev(slot);
 
-        Some(self.free_node(index))
+        Some(self.free_slot(slot))
     }
 
     // --------------------------------------------------------
@@ -448,6 +471,88 @@ impl<T, S: Storage<T>> List<T, S> {
         CursorMut::at(self, self.tail, self.len.saturating_sub(1))
     }
 
+    /// **本库扩展**：按稳定句柄取游标，**O(1)**。句柄失效（槽位已空闲 / 越界）返回 `None`。
+    ///
+    /// 用它进入的游标**不知道自己的逻辑位置**：`index()` / `move_steps` 需要时才会走
+    /// 一趟链算出来（`O(len)`），而按句柄的增删/搬移都是 `O(1)`。
+    ///
+    /// 不做世代校验：槽位被复用后，旧句柄会指向**新元素**（见 [`Slot`] 的文档）。
+    pub fn cursor_at(&self, slot: Slot) -> Option<Cursor<'_, T, S>> {
+        self.live_slot(slot)
+            .map(|slot| Cursor::at(self, slot, crate::cursor::POS_UNKNOWN))
+    }
+
+    /// **本库扩展**：按稳定句柄取**可变**游标，**O(1)**。语义同 [`cursor_at`](Self::cursor_at)。
+    pub fn cursor_at_mut(&mut self, slot: Slot) -> Option<CursorMut<'_, T, S>> {
+        self.live_slot(slot)
+            .map(|slot| CursorMut::at(self, slot, crate::cursor::POS_UNKNOWN))
+    }
+
+    /// **本库扩展**：按句柄删除并返回元素，**O(1)**（不需要逻辑位置）。句柄失效返回 `None`。
+    pub fn remove_slot(&mut self, slot: Slot) -> Option<T> {
+        self.live_slot(slot).map(|slot| self.unlink_slot(slot))
+    }
+
+    /// **本库扩展**：链头元素的句柄，`O(1)`。
+    pub fn front_slot(&self) -> Option<Slot> {
+        (self.head != NIL).then_some(Slot(self.head))
+    }
+
+    /// **本库扩展**：链尾元素的句柄，`O(1)`。
+    pub fn back_slot(&self) -> Option<Slot> {
+        (self.tail != NIL).then_some(Slot(self.tail))
+    }
+
+    /// **本库扩展**：把句柄指的元素搬到链头，**O(1)**（LRU 的原语之一）。
+    /// 句柄失效返回 `None`；已经在链头则是空操作。
+    pub fn move_to_front(&mut self, slot: Slot) -> Option<()> {
+        let slot = self.live_slot(slot)?;
+
+        if slot != self.head {
+            self.detach(slot);
+            self.insert_front(slot);
+        }
+
+        Some(())
+    }
+
+    /// **本库扩展**：把句柄指的元素搬到链尾，**O(1)**。语义同 [`move_to_front`](Self::move_to_front)。
+    pub fn move_to_back(&mut self, slot: Slot) -> Option<()> {
+        let slot = self.live_slot(slot)?;
+
+        if slot != self.tail {
+            self.detach(slot);
+            self.insert_back(slot);
+        }
+
+        Some(())
+    }
+
+    /// **本库扩展**：句柄的逻辑位置，**O(len)**（要数一遍）。句柄失效返回 `None`。
+    /// 只是偶尔想知道"第几个"时够用；常问就用 [`cursor_at`](Self::cursor_at) 拿游标。
+    pub fn pos_of(&self, slot: Slot) -> Option<usize> {
+        self.live_slot(slot)
+            .map(|slot| crate::cursor::pos_of_slot(self, slot))
+    }
+
+    /// **本库扩展**：边迭代边给出每个元素的稳定句柄 `(Slot, &T)`。
+    ///
+    /// 想把"链表顺序"和"自己的哈希表"接起来时用它：句柄可以当 key 存起来，
+    /// 之后用 [`cursor_at`](Self::cursor_at) / [`remove_slot`](Self::remove_slot) 回到
+    /// 那个元素（`O(1)`）。
+    pub fn iter_slots(&self) -> impl Iterator<Item = (Slot, &T)> + '_ {
+        let mut slot = self.head;
+
+        (0..self.len).map(move |_| {
+            let current = slot;
+            slot = self.storage.next(current);
+
+            (Slot(current), unsafe {
+                self.storage.data(current).assume_init_ref()
+            })
+        })
+    }
+
     /// **本库扩展**（std 没有随机访问）：定位到第 `pos` 个元素。
     /// 从较近的一端出发，O(min(pos, len - 1 - pos))。
     #[inline]
@@ -456,9 +561,9 @@ impl<T, S: Storage<T>> List<T, S> {
             return None;
         }
 
-        let index = self.index_at(pos);
+        let slot = self.slot_at(pos);
 
-        Some(CursorMut::at(self, index, pos))
+        Some(CursorMut::at(self, slot, pos))
     }
 
     // --------------------------------------------------------
@@ -501,7 +606,7 @@ impl<T, S: Storage<T>> List<T, S> {
     where
         F: FnMut(&mut T) -> bool,
     {
-        let mut index = self.head;
+        let mut slot = self.head;
         // 按个数走：两端的哑元不是 NIL，链没有"天然终点"
         let mut remaining = self.len;
 
@@ -509,15 +614,15 @@ impl<T, S: Storage<T>> List<T, S> {
             remaining -= 1;
 
             // 先取下一个：摘掉 `index` 会改写它自己的链接
-            let next = self.storage.next(index);
+            let next = self.storage.next(slot);
 
-            let keep = f(unsafe { self.storage.data_mut(index).assume_init_mut() });
+            let keep = f(unsafe { self.storage.data_mut(slot).assume_init_mut() });
 
             if !keep {
-                let _ = self.remove_node(index);
+                let _ = self.unlink_slot(slot);
             }
 
-            index = next;
+            slot = next;
         }
     }
 
@@ -531,7 +636,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 想要"逐元素搬到末尾、优先复用自己已有的空闲槽"（按活元素计费），用
     /// [`append_elementwise`](List::append_elementwise)；两条路的取舍与实测见那里。
     pub fn append(&mut self, other: &mut Self) {
-        let other_slots = other.storage.len();
+        let other_slots = other.storage.slots();
 
         if other_slots == 0 {
             return;
@@ -539,7 +644,7 @@ impl<T, S: Storage<T>> List<T, S> {
 
         let other_len = other.len;
         let self_free_empty = self.free_head == NIL;
-        let base = self.storage.len();
+        let base = self.storage.slots();
         let other_head = other.head;
         let other_tail = other.tail;
         let other_free_head = other.free_head;
@@ -611,7 +716,7 @@ impl<T, S: Storage<T>> List<T, S> {
     where
         S: Default,
     {
-        assert!(at <= self.len, "split_off index out of bounds");
+        assert!(at <= self.len, "split_off slot out of bounds");
 
         let len = self.len;
         let mut tail = Self::default();
@@ -627,11 +732,11 @@ impl<T, S: Storage<T>> List<T, S> {
 
     /// 对齐 `LinkedList::remove`。`at >= len` 时 panic。O(N)。
     pub fn remove(&mut self, at: usize) -> T {
-        assert!(at < self.len, "remove index out of bounds");
+        assert!(at < self.len, "remove slot out of bounds");
 
-        let index = self.index_at(at);
+        let slot = self.slot_at(at);
 
-        self.remove_node(index)
+        self.unlink_slot(slot)
     }
 
     /// 对齐 `LinkedList::clear`。保留已分配的容量与槽位。
@@ -640,7 +745,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// `len`（链尾的哑元不是 NIL，不能"走到 NIL 为止"）。
     ///
     /// 为什么不用"一直 `pop_front` 到空"：`pop_front` 每个元素都要走
-    /// [`remove_node`](List::remove_node) / `free_node`——读 `prev`、修补邻居、
+    /// [`unlink_slot`](List::unlink_slot) / `free_slot`——读 `prev`、修补邻居、
     /// 判断端点，还要 `assume_init_read()` **把 `T` 搬出槽位**再析构；`clear` 只读
     /// `next`、**就地** `assume_init_drop`、端点只归位一次。
     ///
@@ -650,15 +755,15 @@ impl<T, S: Storage<T>> List<T, S> {
     #[inline]
     pub fn clear(&mut self) {
         while self.len > 0 {
-            let index = self.head;
+            let slot = self.head;
 
             // 先取下一个：`push_free` 会改写 `index` 自己的 `next`
-            self.head = self.storage.next(index);
+            self.head = self.storage.next(slot);
 
-            unsafe { self.storage.data_mut(index).assume_init_drop() };
+            unsafe { self.storage.data_mut(slot).assume_init_drop() };
 
             self.len -= 1;
-            self.push_free(index);
+            self.push_free(slot);
         }
 
         self.head = NIL;

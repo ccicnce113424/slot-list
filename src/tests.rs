@@ -416,15 +416,35 @@ fn check_bulk<S: Storage<i32> + Default>() {
 // ============================================================
 
 /// 检查 `List` 文档里列出的全部不变量（只读，不改状态）。
+/// 槽位是否在 free 链上（测试用）。按**个数**走（free 链的尾巴是自环，
+/// `NIL` 从不进数组，所以不能"走到 NIL 为止"）。
+fn free_set<S: Storage<T>, T>(list: &List<T, S>) -> Vec<bool> {
+    let mut on_free = vec![false; list.storage.slots()];
+    let free = list.storage.slots() - list.len();
+    let mut slot = list.free_head;
+
+    for step in 0..free {
+        assert!(!on_free[slot], "free 链有环（第 {step} 步）");
+        on_free[slot] = true;
+        slot = list.storage.next(slot);
+    }
+
+    on_free
+}
+
 fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
-    let slots = list.storage.len();
+    let slots = list.storage.slots();
     let len = list.len();
 
-    // 1) 数组里每个值都是合法下标（**没有哨兵值**：
-    //    `append` 能把整段下标直接 `+= base`，靠的就是这条）
+    // 1) `next` 里每个值都是合法下标（**没有哨兵值**：`append` 能把整段下标直接
+    //    `+= base`，靠的就是这条）；`prev` 只对 **live** 槽位要求合法——空闲槽的
+    //    `prev` 是陈旧值（唯一用途是那个空闲标记位），不参与任何运算。
     for i in 0..slots {
-        assert!(list.storage.prev(i) < slots, "prev[{i}] 不是合法下标");
         assert!(list.storage.next(i) < slots, "next[{i}] 不是合法下标");
+
+        if !list.storage.is_free(i) {
+            assert!(list.storage.prev(i) < slots, "prev[{i}] 不是合法下标");
+        }
     }
 
     // 2) 空表时两个端点字段归位
@@ -484,6 +504,18 @@ fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
     }
 
     assert!(seen.iter().all(|&s| s), "有槽位不在任何链上");
+
+    // 5) 空闲标记位必须与"在不在 free 链上"完全一致（句柄的存活判定全靠它）：
+    //    free 链上的槽位 → `is_free` 为真；live 链上的 → 为假。
+    let on_free_chain = free_set(list);
+
+    for (i, &on_free) in on_free_chain.iter().enumerate() {
+        assert_eq!(
+            list.storage.is_free(i),
+            on_free,
+            "槽位 {i} 的空闲标记位与 free 链不一致"
+        );
+    }
 }
 
 /// 一长串操作，每步之后都验一遍不变量。
@@ -555,10 +587,10 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
     }
 
     // clear：所有槽位进 free 链，再重填到超过原有槽位数
-    let slots = list.storage.len();
+    let slots = list.storage.slots();
     list.clear();
     assert_invariants(&list);
-    assert_eq!(list.storage.len(), slots);
+    assert_eq!(list.storage.slots(), slots);
 
     for i in 0..slots + 1 {
         list.push_back(i as i32);
@@ -619,15 +651,15 @@ fn check_append<S: Storage<i32> + Default>() {
 
     // 非空 ⊕ 非空：自己没有空闲槽、对方够密 ⇒ 走整块搬运，
     // 对方的空闲槽也要一起接过来
-    let a_slots = a.storage.len();
-    let a_free = a.storage.len() - a.len();
+    let a_slots = a.storage.slots();
+    let a_free = a.storage.slots() - a.len();
     let mut b: List<i32, S> = (10..20).collect();
 
     assert_eq!(b.pop_front(), Some(10));
     assert_eq!(b.pop_back(), Some(19));
-    assert_eq!(b.storage.len(), 10);
+    assert_eq!(b.storage.slots(), 10);
 
-    let b_free = b.storage.len() - b.len();
+    let b_free = b.storage.slots() - b.len();
 
     assert_eq!(b_free, 2);
     assert_eq!(a_free, 0);
@@ -639,15 +671,15 @@ fn check_append<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![0, 1, 2, 3, 4, 11, 12, 13, 14, 15, 16, 17, 18]
     );
-    assert_eq!(a.storage.len(), a_slots + 10);
+    assert_eq!(a.storage.slots(), a_slots + 10);
     assert!(b.is_empty());
-    assert_eq!(b.storage.len(), 0, "槽位搬走了，容量留下");
+    assert_eq!(b.storage.slots(), 0, "槽位搬走了，容量留下");
     assert_invariants(&a);
     assert_invariants(&b);
 
     // 搬过来的空闲槽必须能被复用（free 链拼接正确）
-    let free = a.storage.len() - a.len();
-    let slots = a.storage.len();
+    let free = a.storage.slots() - a.len();
+    let slots = a.storage.slots();
 
     assert_eq!(free, a_free + b_free, "空闲槽数不对");
 
@@ -655,10 +687,10 @@ fn check_append<S: Storage<i32> + Default>() {
         a.push_back(i as i32);
     }
 
-    assert_eq!(a.storage.len(), slots, "空闲槽没有全部复用");
+    assert_eq!(a.storage.slots(), slots, "空闲槽没有全部复用");
 
     a.push_back(-1);
-    assert!(a.storage.len() > slots, "空闲槽用完之后应该扩容");
+    assert!(a.storage.slots() > slots, "空闲槽用完之后应该扩容");
     assert_invariants(&a);
 
     // `self` 空但带空闲槽（clear 之后）：仍然走整块搬运
@@ -698,8 +730,8 @@ fn check_append<S: Storage<i32> + Default>() {
     b.pop_back();
     a.append(&mut b);
 
-    assert_eq!(a.storage.len(), 6);
-    assert_eq!(a.storage.len() - a.len(), 2);
+    assert_eq!(a.storage.slots(), 6);
+    assert_eq!(a.storage.slots() - a.len(), 2);
     assert_eq!(a.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
     assert_invariants(&a);
 
@@ -720,16 +752,16 @@ fn check_append<S: Storage<i32> + Default>() {
     b.pop_front();
 
     let len_before = a.len();
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
-    assert!(a.storage.len() - a.len() < b.len());
+    assert!(a.storage.slots() - a.len() < b.len());
 
     a.append(&mut b);
 
     assert_eq!(a.len(), len_before + 9);
-    assert_eq!(a.storage.len(), a_slots + b_slots);
-    assert_eq!(b.storage.len(), 0);
+    assert_eq!(a.storage.slots(), a_slots + b_slots);
+    assert_eq!(b.storage.slots(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 
@@ -741,11 +773,11 @@ fn check_append<S: Storage<i32> + Default>() {
         b.pop_front();
     }
 
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
     assert_eq!(
-        (a.len(), a.storage.len(), b.len(), b.storage.len()),
+        (a.len(), a.storage.slots(), b.len(), b.storage.slots()),
         (4, 4, 4, 40)
     );
 
@@ -756,11 +788,11 @@ fn check_append<S: Storage<i32> + Default>() {
         vec![0, 1, 2, 3, 36, 37, 38, 39]
     );
     assert_eq!(
-        a.storage.len(),
+        a.storage.slots(),
         a_slots + b_slots,
         "整块连接会把对方的槽位（含死槽）一起接过来"
     );
-    assert_eq!(b.storage.len(), 0);
+    assert_eq!(b.storage.slots(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 
@@ -770,14 +802,14 @@ fn check_append<S: Storage<i32> + Default>() {
 
     b.clear();
 
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
     a.append(&mut b);
 
     assert_eq!(a.len(), 4);
-    assert_eq!(a.storage.len(), a_slots + b_slots, "空槽也被整块接过来");
-    assert_eq!(b.storage.len(), 0);
+    assert_eq!(a.storage.slots(), a_slots + b_slots, "空槽也被整块接过来");
+    assert_eq!(b.storage.slots(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 }
@@ -792,10 +824,10 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
     }
 
     let mut b: List<i32, S> = (200..203).collect();
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
-    assert_eq!(a.storage.len() - a.len(), 6);
+    assert_eq!(a.storage.slots() - a.len(), 6);
     assert_eq!(b.len(), 3);
 
     a.append_elementwise(&mut b);
@@ -804,10 +836,10 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![6, 7, 8, 9, 200, 201, 202]
     );
-    assert_eq!(a.storage.len(), a_slots, "复用空闲槽，不该扩容");
-    assert_eq!(a.storage.len() - a.len(), 6 - 3);
+    assert_eq!(a.storage.slots(), a_slots, "复用空闲槽，不该扩容");
+    assert_eq!(a.storage.slots() - a.len(), 6 - 3);
     assert!(b.is_empty());
-    assert_eq!(b.storage.len(), b_slots, "对方的槽位留在对方那里");
+    assert_eq!(b.storage.slots(), b_slots, "对方的槽位留在对方那里");
     assert_invariants(&a);
     assert_invariants(&b);
 
@@ -824,8 +856,8 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
         b.pop_front();
     }
 
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
     a.append_elementwise(&mut b);
 
@@ -833,8 +865,8 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![4, 5, 6, 7, 36, 37, 38, 39]
     );
-    assert_eq!(a.storage.len(), a_slots, "只搬活元素，不动对方的死槽");
-    assert_eq!(b.storage.len(), b_slots, "死槽留在对方那里");
+    assert_eq!(a.storage.slots(), a_slots, "只搬活元素，不动对方的死槽");
+    assert_eq!(b.storage.slots(), b_slots, "死槽留在对方那里");
     assert_invariants(&a);
     assert_invariants(&b);
 
@@ -863,14 +895,14 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
 
     b.clear();
 
-    let a_slots = a.storage.len();
-    let b_slots = b.storage.len();
+    let a_slots = a.storage.slots();
+    let b_slots = b.storage.slots();
 
     a.append_elementwise(&mut b);
 
     assert_eq!(a.len(), 5);
-    assert_eq!(a.storage.len(), a_slots);
-    assert_eq!(b.storage.len(), b_slots);
+    assert_eq!(a.storage.slots(), a_slots);
+    assert_eq!(b.storage.slots(), b_slots);
     assert_invariants(&a);
     assert_invariants(&b);
 }
@@ -1016,19 +1048,19 @@ fn check_free_list_reuse<S: Storage<i32> + Default>() {
         list.push_back(i);
     }
 
-    let capacity = list.storage.len();
+    let capacity = list.storage.slots();
 
     for _ in 0..10 {
         list.pop_front();
     }
 
-    assert_eq!(list.storage.len(), capacity);
+    assert_eq!(list.storage.slots(), capacity);
 
     for i in 0..10 {
         list.push_back(i);
     }
 
-    assert_eq!(list.storage.len(), capacity);
+    assert_eq!(list.storage.slots(), capacity);
     assert_eq!(
         list.iter().copied().collect::<Vec<_>>(),
         (0..10).collect::<Vec<_>>()
@@ -1085,7 +1117,7 @@ fn check_clear<S: Storage<Tracked> + Default>() {
         list.push_back(Tracked(Rc::clone(&count)));
     }
 
-    let slots = list.storage.len();
+    let slots = list.storage.slots();
 
     list.clear();
 
@@ -1095,14 +1127,14 @@ fn check_clear<S: Storage<Tracked> + Default>() {
     assert!(list.front().is_none());
     assert!(list.back().is_none());
     assert!(list.iter().next().is_none());
-    assert_eq!(list.storage.len(), slots);
+    assert_eq!(list.storage.slots(), slots);
 
     // 清空后重新填充应复用槽位，不扩容。
     for _ in 0..50 {
         list.push_back(Tracked(Rc::clone(&count)));
     }
 
-    assert_eq!(list.storage.len(), slots);
+    assert_eq!(list.storage.slots(), slots);
     assert_invariants(&list);
 
     drop(list);
@@ -1465,7 +1497,7 @@ fn check_state_is_relocatable<S: Storage<i32> + Default>() {
 
     let (head, tail, free_head, free_tail, len) =
         (src.head, src.tail, src.free_head, src.free_tail, src.len);
-    let slots = src.storage.len();
+    let slots = src.storage.slots();
 
     let dump: Vec<(i32, usize, usize)> = (0..slots)
         .map(|i| {
@@ -1480,7 +1512,7 @@ fn check_state_is_relocatable<S: Storage<i32> + Default>() {
     // 全新的容器：只写数组与标量，不做任何"链接修正"
     let mut dst: List<i32, S> = List::with_capacity(16);
 
-    while dst.storage.len() < slots {
+    while dst.storage.slots() < slots {
         dst.storage.grow();
     }
 
@@ -1513,4 +1545,117 @@ fn state_is_relocatable() {
     check_state_is_relocatable::<Soa<i32>>();
     check_state_is_relocatable::<Packed<i32>>();
     check_state_is_relocatable::<Aos<i32>>();
+}
+
+// ============================================================
+// 句柄（Slot）
+// ============================================================
+
+/// 句柄的入口/出口、O(1) 增删搬移、失效语义（**不做世代校验**是可接受的取舍）。
+fn check_slots<S: Storage<i32> + Default>() {
+    let mut list: List<i32, S> = (0..5).collect(); // 0 1 2 3 4
+
+    let head = list.front_slot().unwrap();
+    let tail = list.back_slot().unwrap();
+    let mid = list.at(2).unwrap().slot().unwrap();
+
+    assert_eq!(list.cursor_at(mid).unwrap().current(), Some(&2));
+    assert_eq!(list.pos_of(mid), Some(2));
+    assert_eq!(list.pos_of(head), Some(0));
+    assert_eq!(list.pos_of(tail), Some(4));
+
+    // O(1) 删除：不需要逻辑位置
+    assert_eq!(list.remove_slot(mid), Some(2));
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![0, 1, 3, 4]);
+    assert_invariants(&list);
+
+    // 失效句柄：槽位进了 free 链 ⇒ None（且判定时**不碰**空闲槽的 MaybeUninit）
+    assert!(list.cursor_at(mid).is_none());
+    assert!(list.cursor_at_mut(mid).is_none());
+    assert!(list.remove_slot(mid).is_none());
+    assert!(list.pos_of(mid).is_none());
+
+    // 槽位被复用后，旧句柄指向**新元素**（不世代校验 = 已知取舍，这里把行为钉住）
+    list.push_back(99); // free 链 LIFO ⇒ 正好复用刚空出来的那个槽位
+    assert_eq!(
+        list.cursor_at(mid).unwrap().current(),
+        Some(&99),
+        "旧句柄会指向复用后的新元素（没有世代校验）"
+    );
+
+    // O(1) 搬移（LRU 原语）
+    assert_eq!(list.move_to_front(tail), Some(()));
+    assert_eq!(
+        list.iter().copied().collect::<Vec<_>>(),
+        vec![4, 0, 1, 3, 99]
+    );
+    assert_eq!(list.move_to_back(head), Some(()));
+    assert_eq!(
+        list.iter().copied().collect::<Vec<_>>(),
+        vec![4, 1, 3, 99, 0]
+    );
+    assert_eq!(list.len(), 5);
+    assert_invariants(&list);
+
+    // 首尾句柄随搬移更新
+    assert_eq!(list.pos_of(list.front_slot().unwrap()), Some(0));
+    assert_eq!(list.pos_of(list.back_slot().unwrap()), Some(4));
+
+    // 按句柄进入的游标：位置未知 ⇒ index()/move_steps 按需走链算出来
+    let mut cursor = list.cursor_at_mut(list.front_slot().unwrap()).unwrap();
+    assert_eq!(cursor.index(), Some(0));
+    cursor.move_next();
+    assert_eq!(cursor.index(), Some(1));
+    assert!(cursor.move_steps(2));
+    assert_eq!(cursor.index(), Some(3));
+
+    // 空表边界
+    let empty: List<i32, S> = List::default();
+    assert_eq!(empty.front_slot(), None);
+    assert_eq!(empty.back_slot(), None);
+    assert_eq!(empty.iter_slots().count(), 0);
+}
+
+#[test]
+fn slots() {
+    check_slots::<Soa<i32>>();
+    check_slots::<Packed<i32>>();
+    check_slots::<Aos<i32>>();
+}
+
+/// 句柄当别的容器的 key（LRU / `LinkedHashMap` 用法的最小验证）。
+fn check_slot_as_key<S: Storage<i32> + Default>() {
+    use std::collections::HashMap;
+
+    let mut list: List<i32, S> = (0..4).collect();
+    let mut keys: Vec<Slot> = list.iter_slots().map(|(slot, _)| slot).collect();
+    let mut map: HashMap<Slot, i32> = list.iter_slots().map(|(slot, &v)| (slot, v)).collect();
+
+    // 用句柄 O(1) 改值、搬位置、删除——全程不需要"第几个"
+    for (i, &slot) in keys.iter().enumerate() {
+        map.insert(slot, 100 + i as i32);
+        assert_eq!(list.move_to_front(slot), Some(()));
+    }
+
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![3, 2, 1, 0]);
+    assert_invariants(&list);
+
+    let victim = keys.swap_remove(1);
+    assert_eq!(map.remove(&victim), Some(101));
+    assert_eq!(list.remove_slot(victim), Some(1));
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![3, 2, 0]);
+
+    // 剩下的句柄仍然有效，且能取回自己的位置
+    for &slot in &keys {
+        assert!(list.cursor_at(slot).is_some());
+        assert!(list.pos_of(slot).is_some());
+    }
+    assert_invariants(&list);
+}
+
+#[test]
+fn slot_as_key() {
+    check_slot_as_key::<Soa<i32>>();
+    check_slot_as_key::<Packed<i32>>();
+    check_slot_as_key::<Aos<i32>>();
 }

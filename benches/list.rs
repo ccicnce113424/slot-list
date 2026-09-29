@@ -33,7 +33,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use slot_list::{AosList, PackedList, SoaList};
+use slot_list::{AosList, PackedList, Slot, SoaList};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -145,6 +145,37 @@ macro_rules! bench_insert_before_remove {
             }
 
             black_box(cursor.index());
+        }
+    };
+}
+
+/// 随机位置"删一个 + 原地插回"：
+/// - `by_handle`：`cursor_at(handle)` —— **O(1)** 入口；
+/// - `by_pos`   ：`at(pos)`          —— O(N) 走链入口。
+///
+/// 两者**做的工作完全一样**，唯一区别是进入方式。
+macro_rules! bench_slot_vs_pos {
+    ($by_handle:ident, $by_pos:ident, $ty:ty) => {
+        fn $by_handle(list: &mut $ty, handles: &[Slot]) {
+            for (i, &handle) in handles.iter().enumerate() {
+                let mut cursor = list.cursor_at_mut(handle).unwrap();
+                let value = cursor.remove_current().unwrap();
+
+                cursor.insert_before(value ^ (i as usize));
+
+                black_box(value);
+            }
+        }
+
+        fn $by_pos(list: &mut $ty, positions: &[usize]) {
+            for (i, &pos) in positions.iter().enumerate() {
+                let mut cursor = list.at(pos).unwrap();
+                let value = cursor.remove_current().unwrap();
+
+                cursor.insert_before(value ^ (i as usize));
+
+                black_box(value);
+            }
         }
     };
 }
@@ -863,6 +894,10 @@ fn linkedlist_blob_push_back_pop_front() {
     }
 }
 
+bench_slot_vs_pos!(soalist_by_handle, soalist_by_pos, SoaList<usize>);
+bench_slot_vs_pos!(packedlist_by_handle, packedlist_by_pos, PackedList<usize>);
+bench_slot_vs_pos!(aoslist_by_handle, aoslist_by_pos, AosList<usize>);
+
 // ============================================================
 // Criterion groups
 // ============================================================
@@ -1174,6 +1209,50 @@ fn blob_iter(c: &mut Criterion) {
     g.finish();
 }
 
+/// 句柄入口（O(1)）vs 逻辑位置入口（O(N)）：**同一个工作**，只有入口不同。
+/// 这一组就是"要不要把 Slot 暴露出来"的量化依据。
+fn slot_entry(c: &mut Criterion) {
+    let positions = make_random_positions(N, RANDOM_OPS);
+    let mut soalist = make_soalist();
+    let mut packedlist = make_packedlist();
+    let mut aoslist = make_aoslist();
+
+    // 句柄在计时区外先取好（取的时候要站到那个位置，是 O(N)）
+    let soa_handles: Vec<Slot> = positions
+        .iter()
+        .map(|&pos| soalist.at(pos).unwrap().slot().unwrap())
+        .collect();
+    let packed_handles: Vec<Slot> = positions
+        .iter()
+        .map(|&pos| packedlist.at(pos).unwrap().slot().unwrap())
+        .collect();
+    let aos_handles: Vec<Slot> = positions
+        .iter()
+        .map(|&pos| aoslist.at(pos).unwrap().slot().unwrap())
+        .collect();
+
+    let mut g = c.benchmark_group("slot_entry");
+    g.bench_function("SoaList::by_handle", |b| {
+        b.iter(|| soalist_by_handle(&mut soalist, &soa_handles))
+    });
+    g.bench_function("SoaList::by_pos", |b| {
+        b.iter(|| soalist_by_pos(&mut soalist, &positions))
+    });
+    g.bench_function("PackedList::by_handle", |b| {
+        b.iter(|| packedlist_by_handle(&mut packedlist, &packed_handles))
+    });
+    g.bench_function("PackedList::by_pos", |b| {
+        b.iter(|| packedlist_by_pos(&mut packedlist, &positions))
+    });
+    g.bench_function("AosList::by_handle", |b| {
+        b.iter(|| aoslist_by_handle(&mut aoslist, &aos_handles))
+    });
+    g.bench_function("AosList::by_pos", |b| {
+        b.iter(|| aoslist_by_pos(&mut aoslist, &positions))
+    });
+    g.finish();
+}
+
 fn blob_end_ops(c: &mut Criterion) {
     let mut g = c.benchmark_group("blob_end_ops");
     g.bench_function("SoaList", |b| b.iter(soalist_blob_push_back_pop_front));
@@ -1206,6 +1285,7 @@ criterion_group! {
         append_blob,
         blob_iter,
         blob_end_ops,
+        slot_entry,
 }
 
 criterion_main!(benches);

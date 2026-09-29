@@ -17,6 +17,26 @@ use std::mem::{MaybeUninit, offset_of, size_of};
 /// 的前提。
 pub(crate) const NIL: usize = usize::MAX;
 
+/// 「这个槽位当前空闲」的标记位，存在 `prev` 的**最高位**。
+///
+/// 为什么要它：句柄（[`Slot`](crate::Slot)）是指向槽位的裸标识，槽位会被 free-list
+/// 复用 ⇒ 必须能 O(1) 判断"这个槽位现在活没活"，**否则就要对空闲槽的
+/// `MaybeUninit` 做 `assume_init_*`（UB）**。
+///
+/// 为什么放在 `prev` 的最高位：
+///
+/// - **写入次数最少**：live 槽位的 `prev` 由链接写入覆盖（那些值天然没有这一位），
+///   空闲槽位只被 free 链用到 `next` ⇒ 这一位**只在"变空闲"那一次**需要显式写，
+///   链接写入路径上没有任何 read-modify-write；
+/// - **`append` 的整段 `+= base` 自己会带着它走**：`2^63 | v` 加 `base` 仍是
+///   `2^63 | (v + base)`，只要不溢出 `u64` 就不需要特例（`v + base < 2^63`，而
+///   槽位数远小于此 ⇒ 实际永远成立，`debug_assert` 兜底）；
+/// - **读值处一律掩码**：`Storage::prev` 返回掩码后的下标，`is_free` 只看那一位。
+///
+/// 代价：每个"变成空闲"的槽位一次 read-modify-write（`pop`/`remove`/`clear` 等
+/// 每条回收路径一次）。
+pub(crate) const FREE_BIT: usize = 1 << (usize::BITS - 1);
+
 /// [`Iter`](crate::Iter) / [`IterMut`](crate::IterMut) 需要的裸地址布局。
 ///
 /// 三种 `Storage` 把同样的三个逻辑字段放在完全不同的位置，迭代器又必须用裸地址
@@ -89,11 +109,11 @@ pub mod sealed {
 /// [`List`](crate::List) 的实现细节，出现在类型参数位置上。
 pub trait Storage<T>: sealed::Sealed {
     /// 已分配的槽位总数（live + free）。
-    fn len(&self) -> usize;
+    fn slots(&self) -> usize;
 
     /// 是否没有任何槽位。
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.slots() == 0
     }
 
     /// 预留至少 `additional` 个槽位的容量（`len + additional`）。
@@ -107,7 +127,7 @@ pub trait Storage<T>: sealed::Sealed {
     fn grow(&mut self) -> usize;
 
     /// 把 `other` 的全部槽位接到 `self` 后面，并把搬过来的**每个下标都加上
-    /// 偏移**（偏移量 = 搬运前 `self.len()`，由实现自己取）。搬完 `other` 变空
+    /// 偏移**（偏移量 = 搬运前 `self.slots()`，由实现自己取）。搬完 `other` 变空
     /// （容量留在它自己那里）。
     ///
     /// 关键是"一边复制一边把**已经更新过**的索引写进自己的 `Vec`"：索引只写
@@ -152,12 +172,20 @@ pub trait Storage<T>: sealed::Sealed {
     ///   再付一次全量搬运（实测 3.9→7.5 ms、15.5→34.0 ms，**翻倍**）
     fn append(&mut self, other: &mut Self);
 
-    fn data(&self, index: usize) -> &MaybeUninit<T>;
-    fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T>;
-    fn prev(&self, index: usize) -> usize;
-    fn next(&self, index: usize) -> usize;
-    fn set_prev(&mut self, index: usize, value: usize);
-    fn set_next(&mut self, index: usize, value: usize);
+    fn data(&self, slot: usize) -> &MaybeUninit<T>;
+    fn data_mut(&mut self, slot: usize) -> &mut MaybeUninit<T>;
+    /// 槽位当前是否空闲。**只看 `prev` 的最高位**，不读 `data`（空闲槽的 `data`
+    /// 是未初始化的，碰它就是 UB）。
+    fn is_free(&self, slot: usize) -> bool;
+
+    /// 把槽位标记成空闲（挂回 free 链时调用）。重复标记是幂等的。
+    fn mark_free(&mut self, slot: usize);
+
+    /// 槽位的前驱下标。**返回值已掩掉空闲标记位**。
+    fn prev(&self, slot: usize) -> usize;
+    fn next(&self, slot: usize) -> usize;
+    fn set_prev(&mut self, slot: usize, value: usize);
+    fn set_next(&mut self, slot: usize, value: usize);
 
     #[doc(hidden)]
     fn layout(&mut self) -> Layout;
@@ -193,7 +221,7 @@ impl<T> sealed::Sealed for Soa<T> {}
 
 impl<T> Storage<T> for Soa<T> {
     #[inline]
-    fn len(&self) -> usize {
+    fn slots(&self) -> usize {
         self.data.len()
     }
 
@@ -205,59 +233,68 @@ impl<T> Storage<T> for Soa<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
-        let index = self.data.len();
+        let slot = self.data.len();
 
         self.data.push(MaybeUninit::uninit());
         // 哑元：指向自己的自环（合法下标，见 trait 里的说明）
-        self.prev.push(index);
-        self.next.push(index);
+        self.prev.push(slot);
+        self.next.push(slot);
 
-        index
+        slot
     }
 
     fn append(&mut self, other: &mut Self) {
-        let base = self.len();
+        let base = self.slots();
 
         // data 没有下标要修 ⇒ 直接整块搬（会搬空 other.data）
         self.data.append(&mut other.data);
         // 两个索引数组一边复制一边加：只写一遍
-        self.prev
-            .extend(other.prev.iter().map(|&index| index + base));
-        self.next
-            .extend(other.next.iter().map(|&index| index + base));
+        self.prev.extend(other.prev.iter().map(|&slot| slot + base));
+        self.next.extend(other.next.iter().map(|&slot| slot + base));
 
         other.prev.clear();
         other.next.clear();
     }
 
     #[inline]
-    fn data(&self, index: usize) -> &MaybeUninit<T> {
-        unsafe { self.data.get_unchecked(index) }
+    fn data(&self, slot: usize) -> &MaybeUninit<T> {
+        unsafe { self.data.get_unchecked(slot) }
     }
 
     #[inline]
-    fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
-        unsafe { self.data.get_unchecked_mut(index) }
+    fn data_mut(&mut self, slot: usize) -> &mut MaybeUninit<T> {
+        unsafe { self.data.get_unchecked_mut(slot) }
     }
 
     #[inline]
-    fn prev(&self, index: usize) -> usize {
-        unsafe { *self.prev.get_unchecked(index) }
+    fn is_free(&self, slot: usize) -> bool {
+        unsafe { *self.prev.get_unchecked(slot) & FREE_BIT != 0 }
     }
 
     #[inline]
-    fn next(&self, index: usize) -> usize {
-        unsafe { *self.next.get_unchecked(index) }
+    fn mark_free(&mut self, slot: usize) {
+        unsafe { *self.prev.get_unchecked_mut(slot) |= FREE_BIT };
     }
 
     #[inline]
-    fn set_prev(&mut self, index: usize, value: usize) {
-        unsafe { *self.prev.get_unchecked_mut(index) = value };
+    fn prev(&self, slot: usize) -> usize {
+        // 掩掉空闲标记位：调用方要的是下标
+        unsafe { *self.prev.get_unchecked(slot) & !FREE_BIT }
     }
 
     #[inline]
-    fn set_next(&mut self, index: usize, value: usize) {
-        unsafe { *self.next.get_unchecked_mut(index) = value };
+    fn next(&self, slot: usize) -> usize {
+        unsafe { *self.next.get_unchecked(slot) }
+    }
+
+    #[inline]
+    fn set_prev(&mut self, slot: usize, value: usize) {
+        unsafe { *self.prev.get_unchecked_mut(slot) = value };
+    }
+
+    #[inline]
+    fn set_next(&mut self, slot: usize, value: usize) {
+        unsafe { *self.next.get_unchecked_mut(slot) = value };
     }
 
     fn layout(&mut self) -> Layout {
@@ -307,7 +344,7 @@ impl<T> sealed::Sealed for Packed<T> {}
 
 impl<T> Storage<T> for Packed<T> {
     #[inline]
-    fn len(&self) -> usize {
+    fn slots(&self) -> usize {
         self.links.len()
     }
 
@@ -318,19 +355,19 @@ impl<T> Storage<T> for Packed<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
-        let index = self.data.len();
+        let slot = self.data.len();
 
         self.data.push(MaybeUninit::uninit());
         self.links.push(Link {
-            prev: index,
-            next: index,
+            prev: slot,
+            next: slot,
         });
 
-        index
+        slot
     }
 
     fn append(&mut self, other: &mut Self) {
-        let base = self.len();
+        let base = self.slots();
 
         self.data.append(&mut other.data);
         // 两条链接打包在同一个数组里，也只需要写一遍
@@ -343,33 +380,43 @@ impl<T> Storage<T> for Packed<T> {
     }
 
     #[inline]
-    fn data(&self, index: usize) -> &MaybeUninit<T> {
-        unsafe { self.data.get_unchecked(index) }
+    fn data(&self, slot: usize) -> &MaybeUninit<T> {
+        unsafe { self.data.get_unchecked(slot) }
     }
 
     #[inline]
-    fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
-        unsafe { self.data.get_unchecked_mut(index) }
+    fn data_mut(&mut self, slot: usize) -> &mut MaybeUninit<T> {
+        unsafe { self.data.get_unchecked_mut(slot) }
     }
 
     #[inline]
-    fn prev(&self, index: usize) -> usize {
-        unsafe { self.links.get_unchecked(index).prev }
+    fn is_free(&self, slot: usize) -> bool {
+        unsafe { self.links.get_unchecked(slot).prev & FREE_BIT != 0 }
     }
 
     #[inline]
-    fn next(&self, index: usize) -> usize {
-        unsafe { self.links.get_unchecked(index).next }
+    fn mark_free(&mut self, slot: usize) {
+        unsafe { self.links.get_unchecked_mut(slot).prev |= FREE_BIT };
     }
 
     #[inline]
-    fn set_prev(&mut self, index: usize, value: usize) {
-        unsafe { self.links.get_unchecked_mut(index).prev = value };
+    fn prev(&self, slot: usize) -> usize {
+        unsafe { self.links.get_unchecked(slot).prev & !FREE_BIT }
     }
 
     #[inline]
-    fn set_next(&mut self, index: usize, value: usize) {
-        unsafe { self.links.get_unchecked_mut(index).next = value };
+    fn next(&self, slot: usize) -> usize {
+        unsafe { self.links.get_unchecked(slot).next }
+    }
+
+    #[inline]
+    fn set_prev(&mut self, slot: usize, value: usize) {
+        unsafe { self.links.get_unchecked_mut(slot).prev = value };
+    }
+
+    #[inline]
+    fn set_next(&mut self, slot: usize, value: usize) {
+        unsafe { self.links.get_unchecked_mut(slot).next = value };
     }
 
     fn layout(&mut self) -> Layout {
@@ -417,7 +464,7 @@ impl<T> sealed::Sealed for Aos<T> {}
 
 impl<T> Storage<T> for Aos<T> {
     #[inline]
-    fn len(&self) -> usize {
+    fn slots(&self) -> usize {
         self.nodes.len()
     }
 
@@ -427,19 +474,19 @@ impl<T> Storage<T> for Aos<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
-        let index = self.nodes.len();
+        let slot = self.nodes.len();
 
         self.nodes.push(Node {
             data: MaybeUninit::uninit(),
-            prev: index,
-            next: index,
+            prev: slot,
+            next: slot,
         });
 
-        index
+        slot
     }
 
     fn append(&mut self, other: &mut Self) {
-        let base = self.len();
+        let base = self.slots();
 
         // data 和两条链接在同一个数组里，"一遍过"就意味着 data 也要逐元素搬
         // （丢掉了 memcpy）；这里按最省事的方式写，让编译器 best-effort。
@@ -451,33 +498,43 @@ impl<T> Storage<T> for Aos<T> {
     }
 
     #[inline]
-    fn data(&self, index: usize) -> &MaybeUninit<T> {
-        unsafe { &self.nodes.get_unchecked(index).data }
+    fn data(&self, slot: usize) -> &MaybeUninit<T> {
+        unsafe { &self.nodes.get_unchecked(slot).data }
     }
 
     #[inline]
-    fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
-        unsafe { &mut self.nodes.get_unchecked_mut(index).data }
+    fn data_mut(&mut self, slot: usize) -> &mut MaybeUninit<T> {
+        unsafe { &mut self.nodes.get_unchecked_mut(slot).data }
     }
 
     #[inline]
-    fn prev(&self, index: usize) -> usize {
-        unsafe { self.nodes.get_unchecked(index).prev }
+    fn is_free(&self, slot: usize) -> bool {
+        unsafe { self.nodes.get_unchecked(slot).prev & FREE_BIT != 0 }
     }
 
     #[inline]
-    fn next(&self, index: usize) -> usize {
-        unsafe { self.nodes.get_unchecked(index).next }
+    fn mark_free(&mut self, slot: usize) {
+        unsafe { self.nodes.get_unchecked_mut(slot).prev |= FREE_BIT };
     }
 
     #[inline]
-    fn set_prev(&mut self, index: usize, value: usize) {
-        unsafe { self.nodes.get_unchecked_mut(index).prev = value };
+    fn prev(&self, slot: usize) -> usize {
+        unsafe { self.nodes.get_unchecked(slot).prev & !FREE_BIT }
     }
 
     #[inline]
-    fn set_next(&mut self, index: usize, value: usize) {
-        unsafe { self.nodes.get_unchecked_mut(index).next = value };
+    fn next(&self, slot: usize) -> usize {
+        unsafe { self.nodes.get_unchecked(slot).next }
+    }
+
+    #[inline]
+    fn set_prev(&mut self, slot: usize, value: usize) {
+        unsafe { self.nodes.get_unchecked_mut(slot).prev = value };
+    }
+
+    #[inline]
+    fn set_next(&mut self, slot: usize, value: usize) {
+        unsafe { self.nodes.get_unchecked_mut(slot).next = value };
     }
 
     fn layout(&mut self) -> Layout {
