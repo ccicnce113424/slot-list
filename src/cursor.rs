@@ -39,71 +39,70 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
 
     /// 对齐 `Cursor::peek_next`，不移动游标。
     pub fn peek_next(&self) -> Option<&'a T> {
+        // 空表没有下一个；已经在链尾也没有（尾的 `next` 是哑元）
+        if self.list.len == 0 || (self.node != NIL && self.node == self.list.tail) {
+            return None;
+        }
+
         let next = if self.node == NIL {
             self.list.head
         } else {
             self.list.storage.next(self.node)
         };
 
-        if next == NIL {
-            return None;
-        }
-
         Some(unsafe { self.list.storage.data(next).assume_init_ref() })
     }
 
     /// 对齐 `Cursor::peek_prev`，不移动游标。
     pub fn peek_prev(&self) -> Option<&'a T> {
+        // 空表没有上一个；已经在链头也没有（链头的 `prev` 是哑元）
+        if self.list.len == 0 || (self.node != NIL && self.node == self.list.head) {
+            return None;
+        }
+
         let prev = if self.node == NIL {
             self.list.tail
         } else {
             self.list.storage.prev(self.node)
         };
 
-        if prev == NIL {
-            return None;
-        }
-
         Some(unsafe { self.list.storage.data(prev).assume_init_ref() })
     }
 
     /// 对齐 `Cursor::move_next`。
     pub fn move_next(&mut self) {
-        if self.node == NIL {
+        if self.list.len == 0 {
+            // 空表上永远在幽灵位置
+            self.node = NIL;
+            self.pos = 0;
+        } else if self.node == NIL {
             self.node = self.list.head;
             self.pos = 0;
+        } else if self.node == self.list.tail {
+            // 越过链尾：进入幽灵位置
+            self.node = NIL;
+            self.pos = 0;
         } else {
-            let next = self.list.storage.next(self.node);
-
-            if next == NIL {
-                self.node = NIL;
-                self.pos = 0;
-            } else {
-                self.node = next;
-                self.pos += 1;
-            }
+            self.node = self.list.storage.next(self.node);
+            self.pos += 1;
         }
     }
 
     /// 对齐 `Cursor::move_prev`。
     pub fn move_prev(&mut self) {
-        if self.node == NIL {
+        if self.list.len == 0 {
+            self.node = NIL;
+            self.pos = 0;
+        } else if self.node == NIL {
             self.node = self.list.tail;
-            self.pos = if self.list.len == 0 {
-                0
-            } else {
-                self.list.len - 1
-            };
+            self.pos = self.list.len - 1;
+        } else if self.node == self.list.head {
+            // 越过链头：进入幽灵位置
+            self.node = NIL;
+            self.pos = 0;
         } else {
-            let prev = self.list.storage.prev(self.node);
-
-            if prev == NIL {
-                self.node = NIL;
-                self.pos = 0;
-            } else {
-                self.node = prev;
-                self.pos -= 1;
-            }
+            self.node = self.list.storage.prev(self.node);
+            self.pos -= 1;
         }
     }
 
@@ -156,71 +155,68 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
 
     /// 对齐 `CursorMut::peek_next`，不移动游标。
     pub fn peek_next(&mut self) -> Option<&mut T> {
+        if self.list.len == 0 || (self.node != NIL && self.node == self.list.tail) {
+            return None;
+        }
+
         let next = if self.node == NIL {
             self.list.head
         } else {
             self.list.storage.next(self.node)
         };
 
-        if next == NIL {
-            return None;
-        }
-
         Some(unsafe { self.list.storage.data_mut(next).assume_init_mut() })
     }
 
     /// 对齐 `CursorMut::peek_prev`，不移动游标。
     pub fn peek_prev(&mut self) -> Option<&mut T> {
+        if self.list.len == 0 || (self.node != NIL && self.node == self.list.head) {
+            return None;
+        }
+
         let prev = if self.node == NIL {
             self.list.tail
         } else {
             self.list.storage.prev(self.node)
         };
 
-        if prev == NIL {
-            return None;
-        }
-
         Some(unsafe { self.list.storage.data_mut(prev).assume_init_mut() })
     }
 
     /// 对齐 `CursorMut::move_next`。
     pub fn move_next(&mut self) {
-        if self.node == NIL {
+        if self.list.len == 0 {
+            // 空表上永远在幽灵位置
+            self.node = NIL;
+            self.pos = 0;
+        } else if self.node == NIL {
             self.node = self.list.head;
             self.pos = 0;
+        } else if self.node == self.list.tail {
+            // 越过链尾：进入幽灵位置
+            self.node = NIL;
+            self.pos = 0;
         } else {
-            let next = self.list.storage.next(self.node);
-
-            if next == NIL {
-                self.node = NIL;
-                self.pos = 0;
-            } else {
-                self.node = next;
-                self.pos += 1;
-            }
+            self.node = self.list.storage.next(self.node);
+            self.pos += 1;
         }
     }
 
     /// 对齐 `CursorMut::move_prev`。
     pub fn move_prev(&mut self) {
-        if self.node == NIL {
+        if self.list.len == 0 {
+            self.node = NIL;
+            self.pos = 0;
+        } else if self.node == NIL {
             self.node = self.list.tail;
-            self.pos = if self.list.len == 0 {
-                0
-            } else {
-                self.list.len - 1
-            };
+            self.pos = self.list.len - 1;
+        } else if self.node == self.list.head {
+            // 越过链头：进入幽灵位置
+            self.node = NIL;
+            self.pos = 0;
         } else {
-            let prev = self.list.storage.prev(self.node);
-
-            if prev == NIL {
-                self.node = NIL;
-                self.pos = 0;
-            } else {
-                self.node = prev;
-                self.pos -= 1;
-            }
+            self.node = self.list.storage.prev(self.node);
+            self.pos -= 1;
         }
     }
 
@@ -230,13 +226,17 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         let new = self.list.alloc_node(item);
 
         if self.node == NIL {
-            let tail = self.list.tail;
+            // 幽灵位置：追加到末尾
+            self.list.insert_back(new);
+        } else if self.node == self.list.head {
+            // 插在链头之前：新节点成为链头（原链头的 `prev` 是哑元，不能用）
+            self.list.insert_front(new);
 
-            self.list.insert_link(new, tail, NIL);
+            self.pos += 1;
         } else {
             let prev = self.list.storage.prev(self.node);
 
-            self.list.insert_link(new, prev, self.node);
+            self.list.insert_between(new, prev, self.node);
 
             self.pos += 1;
         }
@@ -247,13 +247,15 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         let new = self.list.alloc_node(item);
 
         if self.node == NIL {
-            let head = self.list.head;
-
-            self.list.insert_link(new, NIL, head);
+            // 幽灵位置：插到最前（空表时也是这一支）
+            self.list.insert_front(new);
+        } else if self.node == self.list.tail {
+            // 插在链尾之后：新节点成为链尾（原链尾的 `next` 是哑元）
+            self.list.insert_back(new);
         } else {
             let next = self.list.storage.next(self.node);
 
-            self.list.insert_link(new, self.node, next);
+            self.list.insert_between(new, self.node, next);
         }
     }
 
@@ -265,18 +267,20 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
 
         let node = self.node;
-        let prev = self.list.storage.prev(node);
         let next = self.list.storage.next(node);
+        // 摘之前判断：摘掉链尾之后 `tail` 就变了
+        let was_tail = node == self.list.tail;
 
-        self.list.remove_link(prev, next);
+        let value = self.list.remove_node(node);
 
-        self.node = next;
-
-        if next == NIL {
+        if was_tail {
+            self.node = NIL;
             self.pos = 0;
+        } else {
+            self.node = next;
         }
 
-        Some(self.list.free_node(node))
+        Some(value)
     }
 
     /// 对齐 `CursorMut::push_front`。游标指向的节点不变。

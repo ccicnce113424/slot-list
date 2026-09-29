@@ -19,7 +19,7 @@ use slot_list::{AosList, PackedList, SoaList};
 
 use fast_list::LinkedList as FastLinkedList;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use std::{
     collections::{LinkedList, VecDeque},
@@ -191,6 +191,24 @@ macro_rules! bench_cursor_update {
     };
 }
 
+/// 整块搬运：`a.append(&mut b)`（输入由 `iter_batched` 在计时区外造好）。
+///
+/// **返回值必须把两个链表交回去**：否则它们会在计时区内析构，而"析构一个
+/// 2M 节点的链表"会把这个基准彻底带偏（各基线的析构代价差得也很远：
+/// `LinkedList` 是 2M 次 `Box` 释放，`Vec` 是零）。交给 criterion 之后，
+/// 析构发生在计时之后。
+macro_rules! bench_append {
+    ($name:ident, $ty:ty) => {
+        fn $name(mut a: $ty, mut b: $ty) -> ($ty, $ty) {
+            a.append(&mut b);
+
+            black_box(a.len());
+
+            (a, b)
+        }
+    };
+}
+
 macro_rules! bench_construct_blob {
     ($name:ident, $ty:ty) => {
         fn $name() -> $ty {
@@ -302,6 +320,10 @@ bench_random_remove_insert!(aoslist_random_remove_insert, AosList<usize>);
 bench_cursor_update!(soalist_cursor_update, SoaList<usize>);
 bench_cursor_update!(packedlist_cursor_update, PackedList<usize>);
 bench_cursor_update!(aoslist_cursor_update, AosList<usize>);
+
+bench_append!(soalist_append, SoaList<usize>);
+bench_append!(packedlist_append, PackedList<usize>);
+bench_append!(aoslist_append, AosList<usize>);
 
 bench_construct_blob!(make_soalist_blob, SoaList<Blob64>);
 bench_construct_blob!(make_packedlist_blob, PackedList<Blob64>);
@@ -755,6 +777,40 @@ fn fastlist_index_update(list: &mut FastLinkedList<usize>) {
     black_box(checksum);
 }
 
+// ---- append（整块搬运）----
+
+fn vecdeque_append(
+    mut a: VecDeque<usize>,
+    mut b: VecDeque<usize>,
+) -> (VecDeque<usize>, VecDeque<usize>) {
+    a.append(&mut b);
+
+    black_box(a.len());
+
+    (a, b)
+}
+
+/// std 的 `LinkedList::append` 是 O(1) 指针拼接（不搬元素）。
+fn linkedlist_append(
+    mut a: LinkedList<usize>,
+    mut b: LinkedList<usize>,
+) -> (LinkedList<usize>, LinkedList<usize>) {
+    a.append(&mut b);
+
+    black_box(a.len());
+
+    (a, b)
+}
+
+/// `Vec` 是"整块 memcpy"的天然上限，用来标定"复制 + 修下标"有多贵。
+fn vec_append(mut a: Vec<usize>, mut b: Vec<usize>) -> (Vec<usize>, Vec<usize>) {
+    a.append(&mut b);
+
+    black_box(a.len());
+
+    (a, b)
+}
+
 // ============================================================
 // 64 字节元素
 // ============================================================
@@ -1065,6 +1121,54 @@ fn cursor_update(c: &mut Criterion) {
     g.finish();
 }
 
+fn append(c: &mut Criterion) {
+    let mut g = c.benchmark_group("append");
+
+    g.bench_function("SoaList", |b| {
+        b.iter_batched(
+            || (make_soalist(), make_soalist()),
+            |(a, b)| soalist_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("PackedList", |b| {
+        b.iter_batched(
+            || (make_packedlist(), make_packedlist()),
+            |(a, b)| packedlist_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("AosList", |b| {
+        b.iter_batched(
+            || (make_aoslist(), make_aoslist()),
+            |(a, b)| aoslist_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("VecDeque", |b| {
+        b.iter_batched(
+            || (make_vecdeque(), make_vecdeque()),
+            |(a, b)| vecdeque_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("LinkedList", |b| {
+        b.iter_batched(
+            || (make_linkedlist(), make_linkedlist()),
+            |(a, b)| linkedlist_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.bench_function("Vec", |b| {
+        b.iter_batched(
+            || (make_vec(), make_vec()),
+            |(a, b)| vec_append(a, b),
+            BatchSize::PerIteration,
+        )
+    });
+    g.finish();
+}
+
 fn blob_iter(c: &mut Criterion) {
     let soalist = make_soalist_blob();
     let packedlist = make_packedlist_blob();
@@ -1118,6 +1222,7 @@ criterion_group! {
         churn,
         random_remove_insert,
         cursor_update,
+        append,
         blob_iter,
         blob_end_ops,
 }

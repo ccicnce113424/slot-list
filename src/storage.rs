@@ -8,7 +8,13 @@
 
 use std::mem::{MaybeUninit, offset_of, size_of};
 
-/// 「没有指向任何节点」的哨兵值。
+/// 「这一侧没有邻居」。
+///
+/// **只作为标量使用**：函数参数（`List::insert_link` 的 `prev` / `next`）和
+/// 游标的幽灵位置 tag。它**绝不会出现在 `prev` / `next`
+/// 数组里**——数组里每个值都是合法槽位下标（链表两端的"哑元"字段是"没人读
+/// 的合法下标"，不是 NIL）。这是 [`Storage::append`] 能把整段下标直接加偏移
+/// 的前提。
 pub(crate) const NIL: usize = usize::MAX;
 
 /// [`IterMut`](crate::IterMut) 需要的裸地址布局：
@@ -55,8 +61,21 @@ pub trait Storage<T>: sealed::Sealed {
     /// 预留至少 `additional` 个槽位的容量（`len + additional`）。
     fn reserve(&mut self, additional: usize);
 
-    /// 追加一个未初始化的槽位并返回其下标。
+    /// 追加一个新槽位并返回其下标。
+    ///
+    /// 两条链接先初始化成指向自己的自环：调用方随后就会重写需要的那几条，
+    /// 但**两端那两条"哑元"字段可能一直留着这个值**，所以它必须是合法下标
+    /// （见 [`append`](Storage::append)：整段下标都要无条件加偏移）。
     fn grow(&mut self) -> usize;
+
+    /// 把 `other` 的全部槽位接到 `self` 后面，并把搬过来的**每个下标都加上
+    /// 偏移**（偏移量 = 搬运前 `self.len()`，由实现自己取）。搬完 `other` 变空
+    /// （容量留在它自己那里）。
+    ///
+    /// 关键是"一边复制一边把**已经更新过**的索引写进自己的 `Vec`"：索引只写
+    /// 一遍（实测比"先整块 memcpy、再原地读改写修一遍"快 ~0.7ms/24MB，甚至
+    /// 比纯 memcpy 三个数组还快——因为省掉了 16MB 读 + 16MB 写）。
+    fn append(&mut self, other: &mut Self);
 
     fn data(&self, index: usize) -> &MaybeUninit<T>;
     fn data_mut(&mut self, index: usize) -> &mut MaybeUninit<T>;
@@ -111,11 +130,29 @@ impl<T> Storage<T> for Soa<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
-        self.data.push(MaybeUninit::uninit());
-        self.prev.push(NIL);
-        self.next.push(NIL);
+        let index = self.data.len();
 
-        self.data.len() - 1
+        self.data.push(MaybeUninit::uninit());
+        // 哑元：指向自己的自环（合法下标，见 trait 里的说明）
+        self.prev.push(index);
+        self.next.push(index);
+
+        index
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        let base = self.len();
+
+        // data 没有下标要修 ⇒ 直接整块搬（会搬空 other.data）
+        self.data.append(&mut other.data);
+        // 两个索引数组一边复制一边加：只写一遍
+        self.prev
+            .extend(other.prev.iter().map(|&index| index + base));
+        self.next
+            .extend(other.next.iter().map(|&index| index + base));
+
+        other.prev.clear();
+        other.next.clear();
     }
 
     #[inline]
@@ -206,13 +243,28 @@ impl<T> Storage<T> for Packed<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
+        let index = self.data.len();
+
         self.data.push(MaybeUninit::uninit());
         self.links.push(Link {
-            prev: NIL,
-            next: NIL,
+            prev: index,
+            next: index,
         });
 
-        self.links.len() - 1
+        index
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        let base = self.len();
+
+        self.data.append(&mut other.data);
+        // 两条链接打包在同一个数组里，也只需要写一遍
+        self.links.extend(other.links.iter().map(|link| Link {
+            prev: link.prev + base,
+            next: link.next + base,
+        }));
+
+        other.links.clear();
     }
 
     #[inline]
@@ -300,13 +352,27 @@ impl<T> Storage<T> for Aos<T> {
 
     #[inline]
     fn grow(&mut self) -> usize {
+        let index = self.nodes.len();
+
         self.nodes.push(Node {
             data: MaybeUninit::uninit(),
-            prev: NIL,
-            next: NIL,
+            prev: index,
+            next: index,
         });
 
-        self.nodes.len() - 1
+        index
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        let base = self.len();
+
+        // data 和两条链接在同一个数组里，"一遍过"就意味着 data 也要逐元素搬
+        // （丢掉了 memcpy）；这里按最省事的方式写，让编译器 best-effort。
+        self.nodes.extend(other.nodes.drain(..).map(|node| Node {
+            data: node.data,
+            prev: node.prev + base,
+            next: node.next + base,
+        }));
     }
 
     #[inline]
