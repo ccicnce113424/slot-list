@@ -1,5 +1,5 @@
 //! 三种内存布局（`SoaList` / `PackedList` / `AosList`）与
-//! std `LinkedList`、`VecDeque`、fast-list、`Vec` 的横向基准。
+//! std `LinkedList`、`VecDeque`、`Vec` 的横向基准。
 //!
 //! 三种布局是同一个泛型类型 `List<T, S>` 的不同 `Storage` 参数，所以
 //! 基准体用宏生成三种实例，不手写三份；基线各自手写。
@@ -50,7 +50,7 @@
 //! - 想追平只有两条（都实测）：索引降到 u32 ⇒ 16 B/槽、**−37%**；目标预置容量不扩容
 //!   ⇒ **−57%**（后者要求分配器保持页热：mimalloc 有效，系统 malloc 下反而更贵）。
 //!
-//! ## 迭代（`iteration` / `blob_iter`）这一组：瓶颈在"沿链走"，不在迭代器
+//! ## 迭代（`iteration` / `blob_iter`）这一组：瓶颈在"沿链走"的依赖加载
 //!
 //! 1M × `usize`，把迭代拆成三层（内部探针，min/9 轮，ns/元素）：
 //!
@@ -61,17 +61,33 @@
 //! | AosList | 1.29 | 1.34 | **0.478** |
 //! | `Vec` 顺序扫（对照） | — | — | 0.062 |
 //!
-//! - **迭代器本身没有浪费**：`iter()` 只比"自己沿链走"慢 ~5%（双层判断 + 计数）。
-//! - **顺序扫槽位：Soa/Packed 和 `Vec` 同速**（0.062 ns/元素，能按 8 B 步长流式走）；
-//!   **Aos 退化 7.7×**——节点交错后每 24 B 只用 8 B，既丢带宽又没法窄步长向量化。
-//! - **真正贵的是"沿链走"**：~1.1 ns/元素，本质是"读 `next` → 去那个槽位"的依赖链；
-//!   它和 `LinkedList`（1.00 ns/元素）同量级：我们省掉了每节点的独立分配，但
-//!   `data` 与 `next` 分在两个数组 ⇒ 每元素多一次加载，正好抵消。
-//! - 三种布局各占一头：Soa/Packed 顺序扫最优、沿链要多载入一次；Aos 沿链同线、
-//!   顺序扫退化。**还没试的方向**：分组/分块布局（几个元素一组，组内 `data` 连续、
-//!   链接连续），同时吃"顺序扫可向量化"和"链走同线"两头。
-//! - 这些数字依赖链的局部性（这里是 `push_back` 构造 ⇒ 链就是 0,1,2,… 递增，硬件
-//!   预取猜得中）；`random_remove_insert` 之后链会碎，沿链走的成本只会更差。
+//! - **迭代器实现本身没有浪费**：`iter()` 只比"自己沿链走"慢 ~5%（双层判断 + 计数）。
+//! - **顺序扫槽位：Soa/Packed 与 `Vec` 同速**（0.062 ns/元素）；**Aos 退化 7.7×**
+//!   ——节点交错后每 24 B 只用 8 B。但公开 API 没有"按槽位顺序扫全体"的操作，
+//!   所以那只是上限，不是任何一次调用的成本。
+//! - **真正贵的是"沿链走"**：~1.1 ns/元素，本质是"读 `next` → 去那个槽位"这次
+//!   **依赖加载的延迟**（~4 周期/元素）——不是带宽。对照：`LinkedList` 1.00、
+//!   `VecDeque` 0.31、`Vec` 0.07。
+//!
+//! ### 试过并否掉的三个方案（都有实测数字，别再走一遍）
+//!
+//! | 方案 | 连续链迭代（ns/元素） | 代价 |
+//! |---|---|---|
+//! | 分块（分组）+ 块内仍每槽显式链接 | **1.70（慢 55%）** | 无——纯负收益 |
+//! | 分块 + 块内顺序由位置隐含 | **0.084 ~ 0.136（快 8~13×）** | 插入/删除要搬动块内元素 ⇒ **下标不再稳定**，与"下标即指针"冲突 |
+//! | 维护顺行位图（每槽 1 bit：`next(i) == i + 1`） | **0.449（快 2.5×）** | 每次链写入 +1 store ⇒ `churn` **2.80 → 5.66 ms（慢一倍）** |
+//! | 迭代器侧探路（段用尽时并行读 8 个 `next` 候选） | 独立探针 0.68（快 1.6×）／**crate 内 2.40（慢一倍）** | 原因未定位（同一份代码在独立探针里快、进 crate 就慢） ⇒ 未采用 |
+//!
+//! 读法：
+//!
+//! - 只"分块"不改链接的存放方式 = **负收益**：每步那次依赖加载还在，还多了下标算术。
+//! - 要拿到 8~13× 就得让"块内顺序 = 槽位顺序"由位置隐含 ⇒ 插入/删除必须搬动块内
+//!   元素 ⇒ `Cursor::index()` 的先前取值会指向别的元素（与"下标即指针"冲突）。
+//! - "维护位图"路径干净、能拿 2.5×，但把成本压在最热的写路径上（`pop` / `push` /
+//!   中间插删每次链写入多一个 store）⇒ `churn` 翻倍，不划算。
+//! - 这三个数字都依赖**链的局部性**（这里是 `push_back` 构造 ⇒ 链就是 0,1,2,… 递增，
+//!   硬件预取猜得中）。乱序链（`random_remove_insert` 之后）上 `iter()` 会落到
+//!   "每步一次 miss"的量级，与 `LinkedList` 同一水平。
 //!
 //! ## 本机的噪声底：小于 ~5% 的差异别当真
 //!
@@ -169,8 +185,6 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use slot_list::{AosList, PackedList, SoaList};
-
-use fast_list::LinkedList as FastLinkedList;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -496,7 +510,7 @@ bench_blob_end_ops!(packedlist_blob_push_back_pop_front, PackedList<Blob64>);
 bench_blob_end_ops!(aoslist_blob_push_back_pop_front, AosList<Blob64>);
 
 // ============================================================
-// 基线：std VecDeque / std LinkedList / fast-list / Vec
+// 基线：std VecDeque / std LinkedList / Vec
 // ============================================================
 
 // ---- 输入生成与游标定位 ----
@@ -579,18 +593,6 @@ fn linkedlist_push_back_pop_front() {
     }
 }
 
-fn fastlist_push_back_pop_front() {
-    let mut list = FastLinkedList::new();
-
-    for i in 0..N {
-        list.push_back(black_box(i));
-    }
-
-    while let Some(value) = list.pop_front() {
-        black_box(value);
-    }
-}
-
 fn vecdeque_push_front_pop_back() {
     let mut deque = VecDeque::new();
 
@@ -605,18 +607,6 @@ fn vecdeque_push_front_pop_back() {
 
 fn linkedlist_push_front_pop_back() {
     let mut list = LinkedList::new();
-
-    for i in 0..N {
-        list.push_front(black_box(i));
-    }
-
-    while let Some(value) = list.pop_back() {
-        black_box(value);
-    }
-}
-
-fn fastlist_push_front_pop_back() {
-    let mut list = FastLinkedList::new();
 
     for i in 0..N {
         list.push_front(black_box(i));
@@ -649,16 +639,6 @@ fn make_linkedlist() -> LinkedList<usize> {
     list
 }
 
-fn make_fastlist() -> FastLinkedList<usize> {
-    let mut list = FastLinkedList::new();
-
-    for i in 0..N {
-        list.push_back(i);
-    }
-
-    list
-}
-
 fn make_vec() -> Vec<usize> {
     (0..N).collect()
 }
@@ -680,16 +660,6 @@ fn linkedlist_iter(list: &LinkedList<usize>) {
 
     for value in list.iter() {
         sum = sum.wrapping_add(*value);
-    }
-
-    black_box(sum);
-}
-
-fn fastlist_iter(list: &FastLinkedList<usize>) {
-    let mut sum = 0usize;
-
-    for item in list.iter() {
-        sum = sum.wrapping_add(item.value);
     }
 
     black_box(sum);
@@ -733,22 +703,6 @@ fn linkedlist_at_middle(list: &LinkedList<usize>) {
     black_box(sum);
 }
 
-fn fastlist_at_middle(list: &FastLinkedList<usize>) {
-    let mut sum = 0usize;
-
-    let middle = N / 2;
-
-    for _ in 0..LOOKUPS {
-        let index = list.nth(black_box(middle)).unwrap();
-
-        let item = list.get(index).unwrap();
-
-        sum = sum.wrapping_add(item.value);
-    }
-
-    black_box(sum);
-}
-
 // ---- 已知位置的局部插入/删除 ----
 
 fn vecdeque_insert_remove(deque: &mut VecDeque<usize>) {
@@ -779,20 +733,6 @@ fn linkedlist_insert_before_remove(list: &mut LinkedList<usize>) {
     black_box(cursor.index().unwrap());
 }
 
-fn fastlist_insert_before_remove(list: &mut FastLinkedList<usize>) {
-    let middle_index = list.nth(N / 2).unwrap();
-
-    for i in 0..MIDDLE_OPS {
-        let inserted = list.insert_before(middle_index, black_box(i));
-
-        let removed = list.remove(inserted).unwrap();
-
-        black_box(removed.value);
-    }
-
-    black_box(middle_index);
-}
-
 // ---- 稳态 churn ----
 
 fn vecdeque_churn(deque: &mut VecDeque<usize>) {
@@ -806,16 +746,6 @@ fn vecdeque_churn(deque: &mut VecDeque<usize>) {
 }
 
 fn linkedlist_churn(list: &mut LinkedList<usize>) {
-    for i in 0..CHURN_OPS {
-        let value = list.pop_front().unwrap();
-
-        black_box(value);
-
-        list.push_back(black_box(i));
-    }
-}
-
-fn fastlist_churn(list: &mut FastLinkedList<usize>) {
     for i in 0..CHURN_OPS {
         let value = list.pop_front().unwrap();
 
@@ -848,26 +778,6 @@ fn linkedlist_random_remove_insert(list: &mut LinkedList<usize>, positions: &[us
         black_box(value);
 
         cursor.insert_before(black_box(i));
-    }
-
-    black_box(list.len());
-}
-
-fn fastlist_random_remove_insert(list: &mut FastLinkedList<usize>, positions: &[usize]) {
-    for (i, &pos) in positions.iter().enumerate() {
-        let index = list.nth(pos).unwrap();
-
-        let removed = list.remove(index).unwrap();
-
-        black_box(removed.value);
-
-        if pos < list.len() {
-            let next_index = list.nth(pos).unwrap();
-
-            list.insert_before(next_index, black_box(i));
-        } else {
-            list.push_back(black_box(i));
-        }
     }
 
     black_box(list.len());
@@ -908,26 +818,6 @@ fn linkedlist_cursor_update(list: &mut LinkedList<usize>) {
         let new_value = value.wrapping_add(delta);
 
         *cursor.current().unwrap() = new_value;
-
-        checksum ^= black_box(new_value);
-    }
-
-    black_box(checksum);
-}
-
-fn fastlist_index_update(list: &mut FastLinkedList<usize>) {
-    let index = list.nth(N / 2).unwrap();
-
-    let mut checksum = 0usize;
-
-    for i in 0..CURSOR_UPDATE_OPS {
-        let delta = black_box(i.wrapping_mul(0x9e37_79b9));
-
-        let value = list.get(index).unwrap().value;
-
-        let new_value = value.wrapping_add(delta);
-
-        list.get_mut(index).unwrap().value = new_value;
 
         checksum ^= black_box(new_value);
     }
@@ -1002,16 +892,6 @@ fn make_vecdeque_blob() -> VecDeque<Blob64> {
 
 fn make_linkedlist_blob() -> LinkedList<Blob64> {
     let mut list = LinkedList::new();
-
-    for i in 0..LARGE_N {
-        list.push_back(Blob64::new(i));
-    }
-
-    list
-}
-
-fn make_fastlist_blob() -> FastLinkedList<Blob64> {
-    let mut list = FastLinkedList::new();
 
     for i in 0..LARGE_N {
         list.push_back(Blob64::new(i));
@@ -1100,16 +980,6 @@ fn linkedlist_blob_iter(list: &LinkedList<Blob64>) {
     black_box(sum);
 }
 
-fn fastlist_blob_iter(list: &FastLinkedList<Blob64>) {
-    let mut sum = 0usize;
-
-    for item in list.iter() {
-        sum = sum.wrapping_add(item.value.key());
-    }
-
-    black_box(sum);
-}
-
 fn vec_blob_iter(vec: &[Blob64]) {
     let mut sum = 0usize;
 
@@ -1144,18 +1014,6 @@ fn linkedlist_blob_push_back_pop_front() {
     }
 }
 
-fn fastlist_blob_push_back_pop_front() {
-    let mut list = FastLinkedList::new();
-
-    for i in 0..LARGE_N {
-        list.push_back(black_box(Blob64::new(i)));
-    }
-
-    while let Some(value) = list.pop_front() {
-        black_box(value);
-    }
-}
-
 // ============================================================
 // Criterion groups
 // ============================================================
@@ -1167,7 +1025,6 @@ fn end_ops(c: &mut Criterion) {
     g.bench_function("AosList", |b| b.iter(aoslist_push_back_pop_front));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_push_back_pop_front));
     g.bench_function("LinkedList", |b| b.iter(linkedlist_push_back_pop_front));
-    g.bench_function("FastList", |b| b.iter(fastlist_push_back_pop_front));
     g.finish();
 
     let mut g = c.benchmark_group("end_ops/push_front_pop_back");
@@ -1176,7 +1033,6 @@ fn end_ops(c: &mut Criterion) {
     g.bench_function("AosList", |b| b.iter(aoslist_push_front_pop_back));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_push_front_pop_back));
     g.bench_function("LinkedList", |b| b.iter(linkedlist_push_front_pop_back));
-    g.bench_function("FastList", |b| b.iter(fastlist_push_front_pop_back));
     g.finish();
 }
 
@@ -1186,7 +1042,6 @@ fn iteration(c: &mut Criterion) {
     let aoslist = make_aoslist();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
-    let fastlist = make_fastlist();
     let vec = make_vec();
 
     let mut g = c.benchmark_group("iteration");
@@ -1195,7 +1050,6 @@ fn iteration(c: &mut Criterion) {
     g.bench_function("AosList", |b| b.iter(|| aoslist_iter(&aoslist)));
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_iter(&vecdeque)));
     g.bench_function("LinkedList", |b| b.iter(|| linkedlist_iter(&linkedlist)));
-    g.bench_function("FastList", |b| b.iter(|| fastlist_iter(&fastlist)));
     g.bench_function("Vec", |b| b.iter(|| vec_iter(&vec)));
     g.finish();
 }
@@ -1206,7 +1060,6 @@ fn middle_access(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
-    let fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_access");
     g.bench_function("SoaList", |b| b.iter(|| soalist_at_middle(&mut soalist)));
@@ -1218,7 +1071,6 @@ fn middle_access(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_at_middle(&linkedlist))
     });
-    g.bench_function("FastList", |b| b.iter(|| fastlist_at_middle(&fastlist)));
     g.finish();
 }
 
@@ -1228,7 +1080,6 @@ fn middle_insert_remove(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
-    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_insert_remove");
     g.bench_function("SoaList", |b| {
@@ -1246,9 +1097,6 @@ fn middle_insert_remove(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_insert_before_remove(&mut linkedlist))
     });
-    g.bench_function("FastList", |b| {
-        b.iter(|| fastlist_insert_before_remove(&mut fastlist))
-    });
     g.finish();
 }
 
@@ -1258,7 +1106,6 @@ fn churn(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
-    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("churn");
     g.bench_function("SoaList", |b| b.iter(|| soalist_churn(&mut soalist)));
@@ -1270,7 +1117,6 @@ fn churn(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_churn(&mut linkedlist))
     });
-    g.bench_function("FastList", |b| b.iter(|| fastlist_churn(&mut fastlist)));
     g.finish();
 }
 
@@ -1281,7 +1127,6 @@ fn random_remove_insert(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
-    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("random_remove_insert");
     g.bench_function("SoaList", |b| {
@@ -1299,9 +1144,6 @@ fn random_remove_insert(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_random_remove_insert(&mut linkedlist, &positions))
     });
-    g.bench_function("FastList", |b| {
-        b.iter(|| fastlist_random_remove_insert(&mut fastlist, &positions))
-    });
     g.finish();
 }
 
@@ -1311,7 +1153,6 @@ fn cursor_update(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
-    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("cursor_update");
     g.bench_function("SoaList", |b| {
@@ -1328,9 +1169,6 @@ fn cursor_update(c: &mut Criterion) {
     });
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_cursor_update(&mut linkedlist))
-    });
-    g.bench_function("FastList", |b| {
-        b.iter(|| fastlist_index_update(&mut fastlist))
     });
     g.finish();
 }
@@ -1471,7 +1309,6 @@ fn blob_iter(c: &mut Criterion) {
     let aoslist = make_aoslist_blob();
     let vecdeque = make_vecdeque_blob();
     let linkedlist = make_linkedlist_blob();
-    let fastlist = make_fastlist_blob();
     let vec = make_vec_blob();
 
     let mut g = c.benchmark_group("blob_iter");
@@ -1484,7 +1321,6 @@ fn blob_iter(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_blob_iter(&linkedlist))
     });
-    g.bench_function("FastList", |b| b.iter(|| fastlist_blob_iter(&fastlist)));
     g.bench_function("Vec", |b| b.iter(|| vec_blob_iter(&vec)));
     g.finish();
 }
@@ -1500,7 +1336,6 @@ fn blob_end_ops(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(linkedlist_blob_push_back_pop_front)
     });
-    g.bench_function("FastList", |b| b.iter(fastlist_blob_push_back_pop_front));
     g.finish();
 }
 
