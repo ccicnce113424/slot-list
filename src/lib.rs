@@ -11,16 +11,21 @@
 //! | 含义 | 元素在链上的次序（第几个） | 元素在连续内存里的下标（= 身份） |
 //! | 范围 | `0 .. len()` | `0 .. storage.slots()` |
 //! | 稳定性 | 每次插入/删除都会变 | **元素存活期内不变**（可当句柄用） |
-//! | 怎么拿到 | 从端点走链；`Cursor::index()` | 目前**没有公开入口**（若需要句柄，先看
-//!   `fast-list` / `slotmap`：这一格它们已经做了，`fast-list` 的 `contains_key` 即 ABA 校验；
-//!   设计取舍与同机数字见 `PERFORMANCE.md` §8） |
-//! | 换算 | `slot_at(pos)`：走链 `O(min(pos, len-1-pos))` | `pos_of(slot)`：走链 `O(len)`（未提供） |
+//! | 怎么拿到 | 从端点走链；`Cursor::index()` | **句柄**：`Cursor::slot` / `CursorMut::slot` /
+//!   `List::front_slot` / `back_slot` / `iter_slots`（全 `O(1)`）；类型是 [`Slot`]（裸下标
+//!   8 B，**不带世代号** ⇒ 陈旧句柄查不出来；与 `fast-list` 的取舍对照见 `PERFORMANCE.md` §9） |
+//! | 换算 | `slot_at(pos)`：走链 `O(min(pos, len-1-pos))` | `pos_of(slot)`：走链 `O(len)` |
 //!
 //! 公开 API 里带"位置"的都指**逻辑位置**：[`List::at`] / [`List::remove`] /
 //! [`Cursor::index`]（与 std 的 `Cursor::index` 一致：返回逻辑位置，幽灵位置为 `None`）/
-//! [`CursorMut::seek`] / [`CursorMut::move_steps`]。物理槽位今天只作为内部标识存在：
-//! `head` / `tail` / `free_head` / `free_tail` 与 `storage` 里的下标，**不公开**
-//! （句柄 API 的设计与取舍见仓库根目录的 `PERFORMANCE.md` §8）。
+//! [`CursorMut::seek`] / [`CursorMut::move_steps`]。
+//!
+//! **槽位是对外的一等公民**：拿到句柄之后可以 `cursor_at(_mut)` / `remove_slot` /
+//! `move_to_front` / `move_to_back` / `pos_of`，都不用先知道逻辑位置；不变量保证它在
+//! **元素存活期内**有效、插入删除不搬动别的元素。元素被删除后同一槽位会被复用，
+//! 于是**旧句柄不会失效**——它可能指向新元素（经典 ABA；同机对照与取舍见
+//! `PERFORMANCE.md` §9）。`head` / `tail` / `free_head` / `free_tail` 与 `storage`
+//! 里的下标仍然不公开。
 //!
 //! 三种内存布局共用**同一份实现**：
 //!

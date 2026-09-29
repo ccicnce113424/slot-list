@@ -1,5 +1,5 @@
 //! 三种内存布局（`SoaList` / `PackedList` / `AosList`）与
-//! std `LinkedList`、`VecDeque`、`Vec` 的横向基准。
+//! std `LinkedList`、`VecDeque`、`Vec`、以及 `fast-list`（slotmap + 世代号句柄）的横向基准。
 //!
 //! 三种布局是同一个泛型类型 `List<T, S>` 的不同 `Storage` 参数，所以基准体用宏生成
 //! 三种实例，不手写三份；基线各自手写。
@@ -899,6 +899,134 @@ bench_slot_vs_pos!(packedlist_by_handle, packedlist_by_pos, PackedList<usize>);
 bench_slot_vs_pos!(aoslist_by_handle, aoslist_by_pos, AosList<usize>);
 
 // ============================================================
+// 对照组：`fast-list`（slotmap 索引 + 世代号）
+//
+// API 形状不同，基准体单独写、不套宏：
+// - 句柄是 `LinkedListIndex`（slotmap 的 key，带世代号；`contains_key` 即 ABA 校验）；
+// - `get`/`remove`/`insert_before` 都收句柄；`nth(pos)` 是 O(N) 走链；
+// - **没有游标**：删掉一个元素后它给不出"我原来在哪"，这里只能自己从
+//   `LinkedListItem::next_index`/`prev_index` 里挑锚点接回去（我们那边游标留在原位）；
+// - `iter()` 产出 `&LinkedListItem<T>`，值在 `.value`；
+// - 没有 `append` / `move_to_front` / `move_to_back`（功能对照见 PERFORMANCE.md）。
+// ============================================================
+
+use fast_list::{LinkedList as FastList, LinkedListIndex};
+
+fn make_fastlist() -> FastList<usize> {
+    let mut list: FastList<usize> = FastList::new();
+
+    for i in 0..N {
+        list.push_back(i);
+    }
+
+    list
+}
+
+fn fastlist_push_back_pop_front() {
+    let mut list: FastList<usize> = FastList::new();
+
+    for i in 0..N {
+        list.push_back(black_box(i));
+    }
+
+    while let Some(value) = list.pop_front() {
+        black_box(value);
+    }
+}
+
+fn fastlist_iter(list: &FastList<usize>) {
+    let mut sum = 0usize;
+
+    for item in list.iter() {
+        sum = sum.wrapping_add(item.value);
+    }
+
+    black_box(sum);
+}
+
+fn fastlist_at_middle(list: &FastList<usize>) {
+    let mut sum = 0usize;
+    let middle = N / 2;
+
+    for _ in 0..LOOKUPS {
+        let index = list.nth(black_box(middle)).unwrap();
+
+        sum = sum.wrapping_add(list.get(index).unwrap().value);
+    }
+
+    black_box(sum);
+}
+
+fn fastlist_insert_before_remove(list: &mut FastList<usize>) {
+    let middle = list.nth(N / 2).unwrap();
+
+    for i in 0..MIDDLE_OPS {
+        let inserted = list.insert_before(black_box(middle), black_box(i));
+
+        black_box(list.remove(inserted).unwrap().value);
+    }
+}
+
+fn fastlist_churn(list: &mut FastList<usize>) {
+    for i in 0..CHURN_OPS {
+        let value = list.pop_front().unwrap();
+
+        black_box(value);
+
+        list.push_back(black_box(i));
+    }
+}
+
+/// "删一个 + 原地插回"：删掉之后用它自己给的后继（没有就用前驱）当锚点接回去。
+///
+/// 注意这里**不能** `unwrap`：`fast-list` 的句柄带世代号，一次 `remove` + 重新插入
+/// 之后原句柄就作废了（新元素拿新世代）。基准里由调用方用 `contains_key` 先判。
+fn fastlist_remove_reinsert(list: &mut FastList<usize>, handle: LinkedListIndex, i: usize) {
+    let Some(item) = list.remove(black_box(handle)) else {
+        return;
+    };
+
+    black_box(item.value);
+
+    let new_value = black_box(item.value ^ i);
+
+    match item.next_index.or(item.prev_index) {
+        Some(anchor) => {
+            list.insert_before(black_box(anchor), new_value);
+        }
+        None => {
+            list.push_back(new_value);
+        }
+    }
+}
+
+/// 句柄入口。**每次都要 `contains_key` 校验**：上一轮的"删了又插回"已经让这批
+/// 句柄作废了，失效就得按位置重找一遍。这一步是世代号语义的真实成本，不是我们加的。
+fn fastlist_by_handle(
+    list: &mut FastList<usize>,
+    handles: &[LinkedListIndex],
+    positions: &[usize],
+) {
+    for (i, (&handle, &pos)) in handles.iter().zip(positions).enumerate() {
+        let handle = if list.contains_key(handle) {
+            handle
+        } else {
+            list.nth(black_box(pos)).unwrap()
+        };
+
+        fastlist_remove_reinsert(list, handle, i);
+    }
+}
+
+fn fastlist_by_pos(list: &mut FastList<usize>, positions: &[usize]) {
+    for (i, &pos) in positions.iter().enumerate() {
+        let handle = list.nth(black_box(pos)).unwrap();
+
+        fastlist_remove_reinsert(list, handle, i);
+    }
+}
+
+// ============================================================
 // Criterion groups
 // ============================================================
 
@@ -909,6 +1037,7 @@ fn end_ops(c: &mut Criterion) {
     g.bench_function("AosList", |b| b.iter(aoslist_push_back_pop_front));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_push_back_pop_front));
     g.bench_function("LinkedList", |b| b.iter(linkedlist_push_back_pop_front));
+    g.bench_function("FastList", |b| b.iter(fastlist_push_back_pop_front));
     g.finish();
 
     let mut g = c.benchmark_group("end_ops/push_front_pop_back");
@@ -927,6 +1056,7 @@ fn iteration(c: &mut Criterion) {
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
     let vec = make_vec();
+    let fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("iteration");
     g.bench_function("SoaList", |b| b.iter(|| soalist_iter(&soalist)));
@@ -935,6 +1065,7 @@ fn iteration(c: &mut Criterion) {
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_iter(&vecdeque)));
     g.bench_function("LinkedList", |b| b.iter(|| linkedlist_iter(&linkedlist)));
     g.bench_function("Vec", |b| b.iter(|| vec_iter(&vec)));
+    g.bench_function("FastList", |b| b.iter(|| fastlist_iter(&fastlist)));
     g.finish();
 }
 
@@ -944,6 +1075,7 @@ fn middle_access(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
+    let fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_access");
     g.bench_function("SoaList", |b| b.iter(|| soalist_at_middle(&mut soalist)));
@@ -955,6 +1087,7 @@ fn middle_access(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_at_middle(&linkedlist))
     });
+    g.bench_function("FastList", |b| b.iter(|| fastlist_at_middle(&fastlist)));
     g.finish();
 }
 
@@ -964,6 +1097,7 @@ fn middle_insert_remove(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_insert_remove");
     g.bench_function("SoaList", |b| {
@@ -981,6 +1115,9 @@ fn middle_insert_remove(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_insert_before_remove(&mut linkedlist))
     });
+    g.bench_function("FastList", |b| {
+        b.iter(|| fastlist_insert_before_remove(&mut fastlist))
+    });
     g.finish();
 }
 
@@ -990,6 +1127,7 @@ fn churn(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("churn");
     g.bench_function("SoaList", |b| b.iter(|| soalist_churn(&mut soalist)));
@@ -1001,6 +1139,7 @@ fn churn(c: &mut Criterion) {
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_churn(&mut linkedlist))
     });
+    g.bench_function("FastList", |b| b.iter(|| fastlist_churn(&mut fastlist)));
     g.finish();
 }
 
@@ -1011,6 +1150,11 @@ fn random_remove_insert(c: &mut Criterion) {
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
+    let mut fastlist = make_fastlist();
+    let fast_handles: Vec<LinkedListIndex> = positions
+        .iter()
+        .map(|&pos| fastlist.nth(pos).unwrap())
+        .collect();
 
     let mut g = c.benchmark_group("random_remove_insert");
     g.bench_function("SoaList", |b| {
@@ -1027,6 +1171,12 @@ fn random_remove_insert(c: &mut Criterion) {
     });
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_random_remove_insert(&mut linkedlist, &positions))
+    });
+    g.bench_function("FastList::by_handle", |b| {
+        b.iter(|| fastlist_by_handle(&mut fastlist, &fast_handles, &positions))
+    });
+    g.bench_function("FastList::by_pos", |b| {
+        b.iter(|| fastlist_by_pos(&mut fastlist, &positions))
     });
     g.finish();
 }
@@ -1230,6 +1380,11 @@ fn slot_entry(c: &mut Criterion) {
         .iter()
         .map(|&pos| aoslist.at(pos).unwrap().slot().unwrap())
         .collect();
+    let mut fastlist = make_fastlist();
+    let fast_handles: Vec<LinkedListIndex> = positions
+        .iter()
+        .map(|&pos| fastlist.nth(pos).unwrap())
+        .collect();
 
     let mut g = c.benchmark_group("slot_entry");
     g.bench_function("SoaList::by_handle", |b| {
@@ -1249,6 +1404,12 @@ fn slot_entry(c: &mut Criterion) {
     });
     g.bench_function("AosList::by_pos", |b| {
         b.iter(|| aoslist_by_pos(&mut aoslist, &positions))
+    });
+    g.bench_function("FastList::by_handle", |b| {
+        b.iter(|| fastlist_by_handle(&mut fastlist, &fast_handles, &positions))
+    });
+    g.bench_function("FastList::by_pos", |b| {
+        b.iter(|| fastlist_by_pos(&mut fastlist, &positions))
     });
     g.finish();
 }

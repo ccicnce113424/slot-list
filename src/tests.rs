@@ -1520,6 +1520,23 @@ fn churn_does_not_allocate() {
     });
 
     assert!(allocs > 0, "分配计数器没工作");
+
+    // 对照 2：`fast-list`（slotmap 索引）同样靠复用空槽做到零分配 ——
+    // 这条是 PERFORMANCE.md §9 功能对照表里"零分配"那一格的证据。
+    let mut fast: fast_list::LinkedList<usize> = fast_list::LinkedList::new();
+
+    for i in 0..n {
+        fast.push_back(i);
+    }
+
+    let allocs = count_alloc(|| {
+        for i in 0..n {
+            fast.pop_front();
+            fast.push_back(i);
+        }
+    });
+
+    assert_eq!(allocs, 0, "fast-list 的 churn 也应当零分配");
 }
 
 /// **状态可搬运**：整条链的全部状态就是「每槽 `(T, prev, next)` + `head` /

@@ -349,6 +349,7 @@ MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc：别把页还给内核
 
 ```sh
 cargo bench                        # 全套；报告在 target/criterion/report/index.html
+cargo bench -- 'FastList'          # 只看 fast-list 对照组（§9）
 cargo bench -- 'iteration|churn'   # 过滤（正则）
 cargo test                         # 正确性（20 项，含不变量逐槽校验）
 cargo miri test                    # 严格 provenance（迭代器走裸地址）
@@ -406,3 +407,70 @@ cargo miri test                    # 严格 provenance（迭代器走裸地址�
 ⇒ 一句话定位：**本库不是"最快的链表"，而是"能当 `LinkedHashMap` / LRU 的存储引擎、同时
 保留元素级链表 API、稳定句柄与确定性内存"的那个**；想要分块级的吞吐，就用
 `LinkedList<Vec<T>>`（或把块当元素：`List<Vec<T>, Soa<Vec<T>>>`）。
+
+---
+
+## 9. 与 `fast-list` 0.1.8 的对照
+
+同一格子里最接近的对手：slotmap 索引 + 世代号（`LinkedListIndex`）。事实逐条来自两边源码；
+数字是同机同一次 `cargo bench`（`benches/list.rs` 里的 `FastList` 系列），中位数。
+
+### 9.1 性能
+
+| 组（规模） | 本库 `SoaList` | `FastList` | 倍数 | `LinkedList` | `VecDeque` |
+|---|---|---|---|---|---|
+| `end_ops/push_back_pop_front`（1M push + 1M pop） | **7.11 ms** | 12.54 ms | 1.8× | 5.37 ms | 2.58 ms |
+| `iteration`（1M 元素） | **1.135 ms** | 1.76 ms | 1.55× | 1.07 ms | 0.31 ms |
+| `middle_access`（100 次 N/2） | **54.1 ms** | 81.6 ms | 1.5× | 55.0 ms | 57 ns |
+| `middle_insert_remove`（N/2 处 1000 次插删） | **549 µs** | 828 µs | 1.5× | 496 µs | 88.3 ms |
+| `churn`（1M 次 pop+push） | **2.79 ms** | 5.28 ms | 1.9× | 6.03 ms | 1.71 ms |
+| `random_remove_insert`（100 个随机位置） | **28.8 ms** | 43.3 ms | 1.5× | 29.8 ms | 4.67 ms |
+| `slot_entry::by_handle`（100 次句柄入口） | **711 ns** | 44.6 ms | **6.3 万×** | — | — |
+| `slot_entry::by_pos`（100 次位置入口） | **29.0 ms** | 43.8 ms | 1.5× | — | — |
+
+读数注意：`end_ops` 量的是分配器（本文件 §1 的读数纪律，±20%），其余组 ±5%。
+
+**为什么 `by_handle` 那一格差 6 万倍**（这是世代号语义的直接后果，不是实现质量）：
+
+- 基准体是"随机位置删一个 + 原地插回"，criterion 会**反复跑**这段循环。
+- `fast-list` 的 `LinkedListIndex` 带世代号：一次 `remove` + 重新插入之后，**原句柄就作废了**
+  （新元素拿新世代）。所以第一轮之后句柄全失效，唯一出路是 `contains_key` 发现失效后
+  **按位置重找**（O(N)）——基准里就是这么写的，于是 `by_handle` ≈ `by_pos`。
+- 本库的 `Slot` 是裸下标：`remove` + `insert_before` 之后槽位被 LIFO 复用，**旧句柄依旧有效**
+  且仍指向这一格（ABA 语义），所以是 O(1)。代价是：**它不会告诉你元素已经被换过了**。
+
+⇒ 两边的差异不是"谁快"，而是**句柄在变更后的语义**：他们保证"失效可检测"，我们保证"身份不搬动"。
+要在这类工作负载里用好 `fast-list`，得自己在外部维护"元素 → 当前句柄"的映射（每次插删都要更新），
+本库则天生不需要（代价就是 ABA）。
+
+### 9.2 功能
+
+| 维度 | 本库 | `fast-list` 0.1.8 |
+|---|---|---|
+| 句柄类型 | `Slot`（裸下标 `usize`，8 B，无世代） | `LinkedListIndex`（slotmap key：`u32` 下标 + `u32` 世代，8 B） |
+| 陈旧句柄 / ABA | ✗ **查不出来**：槽位复用后旧句柄指向新元素（测试钉住了这个行为） | ✓ `contains_key()` 即时校验（世代不匹配即 `false`） |
+| 句柄 → 元素 | ✓ `cursor_at(_mut)` / `remove_slot`，O(1) | ✓ `get` / `get_mut` / `remove`，O(1) |
+| 位置 → 句柄 | ✓ `slot_at(pos)`，O(N) | ✓ `nth(pos)`，O(N) |
+| **元素级游标** | ✓✓ `Cursor`/`CursorMut`：跨插入/删除保持位置、幽灵位置、`move_prev/next/steps`、`peek` 邻居 | ✗ 只有 `cursor_next/prev`（遍历时取邻居的助手），没有"停在某个元素上"的对象 |
+| 删除后"我原来在哪" | ✓ 游标留在原位，`insert_before` 放回同一处 | ✗ `remove` 之后要自己拿 `LinkedListItem::next_index`/`prev_index` 当锚点（基准就是这么写的） |
+| `move_to_front` / `move_to_back` | ✓ O(1) 内建 | ✗ 要 `insert_*` + `remove` 两步，且**产生新 index ⇒ 旧句柄失效** |
+| 整段搬运 `append` | ✓ O(1) 槽位重编号 + 下标整段偏移 | ✗ 只有 `extend`（逐个 push） |
+| 附带数据 | ✗ 无内建（但 `Slot` 是普通下标，能直接当任何 map/数组的键） | ✓ `new_data::<V>()` / `new_data_sparse::<V>()`（slotmap 的 `SecondaryMap`，键就是句柄） |
+| 无序遍历 | ✓ `iter_slots() -> (Slot, &T)` | ✓ `iter_unordered() -> &LinkedListItem<T>` |
+| 有序遍历 / `retain` / `split_off` | ✓ | ✓ |
+| 按**值**查找 `contains` | ✓ | ✗（只有按句柄的 `contains_key`） |
+| 布局可选 | ✓ 三种（Soa / Packed / Aos） | ✗ 一种 |
+| 每槽内存（T=8） | **24 B**（data + prev + next，§2 已核对） | `LinkedListItem<usize>` = **32 B**（value + index + next + prev），**外加** slotmap 每槽的版本/占用元数据 |
+| 热路径零分配 | ✓ `churn_does_not_allocate` | ✓ 同一测试里也钉了（两边都是 0 次 malloc） |
+| 可见的 `unsafe` | 核心是 unchecked 读写 + 裸地址迭代器，靠 miri + 全套测试兜 | **0 处**（整包 `unsafe` 计数为 0）⇒ 审计/信任成本更低 |
+| 依赖 | 无（纯 std） | `slotmap`（+ 可选 `unstable` 特性开 `Walker`） |
+| 派生实现 | `Clone` / `Debug` / `PartialEq` / `Eq` / `Default` / `FromIterator` / `Extend` / `IntoIterator` | 只有 `Debug` |
+
+**结论**：同一数据结构的两种取舍，不是替代关系。
+
+- 要**世代校验**（陈旧句柄必须能被发现）、要 slotmap 的 `SecondaryMap` 顺便带数据、或者想少一份 `unsafe`
+  ⇒ 用 `fast-list`；代价是槽更大（32 B vs 24 B + slotmap 元数据）、句柄在每次插删后作废、
+  没有游标 / `move_to_*` / `append`。
+- 要**游标语义**（删除后还在原地、幽灵位置、相对移动）、**三种布局**、**整段搬运**、**更小的槽**、
+  **句柄跨变更不失效** ⇒ 用本库；代价是陈旧句柄**测不出来**（要么自己配世代号，要么接受 ABA 语义，
+  要么用 `new_data` 那类外部映射自己维护）。
