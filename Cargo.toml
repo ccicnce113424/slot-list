@@ -13,6 +13,10 @@ default = ["std", "mimalloc"]
 std = []
 # 只影响基准：`cargo bench --no-default-features` 切回系统 malloc 做 A/B 对比。
 mimalloc = []
+# 只影响基准：开它才对比 std `LinkedList` 的**游标**（`#![feature(linked_list_cursors)]`）
+# ⇒ 只有 nightly 能开，stable 上开它会是明确报错而不是静默少几行：
+#   cargo bench --features linked-list-cursors
+linked-list-cursors = []
 
 [dev-dependencies]
 criterion = "0.8"

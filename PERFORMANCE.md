@@ -355,10 +355,19 @@ MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc：别把页还给内核
 ```sh
 cargo bench                        # 全套；报告在 target/criterion/report/index.html
 cargo bench -- 'FastList'          # 只看 fast-list 对照组（§9）
+cargo bench --features linked-list-cursors   # nightly：把 std 游标那三行对照加回来
 cargo bench -- 'iteration|churn'   # 过滤（正则）
 cargo test                         # 正确性（20 项，含不变量逐槽校验）
 cargo miri test                    # 严格 provenance（迭代器走裸地址）
 ```
+
+`benches/list.rs` 在 stable 上同样可编译：对比 std `LinkedList` 游标的三行对照
+（`middle_insert_remove` / `random_remove_insert` / `cursor_update` 的 `LinkedList`）需要
+`#![feature(linked_list_cursors)]`，由 **`linked-list-cursors` feature**（**不在 `default`**）
+控制 ⇒ stable 上 `cargo bench` 直接可用，nightly 想要那三行就
+`cargo bench --features linked-list-cursors`。
+用 feature 而不是 `build.rs` 自动探测通道，是因为这是库：`build.rs` 会在每个下游用户
+编译本 crate 时都跑一次，而 feature 显式、下游零成本，也和 `mimalloc` 一致。
 
 本文件里的"内部探针"数字多数来自临时探针（`#[test]` + `Instant`，min/9 轮），跑完即删；
 `clear` / `Drop` 的对照（`cargo bench -- 'clear_drop'`）已经**常驻**成 `clear_drop` 组：

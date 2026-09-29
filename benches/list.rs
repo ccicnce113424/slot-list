@@ -5,6 +5,21 @@
 //! 三种实例，不手写三份；基线各自手写。
 //!
 //! 运行：`cargo bench [-- <过滤正则>]`
+//!
+//! **stable 上也能编**：只有对比 std `LinkedList` **游标**的那三行
+//! （`middle_insert_remove` / `random_remove_insert` / `cursor_update` 的 `LinkedList`）
+//! 需要 `#![feature(linked_list_cursors)]`，它们由 `linked-list-cursors` feature 控制
+//! ——**该 feature 不在 `default` 里**，所以 stable 上 `cargo bench` 直接可用，
+//! nightly 上想要那三行就显式开：
+//!
+//! ```text
+//! cargo bench                                                    # 任何通道都能跑
+//! cargo bench --features linked-list-cursors                     # 只有 nightly 能开（要那三行对照）
+//! ```
+//!
+//! 用 feature 而不是 `build.rs` 自动探测通道，是因为这是个**库**：`build.rs` 会在每个
+//! 下游用户编译本 crate 时都跑一次，而 feature 是显式的、下游零成本，也和 `mimalloc`
+//! 的做法一致。
 //! 报告：`target/criterion/report/index.html`
 //!
 //! # 读数纪律（先看这段）
@@ -25,7 +40,7 @@
 //! 带宽对账），以及**已试过并否掉的优化**（分块布局、顺行位图、迭代器探路、u32 索引、
 //! `reserve`、`madvise` …），每条都带实测数字与代价。
 
-#![feature(linked_list_cursors)]
+#![cfg_attr(feature = "linked-list-cursors", feature(linked_list_cursors))]
 
 // 全局分配器。`cargo bench --no-default-features` 会切回系统 malloc，
 // 便于对比"分配器是否把内存还给内核"对端操作的影响。
@@ -420,6 +435,7 @@ fn make_random_positions(len: usize, count: usize) -> Vec<usize> {
     positions
 }
 
+#[cfg(feature = "linked-list-cursors")]
 fn linkedlist_cursor_at(
     list: &mut LinkedList<usize>,
     pos: usize,
@@ -597,6 +613,7 @@ fn vecdeque_insert_remove(deque: &mut VecDeque<usize>) {
     }
 }
 
+#[cfg(feature = "linked-list-cursors")]
 fn linkedlist_insert_before_remove(list: &mut LinkedList<usize>) {
     let mut cursor = linkedlist_cursor_at(list, N / 2);
 
@@ -649,6 +666,7 @@ fn vecdeque_random_remove_insert(deque: &mut VecDeque<usize>, positions: &[usize
     black_box(deque.len());
 }
 
+#[cfg(feature = "linked-list-cursors")]
 fn linkedlist_random_remove_insert(list: &mut LinkedList<usize>, positions: &[usize]) {
     for (i, &pos) in positions.iter().enumerate() {
         let mut cursor = linkedlist_cursor_at(list, pos);
@@ -685,6 +703,7 @@ fn vecdeque_index_update(deque: &mut VecDeque<usize>) {
     black_box(checksum);
 }
 
+#[cfg(feature = "linked-list-cursors")]
 fn linkedlist_cursor_update(list: &mut LinkedList<usize>) {
     let mut cursor = linkedlist_cursor_at(list, N / 2);
 
@@ -1146,6 +1165,7 @@ fn middle_insert_remove(c: &mut Criterion) {
     let mut packedlist = make_packedlist();
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
+    #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
     let mut fastlist = make_fastlist();
 
@@ -1162,6 +1182,7 @@ fn middle_insert_remove(c: &mut Criterion) {
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_insert_remove(&mut vecdeque))
     });
+    #[cfg(feature = "linked-list-cursors")]
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_insert_before_remove(&mut linkedlist))
     });
@@ -1199,6 +1220,7 @@ fn random_remove_insert(c: &mut Criterion) {
     let mut packedlist = make_packedlist();
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
+    #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
     let mut fastlist = make_fastlist();
     let fast_handles: Vec<LinkedListIndex> = positions
@@ -1219,6 +1241,7 @@ fn random_remove_insert(c: &mut Criterion) {
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_random_remove_insert(&mut vecdeque, &positions))
     });
+    #[cfg(feature = "linked-list-cursors")]
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_random_remove_insert(&mut linkedlist, &positions))
     });
@@ -1236,6 +1259,7 @@ fn cursor_update(c: &mut Criterion) {
     let mut packedlist = make_packedlist();
     let mut aoslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
+    #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
 
     let mut g = c.benchmark_group("cursor_update");
@@ -1251,6 +1275,7 @@ fn cursor_update(c: &mut Criterion) {
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_index_update(&mut vecdeque))
     });
+    #[cfg(feature = "linked-list-cursors")]
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_cursor_update(&mut linkedlist))
     });
