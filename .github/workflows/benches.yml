@@ -2,6 +2,15 @@ name: Benchmarks
 
 on:
   workflow_dispatch:
+    inputs:
+      filter:
+        description: "criterion filter (empty = the job's own default: full run on x86_64, 'churn|clear_drop' on arm64)"
+        type: string
+        default: ""
+      repeat:
+        description: "measure the same commit N times, saving one criterion baseline per pass (run-to-run stability)"
+        type: number
+        default: 1
   schedule:
     # Weekly: keep the bench targets and the density probe compiling.
     - cron: "0 6 * * 1"
@@ -12,6 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  BENCH_REPEAT: ${{ inputs.repeat }}
 
 jobs:
   x86_64:
@@ -30,8 +40,25 @@ jobs:
 
       # Numbers from a shared CI runner are only indicative: the machines are noisy
       # and the allocator-sensitive groups swing by several-fold. Full run on demand.
+      # `repeat > 1` measures the same commit N times in N processes and keeps one
+      # criterion baseline per pass, i.e. the run-to-run spread on one instance; the
+      # spread between two dispatches additionally includes the instance draw.
       - if: github.event_name == 'workflow_dispatch'
-        run: cargo bench --features mimalloc,linked-list-cursors
+        env:
+          FILTER: ${{ inputs.filter }}
+        run: |
+          args=()
+          if [ -n "$FILTER" ]; then args+=("$FILTER"); fi
+          for i in $(seq 1 "${BENCH_REPEAT:-1}"); do
+            cargo bench --bench list --features mimalloc,linked-list-cursors -- --save-baseline "r$i" "${args[@]}"
+          done
+
+      # The artifact must name the machine: GitHub-hosted runner names are anonymised
+      # and `ubuntu-latest` is not a CPU model.
+      - if: always()
+        run: |
+          mkdir -p target/criterion
+          { uname -a; lscpu; nproc; rustc -Vv; free -h; } > target/criterion/machine.txt 2>&1 || true
 
       - if: always()
         uses: actions/upload-artifact@v4
@@ -60,7 +87,19 @@ jobs:
       # `churn` is the pure-code, allocation-free group that the free-marking write
       # shows up in; `clear_drop` covers the reclaim paths.
       - if: github.event_name == 'workflow_dispatch'
-        run: cargo bench --features mimalloc,linked-list-cursors -- 'churn|clear_drop'
+        env:
+          FILTER: ${{ inputs.filter || 'churn|clear_drop' }}
+        run: |
+          args=()
+          if [ -n "$FILTER" ]; then args+=("$FILTER"); fi
+          for i in $(seq 1 "${BENCH_REPEAT:-1}"); do
+            cargo bench --bench list --features mimalloc,linked-list-cursors -- --save-baseline "r$i" "${args[@]}"
+          done
+
+      - if: always()
+        run: |
+          mkdir -p target/criterion
+          { uname -a; lscpu; nproc; rustc -Vv; free -h; } > target/criterion/machine.txt 2>&1 || true
 
       - if: always()
         uses: actions/upload-artifact@v4
