@@ -32,6 +32,10 @@ free-list 串起来复用；三种内存布局（`SoaList` / `PackedList` / `Aos
   份代码在不同时刻能从 2 ms 漂到 16 ms（缺页 0 → 8187）。比较时看**计时区缺页数**。
 - 判定回归：两版**交替**跑（A/B/A/B），用外部基线（`Vec`/`VecDeque`/`LinkedList`）
   当参照；差值得超出噪声底才算数。
+- **带宽敏感 vs 延迟敏感**：`clear` 的扫描支、`append*`、顺序扫描这类**纯带宽**项，
+  机器上有别的负载时同机就能膨胀 **3~4×**（实测满表扫描 0.13 ms ↔ 0.65 ms）；而
+  `churn`、游标、追链这类**延迟受限**项只动 ~25%（追链稳定在 ~1.08 ms）⇒
+  比这类值时**必须在同一次运行内取对照**，别拿不同时刻的两列相除。
 - 口径：`N` = 1M 元素（`usize`，8 B）；`LARGE_N` = 250k（`Blob64`，64 B）。
 
 ---
@@ -273,7 +277,7 @@ free-list 串起来复用；三种内存布局（`SoaList` / `PackedList` / `Aos
 | 6 | `append` 前先 `reserve` | 无可测收益 | std 的 `Vec::append` 内部本来就先 reserve；`reserve_exact` 反而更贵（实测 3.9→7.5 ms） |
 | 7 | `Aos` 字段次序（`data` 居中/前置） | 噪声内 | 见 §2：cache line 集合相同 |
 | 8 | 库内 `madvise(MADV_HUGEPAGE)` | 好时 8.2 → 1.1~1.4 ms | 本机 THP `madvise` 模式 + `nr_hugepages=0`，复测不稳定（5860 缺页）⇒ 只能靠环境变量 |
-| 9 | `clear` 改成**按内存顺序扫 `data`**、用 `is_free` 判断（不追链） | 密集（无 Drop glue）**2.2×**（1.11 → 0.50 ms） | **稀疏（1M 槽位、1000 live）1.42 µs → 464 µs，慢 327×**；带 Drop glue 连密集也慢 12%（3.18 → 3.60 ms）；复杂度 O(live) → O(slots) ⇒ 否 |
+| 9 | `clear` 改成**按内存顺序扫 `data`**、用 `is_free` 判断（不追链） | 满表（无 Drop glue）**7.1×**（1.08 → 0.15 ms） | **稀疏（1M 槽位、1000 live）1.1 µs → 0.11 ms，慢 100×**（带 64 B glue 的稀疏 `Aos`：2 µs → 2.7 ms）；满表 + glue 只打平（0.95~1.11×）；打平点随宽度/布局动（`u32` 0.25~0.50、`usize` 索引 0.50~0.75）⇒ **采用混合：`2 * len >= slots` 时走扫描**（阈值 0.5 = 六种组合打平点的上界，任何组合都不会挑到更慢的路；代价是 `u32` 下 0.25~0.5 那段 2~4× 收益不要了）。证据：`src/tests.rs::probe_clear_vs_scan` |
 | 10 | 标记空闲改成**只写标志位所在的那一个字节**（省掉读-改-写里的 load） | IR 上确实少一次 load（`--emit llvm-ir`：`store i8 -128` 对 `load i64`+`or`+`store`；RISC 后端从 `ldrb`/`orr`/`strb` 三条降到 `strb` 一条） | 本机 x86-64 实测 `churn` **慢 5.5~7.5%**（Soa/Packed，四次测量、对照 `VecDeque` 持平、布局扰动底 ±2%）⇒ 否；换 ISA 需重测。**注意：整函数 diff 显示差异不止那一条指令**——crate 里 `|=` 是 `movabs`（提出循环）+ `or %r9,(mem)`，字节写是 `movb`，另外寄存器分配、栈帧、指令数（133→126）与**循环对齐**（热块入口 `mod 64` 从 0 到 60）都变了 ⇒ 那 7% 不能归给单条指令；片段级汇编不可外推（见 `FREE_BIT` 文档） |
 
 ---
@@ -311,8 +315,11 @@ K=64，与我们的 `SoaList` 同机同期对照：
 | 项目 | 数字 | 出处 |
 |---|---|---|
 | `clear` vs "一直 `pop` 到空" | 8 B **1.2×**、64 B **2.9×**、512 B **24.5×**（带 Drop glue 时 64 B 只剩 1.6×） | `List::clear` 文档 |
-| `clear`：追链表 vs 扫描槽位（1M 槽位） | 密集 1.11 → 0.50 ms（扫描快 2.2×）；稀疏（1000 live）**1.42 µs → 464 µs（慢 327×）**；密集 + Drop glue 3.18 → 3.60 ms ⇒ **保留追链表** | `List::clear` 文档 + `clear_drop` 组 |
-| `Drop`：只走 live 链就地析构 vs 经 `clear`（1M） | `usize`（纯记账）**1.172 ms → 2.37 µs**；带 Drop glue Soa **3.13 → 1.96 ms（1.6×）**、Aos 2.84 → 2.38 ms | `List` 的 `Drop` 文档 + `clear_drop` 组 |
+| `clear`：追链表 vs 扫描槽位（1M 槽位、`u32` 索引） | 满表 1.08 → **0.15 ms（扫描快 7.1×）**、打平点 0.25；稀疏（1000 live）**1.1 µs → 0.11 ms（慢 100×）**；满表 + Drop glue 平手（2.45 vs 2.57） ⇒ **混合：`2 * len >= slots` 走扫描（阈值 0.5）** | `List::clear` 文档 + `src/tests.rs::probe_clear_vs_scan` |
+| 扫描版的阈值（按布局/宽度） | 打平点：`u32` 下 `Soa` 0.25 / `Packed` 0.25 / `Aos` 0.50；`usize` 索引下三种布局 0.50（≥1.5× 要到 0.75）。**混合阈值取 0.5**：该档六种组合实测 0.99~1.43×（最坏打平，没有组合会明显变慢） | 同上 |
+| 扫描版的**满表收益** | 安静机器：`u32` 3.4~7.1×、`usize` 1.9~2.3×；有环境负载时：1.65~2.96× ——扫描是带宽受限的（见 §1），追链那列稳定 ⇒ **报比值必须在同一次运行内取** | 同上 |
+| 同上、`u64` 索引（与旧记录对账） | 满表 1.08 → 0.58 ms（快 1.9×）、稀疏 1.0 µs → 0.43 ms（慢 430×）；旧记录"2.2× / 327×"就是这一代的数字 ⇒ 标志位那遍由 8 B 降到 4 B 是把阈值从 0.50 降到 0.25 的原因 | 同上 |
+| `Drop`：只走 live 链就地析构 vs 经 `clear`（1M、`u32`） | `usize` 1.098 ms → **1.9 µs**（析构链被消掉）；带 64 B glue **`Soa` 2.498 → 1.889 ms（1.32×）**、`Packed` 2.888 → 2.062（1.40×）、`Aos` 3.569 → 2.069（1.72×）；"只析构"那列还含释放整块槽位数组 ⇒ 比值是下界 | `List` 的 `Drop` 文档 + `clear_drop` 组 |
 | 迭代三层拆解（1M×`usize`，ns/元素） | `iter()` 1.08 / 自己沿链走 1.14 / 顺序扫槽位 **0.062**（Soa）；Aos 1.29 / 1.34 / 0.478 | 本文 §3.2 |
 | `append` 字节对账（mimalloc，1M⊕1M） | 我们 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **差距全在搬的字节数**（16 B/槽 vs 8 B/槽，各自因扩容搬两遍） | §3.6 |
 | 下标改写（`map(\|i\| i + base)`）成本 | 与 `extend_from_slice` 同速（甚至更快）⇒ **加偏移免费** | §3.6 |
@@ -355,6 +362,8 @@ MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc：别把页还给内核
 ```sh
 cargo bench                        # 全套；报告在 target/criterion/report/index.html
 cargo bench -- 'FastList'          # 只看 fast-list 对照组（§9）
+cargo bench -- 'clear_drop'        # clear/Drop 对照（§5）
+cargo test --release -- --ignored --nocapture probe_clear_vs_scan   # clear 的密度曲线与交叉点（§5）
 cargo bench --features linked-list-cursors   # nightly：把 std 游标那三行对照加回来
 cargo bench -- 'iteration|churn'   # 过滤（正则）
 cargo test                         # 正确性（20 项，含不变量逐槽校验）

@@ -1582,6 +1582,8 @@ fn check_raw_roundtrip<S: Storage<i32> + Default>() {
 }
 
 /// `into_raw` 只释放数组、**不析构 `T`**（`Vec::into_raw_parts` 的语义）。
+// `into_raw` 的定义就是**不析构**元素（`Vec::into_raw_parts` 语义），本测试在断言这一点 ⇒ miri 的泄漏检查必然报，属预期。
+#[cfg_attr(miri, ignore)]
 #[test]
 fn into_raw_does_not_drop_elements() {
     let count = Rc::new(Cell::new(0));
@@ -1788,6 +1790,8 @@ fn auto_traits_and_variance() {
     assert!(covariant(list).is_empty());
 }
 
+// drop 中途 panic ⇒ 剩下的元素本来就不可达，本测试就是在断言"会漏" ⇒ miri 的泄漏检查必然报，属预期。
+#[cfg_attr(miri, ignore)]
 #[test]
 fn drop_panic_leaks_rest() {
     check_drop_panic::<Soa<PanicOnDrop>>();
@@ -2108,4 +2112,326 @@ fn slot_as_key() {
     check_slot_as_key::<Soa<i32>>();
     check_slot_as_key::<Packed<i32>>();
     check_slot_as_key::<Aos<i32>>();
+}
+
+/// 混合 `clear` 的两条路径（`2 * len >= slots` 走扫描，否则追链）都必须：只析构
+/// **live** 元素、保持不变量、把槽位全部还回 free 链并且能全部复用。
+///
+/// `SLOTS = 16` ⇒ `live >= 8` 走扫描、`live < 8` 走追链，阈值两侧都覆盖。
+fn check_clear_paths<S: Storage<Tracked> + Default>() {
+    const SLOTS: usize = 16;
+
+    for live in 0..=SLOTS {
+        let count = Rc::new(Cell::new(0));
+        let mut list: List<Tracked, S> = List::default();
+
+        for _ in 0..SLOTS {
+            list.push_back(Tracked(Rc::clone(&count)));
+        }
+
+        for _ in live..SLOTS {
+            drop(list.pop_front());
+        }
+
+        assert_eq!(list.len(), live);
+        assert_eq!(list.storage.slots(), SLOTS);
+        assert_eq!(count.get(), SLOTS - live);
+
+        list.clear();
+        assert_eq!(list.len(), 0);
+        assert_eq!(count.get(), SLOTS, "live = {live}：每个元素恰好析构一次");
+        assert_invariants(&list);
+
+        // 被清掉的槽位要能全部复用（free 链完整、顺序不重要）
+        for _ in 0..SLOTS {
+            list.push_back(Tracked(Rc::clone(&count)));
+        }
+
+        assert_eq!(list.len(), SLOTS, "live = {live}：槽位没有全部回到 free 链");
+        assert_invariants(&list);
+    }
+}
+
+#[test]
+fn clear_paths() {
+    check_clear_paths::<Soa<Tracked>>();
+    check_clear_paths::<Packed<Tracked>>();
+    check_clear_paths::<Aos<Tracked>>();
+}
+
+// ============================================================
+// `clear`：**追链表** vs **顺序扫槽位 + 判 `prev` 最高位**（`List::clear` 文档引用这里）
+//
+//   cargo test --release -- --ignored --nocapture probe_clear_vs_scan
+//
+// 不复用 criterion：这里要的是一条**密度曲线**（live/slots 从 1 扫到 0.001）来找交叉点，
+// 以及两种 clear 之后 free 链的局部性差异。`Drop` 的对照在 benches 的 `clear_drop` 组。
+// ============================================================
+#[cfg(test)]
+mod probe_clear_vs_scan {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const PN: usize = 1_000_000;
+    const PROUNDS: usize = 9;
+
+    /// min/9 轮；`make` 在计时之外，只计 `f`。
+    fn p_bench_state<St, M: FnMut() -> St, F: FnMut(&mut St)>(mut make: M, mut f: F) -> f64 {
+        f(&mut make()); // 预热
+        let mut samples = Vec::with_capacity(PROUNDS);
+        for _ in 0..PROUNDS {
+            let mut st = make();
+            let t = Instant::now();
+            f(&mut st);
+            samples.push(t.elapsed().as_secs_f64() * 1e3);
+            black_box(&mut st);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[0] // min：本仓库读数约定
+    }
+
+    fn p_trim<T, S: Storage<T>>(list: &mut List<T, S>, live: usize) {
+        while list.len() > live {
+            list.pop_front();
+        }
+    }
+
+    /// 追链版 clear：混合实现里 `2 * len < slots` 那一支的等价物（只碰 live 槽位）。
+    ///
+    /// 探针**不能**拿 `clear()` 代表追链——它现在是混合的，密集时会走扫描。
+    fn p_walk_clear<T, S: Storage<T>>(list: &mut List<T, S>) {
+        while list.len > 0 {
+            let slot = list.head;
+
+            // 先取下一个：`push_free` 会改写该槽位自己的 `next`
+            list.head = list.storage.next(slot);
+
+            unsafe { list.storage.data_mut(slot).assume_init_drop() };
+
+            list.len -= 1;
+            list.push_free(slot);
+        }
+
+        list.head = NIL;
+        list.tail = NIL;
+    }
+
+    /// 扫描版 clear：按内存顺序遍历**全部槽位**，用 `is_free` 判断是否 live。
+    /// 和生产代码用同一个 `push_free`（挂链头），只差 `drop_live = false` 那一档是
+    /// 探针专属（不析构，用来隔离"标志位那遍内存"的代价）。
+    fn p_scan_clear<T, S: Storage<T>>(list: &mut List<T, S>, drop_live: bool) {
+        let slots = list.storage.slots();
+
+        for slot in 0..slots {
+            if list.storage.is_free(slot) {
+                continue;
+            }
+
+            if drop_live {
+                unsafe { list.storage.data_mut(slot).assume_init_drop() };
+            }
+
+            list.push_free(slot);
+        }
+
+        list.head = NIL;
+        list.tail = NIL;
+        list.len = 0;
+    }
+
+    /// 带 Drop glue 的 64 B 载荷（和 benches 里同构：真读一下字段，钉住析构）。
+    struct P64([u64; 8]);
+
+    impl P64 {
+        #[inline]
+        fn new(v: usize) -> Self {
+            Self([v as u64; 8])
+        }
+    }
+
+    impl Drop for P64 {
+        #[inline]
+        fn drop(&mut self) {
+            black_box(self.0[0]);
+        }
+    }
+
+    fn p_build_usize<S: Storage<usize> + Default>(live: usize) -> List<usize, S> {
+        let mut l: List<usize, S> = List::default();
+        for i in 0..PN {
+            l.push_back(black_box(i));
+        }
+        p_trim(&mut l, live);
+        l
+    }
+
+    fn p_build_glue<S: Storage<P64> + Default>(live: usize) -> List<P64, S> {
+        let mut l: List<P64, S> = List::default();
+        for i in 0..PN {
+            l.push_back(P64::new(black_box(i)));
+        }
+        p_trim(&mut l, live);
+        l
+    }
+
+    macro_rules! probe_layout {
+        ($label:literal, $S:ty, $SG:ty) => {{
+            println!("--- {} ---", $label);
+            println!(
+                "{:<28} {:>12} {:>12} {:>12} {:>9}",
+                "形状", "追链 live", "扫槽位", "walk/scan", "live/slots"
+            );
+
+            // 无 Drop glue：密度曲线
+            // 曲线是**降序**扫的 ⇒ 后赋值的密度更小；区分两个点：
+            //   `tie`   = 最小的"扫描不亏"密度（≈打平点）
+            //   `worth` = 最小的"扫描快 ≥1.5×"密度（真正值得切换的阈值）
+            let mut tie: Option<f64> = None;
+            let mut worth: Option<f64> = None;
+
+            for &(name, live) in &[
+                ("dense 1M/1M", PN),
+                ("0.75 750k/1M", 750_000),
+                ("0.5 500k/1M", 500_000),
+                ("0.25 250k/1M", 250_000),
+                ("0.1 100k/1M", 100_000),
+                ("0.01 10k/1M", 10_000),
+                ("0.001 1k/1M", 1_000),
+            ] {
+                let walk = p_bench_state(|| p_build_usize::<$S>(live), |l| p_walk_clear(l));
+                let scan = p_bench_state(
+                    || p_build_usize::<$S>(live),
+                    |l| p_scan_clear(l, true),
+                );
+                let density = live as f64 / PN as f64;
+
+                let ratio = walk / scan;
+
+                if ratio >= 1.0 {
+                    tie = Some(density);
+                }
+
+                if ratio >= 1.5 {
+                    worth = Some(density);
+                }
+
+                println!(
+                    "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
+                    name,
+                    walk,
+                    scan,
+                    walk / scan,
+                    density
+                );
+            }
+
+            let show = |v: Option<f64>| match v {
+                Some(d) => format!("live/slots ≳ {d:.2}"),
+                None => "整条曲线都不划算".to_string(),
+            };
+            println!("{:<28} ⇒ {}", "打平点", show(tie));
+            println!("{:<28} ⇒ {}\n", "值得切换（≥1.5×）", show(worth));
+
+            // 无 glue：只扫 prev 判位、**不析构**（隔离"标志位那遍内存"的代价）
+            let walk = p_bench_state(|| p_build_usize::<$S>(PN), |l| p_walk_clear(l));
+            let scan_nodrop =
+                p_bench_state(|| p_build_usize::<$S>(PN), |l| p_scan_clear(l, false));
+            println!(
+                "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
+                "dense：扫描但不析构",
+                walk,
+                scan_nodrop,
+                walk / scan_nodrop,
+                1.0
+            );
+
+            // 带 Drop glue
+            for &(name, live) in &[("glue dense 1M/1M", PN), ("glue 0.001 1k/1M", 1_000)] {
+                let walk = p_bench_state(|| p_build_glue::<$SG>(live), |l| p_walk_clear(l));
+                let scan = p_bench_state(
+                    || p_build_glue::<$SG>(live),
+                    |l| p_scan_clear(l, true),
+                );
+                println!(
+                    "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
+                    name,
+                    walk,
+                    scan,
+                    walk / scan,
+                    live as f64 / PN as f64
+                );
+            }
+
+            // `Drop` 的两种实现：现在（只走 live 链就地析构）对 旧（先 clear 再丢）
+            // 二阶效应：两种 clear 之后 free 链顺序不同，重填的局部性
+            let refill_walk = p_bench_state(
+                || {
+                    let mut l = p_build_usize::<$S>(PN);
+                    p_walk_clear(&mut l);
+                    l
+                },
+                |l| {
+                    for i in 0..PN {
+                        l.push_back(black_box(i));
+                    }
+                },
+            );
+            let refill_scan = p_bench_state(
+                || {
+                    let mut l = p_build_usize::<$S>(PN);
+                    p_scan_clear(&mut l, true);
+                    l
+                },
+                |l| {
+                    for i in 0..PN {
+                        l.push_back(black_box(i));
+                    }
+                },
+            );
+            println!(
+                "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
+                "重填：walk后/scan后",
+                refill_walk,
+                refill_scan,
+                refill_walk / refill_scan,
+                1.0
+            );
+
+            println!();
+        }};
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_clear_vs_scan() {
+        // 先自证：扫描版的语义与 `clear` 等价（不变量 + 清空 + 可复用）
+        {
+            let mut l: List<usize, Soa<usize, u32>> = p_build_usize(1234);
+            p_scan_clear(&mut l, true);
+            assert_eq!(l.len(), 0);
+            assert_invariants(&l);
+            for i in 0..100 {
+                l.push_back(i);
+            }
+            assert_eq!(
+                l.iter().copied().collect::<Vec<_>>(),
+                (0..100).collect::<Vec<_>>()
+            );
+            assert_invariants(&l);
+            println!("扫描版自证：不变量通过、可复用\n");
+        }
+
+        println!("PN = {PN} 槽位，min/{PROUNDS} 轮\n");
+        probe_layout!("Soa（u32 索引）", Soa<usize, u32>, Soa<P64, u32>);
+        probe_layout!("Soa（usize 索引 = u64）", Soa<usize, usize>, Soa<P64, usize>);
+        probe_layout!("Packed（u32 索引）", Packed<usize, u32>, Packed<P64, u32>);
+        probe_layout!(
+            "Packed（usize 索引）",
+            Packed<usize, usize>,
+            Packed<P64, usize>
+        );
+        probe_layout!("Aos（u32 索引）", Aos<usize, u32>, Aos<P64, u32>);
+        probe_layout!("Aos（usize 索引）", Aos<usize, usize>, Aos<P64, usize>);
+    }
 }

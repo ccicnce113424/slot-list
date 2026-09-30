@@ -234,7 +234,7 @@ impl<T, S: Storage<T>> List<T, S> {
 
     /// 把槽位挂回 free 链头。
     #[inline]
-    fn push_free(&mut self, slot: usize) {
+    pub(crate) fn push_free(&mut self, slot: usize) {
         // 唯一需要显式改标记位的地方：从这里起它不再是 live 槽位
         self.storage.mark_free(slot);
 
@@ -856,23 +856,85 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 512 B **24.5×**——收益随 `T` 变大而增长（省掉的是每元素一次搬值）；带 Drop
     /// glue 时 drop 调用本身占大头，64 B 只剩 1.6×。
     ///
-    /// # 为什么不做成"按内存顺序扫 `data`、用 `is_free` 判断"
+    /// # 混合：密度 ≥ 0.5 走"顺序扫槽位"，否则追链
     ///
-    /// 试过（`benches/list.rs` 的 `clear_drop` 组，1M 槽位）：
+    /// 两条路的代价模型完全不同：**追链是 O(live) 次随机槽位访问**（实测 ≈1.07 ns/live：
+    /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**（≈0.11 ns/槽）。
+    /// 数据来自 `src/tests.rs` 的 `probe_clear_vs_scan`：
+    /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`。
+    /// 1M 槽位、默认 `u32` 索引、min/9 轮、`Soa`）：
     ///
-    /// | 形状 | 追链表 | 扫描 | |
+    /// | `live/slots` | 追链表 | 扫槽位 | |
     /// |---|---|---|---|
-    /// | 密集 `slots == len == 1M` | 1.150 ms | **500 µs** | 扫描快 2.3× |
-    /// | 稀疏 `slots = 1M, len = 1000` | **1.42 µs** | 464 µs | 扫描慢 **327×** |
-    /// | 密集 + Drop glue（64 B） | **3.215 ms** | 3.597 ms | 扫描慢 12% |
-    /// | `clear` 后重填（复用局部性） | 2.343 ms | 2.346 ms | 无差别 |
+    /// | 1（满） | 1.08 ms | 0.15 ms | 扫描快 **7×** |
+    /// | 0.5 | 0.54 ms | 0.12 ms | 扫描快 4.5× |
+    /// | 0.25 | 0.27 ms | 0.11 ms | 扫描快 2.4× |
+    /// | 0.10 | 0.107 ms | 0.111 ms | 打平 |
+    /// | 0.01 | 0.011 ms | 0.11 ms | 追链快 10× |
+    /// | 0.001 | 1.1 µs | 0.11 ms | 追链快 **100×** |
+    /// | 满 + 64 B Drop glue | 2.45 ms | 2.57 ms | 平手 |
+    /// | 0.001 + 64 B Drop glue（`Aos`） | 2 µs | 2.7 ms | 追链快 **1300×** |
     ///
-    /// 扫描只有在"没有 Drop glue **且** 几乎满"时才赢，却把复杂度从 O(live)
-    /// 换成 O(slots)：`clear` 一个刚排空的 deque 会从微秒级掉到几百微秒。带
-    /// Drop glue 时（真实载荷）连密集形状都输——析构本身把带宽吃完，扫描多读的
-    /// 那遍 `prev`（`is_free`）就是纯亏。free 链顺序换成升序也没换来复用收益。
+    /// 两条代价模型完全不同：**追链是 O(live) 次随机槽位访问**（实测 ≈1.07 ns/live：
+    /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**
+    /// （≈0.11 ns/槽：只流式读 `prev` 那几字节标志；`Packed` 0.16~0.23 ms、
+    /// `Aos` 0.38 ms——`Aos` 的标记位和整节点共处一条缓存行，要按节点大小付带宽）。
+    ///
+    /// **打平点**（扫描不亏的最低密度）与**值得切换的阈值**（扫描快 ≥1.5×）——
+    /// 两者都随**索引宽度**和**布局**一起动：
+    ///
+    /// | 布局 / 索引 | 满表加速 | 打平点 | ≥1.5× |
+    /// |---|---|---|---|
+    /// | `Soa` / `u32` | 7.1× | 0.25 | 0.25 |
+    /// | `Soa` / `usize`（u64） | 1.9× | 0.50 | 0.75 |
+    /// | `Packed` / `u32` | 4.7× | 0.25 | 0.25 |
+    /// | `Packed` / `usize` | 2.3× | 0.50 | 0.75 |
+    /// | `Aos` / `u32` | 3.4× | 0.50 | 0.50 |
+    /// | `Aos` / `usize` | 2.0× | 0.50 | 0.75 |
+    ///
+    /// 阈值取 **0.5**：`2 * len >= slots` 时走扫描。这一档六种组合实测 **0.99×~1.43×**
+    /// （最坏是打平，没有组合会明显变慢），代价是打平点更低的组合丢掉了 0.5 以下那
+    /// 一段的收益。
+    ///
+    /// **读数注意**：扫描支是纯带宽受限的——机器上有别的负载时同一台机器能摆动 3~4×
+    /// （实测满表扫描 0.13 ms ↔ 0.65 ms），而追链是延迟受限、稳定在 ~1.08 ms ⇒ 比值
+    /// 必须在**同一次运行内**取，且尽量空机（`probe_clear_vs_scan` 已经把两列做成同一次
+    /// 运行内的对照，别拿不同时刻的数字相除）。
+    ///
+    /// 已知边界代价：带 Drop glue 的满表扫描只是打平（0.95~1.11×）——析构本身把带宽
+    /// 吃完，扫描多读的那遍标志位净亏；不额外判 `needs_drop` 是为了让判据只剩一个
+    /// （实测最差 5%，在噪声量级）。
+    ///
+    /// 复杂度：扫描是 O(slots)，但只在 `len ≥ slots/2` 时才会被选中 ⇒ 最坏 O(2·live)；
+    /// "刚排空的 deque"仍然走追链那条微秒级路径。free 链顺序换成升序也没换来复用
+    /// 收益（重填 1.01×）。
     #[inline]
     pub fn clear(&mut self) {
+        let slots = self.storage.slots();
+
+        // 密度 ≥ 0.5 ⇒ 顺序扫槽位（六种组合在这一档都实测 ≥1.0）。`slots == 0` 也落在
+        // 这里，等价于空操作。
+        if self.len * 2 >= slots {
+            for slot in 0..slots {
+                // 已经在 free 链上的槽位**不能**再挂一次：`push_free` 会把它的 `next`
+                // 指向链头，而链上原位置还指着它 ⇒ 成环，free 链再也走不空。
+                if self.storage.is_free(slot) {
+                    continue;
+                }
+
+                unsafe { self.storage.data_mut(slot).assume_init_drop() };
+
+                self.push_free(slot);
+            }
+
+            self.head = NIL;
+            self.tail = NIL;
+            self.len = 0;
+
+            return;
+        }
+
+        // 稀疏：沿 live 链走，只碰 live 槽位
         while self.len > 0 {
             let slot = self.head;
 
@@ -1090,13 +1152,18 @@ impl<'a, T, S: Storage<T>> IntoIterator for &'a mut List<T, S> {
 ///
 /// 不走 [`clear`](List::clear) 的原因：`clear` 还要把每个槽位挂回 free 链
 /// （`mark_free` + `set_next` + 端点归位），而这里整个存储马上要跟着释放，
-/// 那份维护是纯亏。实测（1M 元素、`clear_drop` 组）：
+/// 那份维护是纯亏。实测（1M 元素、`clear_drop` 组，`cargo bench -- 'clear_drop'`）：
 ///
 /// | 载荷 | 经 `clear` | 只析构 | |
 /// |---|---|---|---|
-/// | `usize`（无 glue，纯记账） | 1.172 ms | **1.86 µs** | 消掉白做 |
-/// | `Drop64`（有 glue，Soa） | 3.134 ms | **2.117 ms** | 快 1.48× |
-/// | `Drop64`（有 glue，Aos） | 2.835 ms | 2.509 ms | 快 1.13× |
+/// | `usize`（无 glue） | 1.098 ms | **1.9 µs** | 整条析构链被 LLVM 消掉，只剩释放存储 |
+/// | `Drop64`（有 glue，`Soa`） | 2.498 ms | **1.889 ms** | 快 1.32× |
+/// | `Drop64`（有 glue，`Packed`） | 2.888 ms | 2.062 ms | 快 1.40× |
+/// | `Drop64`（有 glue，`Aos`） | 3.569 ms | 2.069 ms | 快 1.72× |
+///
+/// 表里"只析构"那列**还含**释放整个槽位数组（"经 `clear`"那列不含）⇒ 1.3~1.7× 是
+/// 下界：省掉的正是每槽一次随机 read-modify-write 加一次随机 `next` 写。稀疏表上差别
+/// 更极端——walk 本身只有微秒级（见 [`clear`](List::clear) 的密度表）。
 ///
 /// 这一条对 `into_iter()` 半途丢弃同样有效（[`IntoIter`] 是 `pop_front` 的
 /// 薄包装，剩余元素最终由这里收尾）。

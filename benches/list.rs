@@ -1508,10 +1508,17 @@ fn blob_end_ops(c: &mut Criterion) {
 //
 // 量两件事（都是用 `iter_batched` 把"造数据/析构"挪出计时区）：
 //
-// 结论（1M 槽位、Soa）：`clear` 保留追链表。扫描版只在"没有 Drop glue 且几乎满"时
-// 快 2.2×，稀疏时慢 327×（1.42 µs → 464 µs）、带 Drop glue 时连密集也慢 12%；
-// `Drop` 只走 live 链就地析构则全面胜出——无 glue 1.172 ms → 2.37 µs，带 glue
-// Soa 3.13 → 1.96 ms（1.6×）。明细见 PERFORMANCE.md §4/§5。
+// 结论（1M 槽位、`u32` 索引）：`clear` 保留追链表。扫描版只在"没有 Drop glue 且八分满以上"
+// 才赢（满表快 7×），交叉点 `live/slots ≈ 0.10`（`Aos` 0.27）；稀疏时慢 100× 以上
+// （1.1 µs → 0.11 ms；带 64 B glue 的稀疏 `Aos` 2 µs → 2.7 ms）；带 Drop glue 时
+// 密集只打平。`Drop` 只走 live 链就地析构则全面胜出——无 glue 1.098 ms → 1.9 µs
+// （析构链被消掉），带 glue `Soa` 2.498 → 1.889 ms（1.32×）、`Aos` 3.569 → 2.069 ms。
+// 扫描版在**本文件里跑不了**（要碰 `List` 的私有字段），它的数字与密度曲线来自
+// `src/tests.rs::probe_clear_vs_scan`。明细见 PERFORMANCE.md §4/§5。
+//
+// 注意：`clear` 现在是**混合**的（`2 * len >= slots` 走扫描，否则追链）⇒
+// `dense/*` 那几行量的是扫描、`sparse/*` 量的是追链；两种写法各自的数字看
+// `src/tests.rs::probe_clear_vs_scan`。
 //
 // 1. `clear`：追链表 vs "按内存顺序扫一遍 data、用 `is_free` 判断"。
 //    两种写法的代价模型完全不同——追链表是 O(live) 次**随机**槽位访问，
