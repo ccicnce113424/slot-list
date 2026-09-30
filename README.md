@@ -59,7 +59,9 @@ All three layouts share one implementation; only where the fields sit differs.
 | `NodesList<T>` | `Nodes` | `data`+`prev`+`next` in a single `Node` array |
 
 The second type parameter is the link index width (`u8`/`u16`/`u32`/`u64`/`usize`);
-`u32` halves the link bytes per slot at the cost of a 2^31-1 slot ceiling.
+`u32` halves each link (8 B → 4 B) at the cost of a 2^31-1 slot ceiling; for an 8-byte element
+that takes a slot from 24 B (8 B payload + 16 B links) to 16 B. All three layouts total the same
+bytes per slot; only the field arrangement differs.
 
 ## `no_std`
 

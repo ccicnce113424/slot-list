@@ -39,11 +39,11 @@
 //! The three memory layouts share **one implementation**; the only difference is
 //! "which fields sit together":
 //!
-//! | alias | layout | arrangement | per slot (T=8 / T=64) |
+//! | alias | layout | arrangement | slot size for an 8 B / 64 B element |
 //! |---|---|---|---|
-//! | [`SplitList`] | [`Split`] | `data` / `prev` / `next` **as three separate `Vec`s** | 24 / 80 B (`u32` index: 16 / 72) |
-//! | [`PackedLinksList`] | [`PackedLinks`] | `data` in one `Vec`, `prev`/`next` **paired** into a single `Link` | 24 / 80 B (`u32`: 16 / 72) |
-//! | [`NodesList`] | [`Nodes`] | `data` + `prev` + `next` **as a whole node** in one `Node` | 24 / 80 B (`u32`: 16 / 72) |
+//! | [`SplitList`] | [`Split`] | `data` / `prev` / `next` **as three separate `Vec`s** | 24 / 80 B = 8 / 64 B payload + 16 B links (`u32` index: 16 / 72 B) |
+//! | [`PackedLinksList`] | [`PackedLinks`] | `data` in one `Vec`, `prev`/`next` **paired** into a single `Link` | 24 / 80 B (`u32`: 16 / 72 B) |
+//! | [`NodesList`] | [`Nodes`] | `data` + `prev` + `next` **as a whole node** in one `Node` | 24 / 80 B (`u32`: 16 / 72 B) |
 //!
 //! The alias's second parameter is the **index width** ([`Ix`]), defaulting to
 //! [`DefaultIx`] = `usize`; enabling the `u32-index` feature switches it to `u32`: a
@@ -180,8 +180,9 @@ pub use storage::{DefaultIx, Ix, Nodes, PackedLinks, Split, Storage};
 /// `Split` layout: `data` / `prev` / `next` as three independent `Vec`s.
 ///
 /// The second parameter is the **index width** ([`Ix`]: `u8` / `u16` / `u32` / `u64` /
-/// `usize`), which directly determines the bytes per slot: with `T = 8`, `usize` is
-/// 24 B/slot, `u32` is **16 B**, and `u16` is 12 B. The cost is a slot-count limit
+/// `usize`), which directly determines the bytes per slot: for an 8-byte element (`usize`),
+/// the default `usize` index gives 24 B/slot (8 B payload + 2×8 B links), `u32` is **16 B**,
+/// and `u16` is 12 B. The cost is a slot-count limit
 /// (`u32` ⇒ 2.1G, `u16` ⇒ 32k, `u8` ⇒ 128; exceeding it panics).
 pub type SplitList<T, I = DefaultIx> = List<T, Split<T, I>>;
 

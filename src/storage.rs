@@ -21,8 +21,8 @@ pub(crate) const NIL: usize = usize::MAX;
 /// How wide an integer stores slot indices in the link arrays.
 ///
 /// Per-slot cost = `T` + two links, so the link width directly determines memory and
-/// bandwidth: switching `usize` to `u32` takes the per-slot size for `T = 8` from 24 B
-/// down to **16 B** (`PERFORMANCE.md` §2/§4).
+/// bandwidth: switching `usize` to `u32` takes the slot for an 8-byte element (`usize`)
+/// from 24 B (8 B payload + 2×8 B links) down to **16 B** (`PERFORMANCE.md` §1.3/§4).
 ///
 /// **Limit**: the free mark bit occupies the top bit (see [`Ix::FREE_BIT`]), and `append`'s
 /// wholesale `+= base` avoids the special case by never carrying into that bit, so the
@@ -340,9 +340,9 @@ pub type DefaultIx = usize;
 
 /// **Three completely separate streams**: one `Vec` each for `data` / `prev` / `next`.
 ///
-/// Walking the chain touches only the index arrays (4 B/slot at `u32`), the most
-/// bandwidth-efficient option; the cost is three base addresses per slot, so an element and
-/// its links never share a cache line.
+/// Walking the chain touches only the index arrays (8 B per link with the default `usize`
+/// index, 4 B with `u32`) — the most bandwidth-efficient option; the cost is three base
+/// addresses per slot, so an element and its links never share a cache line.
 ///
 /// The index width is adjustable (`prev`/`next` narrow together): `Split<T, u16>` /
 /// `Split<T, u32>` / `Split<T, usize>`, default see [`DefaultIx`].
