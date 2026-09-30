@@ -17,8 +17,8 @@ jobs:
     name: 1.85 (library)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # `rust-version = "1.85"` (edition 2024) applies to the library. Only `--lib`
       # is checked: the dev-dependencies (criterion, mimalloc) may need a newer Rust.

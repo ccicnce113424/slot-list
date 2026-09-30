@@ -18,7 +18,7 @@ jobs:
     name: build benches, run the clear probe (x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       # Both allocator configurations must keep compiling; `linked-list-cursors`
@@ -34,7 +34,7 @@ jobs:
         run: cargo bench --features mimalloc,linked-list-cursors
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-report-x86_64
           path: target/criterion
@@ -50,7 +50,7 @@ jobs:
     # to differ per ISA, so this runner exists to re-measure `churn` on AArch64.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --no-run --features linked-list-cursors
@@ -63,7 +63,7 @@ jobs:
         run: cargo bench --features mimalloc,linked-list-cursors -- 'churn|clear_drop'
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-report-arm64
           path: target/criterion
