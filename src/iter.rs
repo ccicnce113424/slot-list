@@ -5,7 +5,7 @@ use core::mem::MaybeUninit;
 use crate::list::List;
 use crate::storage::{Layout, Storage};
 
-/// `&List` 的迭代器，对齐 `std::collections::linked_list::Iter`。
+/// Iterator over `&List`, matching `std::collections::linked_list::Iter`.
 pub struct Iter<'a, T, S: Storage<T>> {
     list: &'a List<T, S>,
     front: usize,
@@ -75,11 +75,12 @@ impl<T, S: Storage<T>> Clone for Iter<'_, T, S> {
     }
 }
 
-/// `&mut List` 的迭代器，对齐 `std::collections::linked_list::IterMut`。
+/// Iterator over `&mut List`, matching `std::collections::linked_list::IterMut`.
 ///
-/// 内部用裸地址（由 [`Storage::layout`] 提供）实现，这样才能在
-/// `next()` 里交出 `&'a mut T` 而不与迭代器自身状态冲突。安全性由
-/// `iter_mut(&mut self)` 的独占借用保证：迭代期间容器不会移动或重分配。
+/// Implemented with raw addresses (provided by [`Storage::layout`]) so that
+/// `next()` can hand out `&'a mut T` without conflicting with the iterator's own
+/// state. Safety comes from the exclusive borrow in `iter_mut(&mut self)`: the
+/// container cannot move or reallocate during iteration.
 pub struct IterMut<'a, T, S: Storage<T>> {
     layout: Layout,
     front: usize,
@@ -101,7 +102,8 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
-    /// 元素 `slot` 的 `data` 槽地址（基址是字节指针，所以这里只需一次 cast）。
+    /// Address of the `data` slot of element `slot` (the base is a byte pointer,
+    /// so a single cast suffices here).
     unsafe fn data(&self, slot: usize) -> *mut MaybeUninit<T> {
         unsafe {
             self.layout
@@ -111,11 +113,13 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
-    /// 按链接宽度读一个下标并加宽。
+    /// Read an index at the link width and widen it.
     ///
-    /// **不能**直接 `cast::<usize>()` 解引用：链接可能是 4 字节（`Split<T, u32>`），
-    /// 地址只有 4 字节对齐 ⇒ 未对齐读是 UB（miri 会报）。宽度在迭代器生命周期内不变，
-    /// 所以 `match` 的判别式是循环不变量（LLVM 会把它提出循环，分支也可预测）。
+    /// We **must not** `cast::<usize>()` and dereference directly: a link may be
+    /// 4 bytes (`Split<T, u32>`) and the address is only 4-byte aligned, so an
+    /// unaligned read is UB (miri flags it). The width is constant for the
+    /// iterator's lifetime, so the `match` discriminant is a loop invariant
+    /// (LLVM hoists it out of the loop; the branch is predictable).
     #[inline(always)]
     unsafe fn read_ix(ptr: *const u8, width: usize) -> usize {
         unsafe {
@@ -137,7 +141,8 @@ impl<'a, T, S: Storage<T>> IterMut<'a, T, S> {
         }
     }
 
-    /// 只对 **live** 槽位调用（`Layout` 读的是裸值：空闲槽的 `prev` 是空闲标记位）。
+    /// Call only on **live** slots (`Layout` reads the raw value: a free slot's
+    /// `prev` holds the free bit).
     unsafe fn prev_of(&self, slot: usize) -> usize {
         unsafe {
             Self::read_ix(
@@ -188,12 +193,12 @@ impl<T, S: Storage<T>> ExactSizeIterator for IterMut<'_, T, S> {}
 
 impl<T, S: Storage<T>> FusedIterator for IterMut<'_, T, S> {}
 
-// 与 std 的 `IterMut` 一致：独占访问，可安全地跨线程传递。
+// Matches std's `IterMut`: exclusive access, safe to send across threads.
 unsafe impl<T: Send, S: Storage<T>> Send for IterMut<'_, T, S> {}
 
 unsafe impl<T: Sync, S: Storage<T>> Sync for IterMut<'_, T, S> {}
 
-/// 所有权迭代器，对齐 `std::collections::linked_list::IntoIter`。
+/// Owning iterator, matching `std::collections::linked_list::IntoIter`.
 pub struct IntoIter<T, S: Storage<T>> {
     list: List<T, S>,
 }

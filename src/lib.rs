@@ -1,146 +1,166 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![warn(missing_docs)]
+#![warn(unsafe_op_in_unsafe_fn)]
 
-//! 一个双向链表，节点全部放在**预分配的连续区域**里：**槽位下标就是元素的身份**
-//! （`slot`，在元素存活期内不变），删除后的槽位用 free-list 串起来复用（LIFO）。
-//! 这就是名字 **`slot-list`** 的由来。
+//! A doubly linked list whose nodes all live in a **preallocated contiguous
+//! region**: **the slot index is the element's identity** (`slot`, constant for
+//! the element's lifetime), and deleted slots are reused through a free-list
+//! (LIFO). That is where the name **`slot-list`** comes from.
 //!
-//! # 两个"位置"：逻辑位置 `pos` 与物理槽位 `slot`
+//! # Two "positions": logical position `pos` and physical slot `slot`
 //!
-//! 内部变量与文档里把这两个词彻底分开，**它们之间没有换算公式**：
+//! The code and the docs keep these two terms strictly apart; **there is no
+//! conversion formula between them**:
 //!
-//! | | 逻辑位置 `pos` | 物理槽位 `slot` |
+//! | | logical position `pos` | physical slot `slot` |
 //! |---|---|---|
-//! | 含义 | 元素在链上的次序（第几个） | 元素在连续内存里的下标（= 身份） |
-//! | 范围 | `0 .. len()` | `0 .. storage.slots()` |
-//! | 稳定性 | 每次插入/删除都会变 | **元素存活期内不变**（可当句柄用） |
-//! | 怎么拿到 | 从端点走链；`Cursor::index()` | **句柄**：`Cursor::slot` / `CursorMut::slot` /
-//!   `List::front_slot` / `back_slot` / `iter_slots`（全 `O(1)`）；类型是 [`Slot`]（裸下标
-//!   8 B，**不带世代号** ⇒ 陈旧句柄查不出来；与 `fast-list` 的取舍对照见 `PERFORMANCE.md` §9） |
-//! | 换算 | `slot_at(pos)`：走链 `O(min(pos, len-1-pos))` | `pos_of(slot)`：走链 `O(len)` |
+//! | Meaning | the element's order in the chain (which one) | the element's index in contiguous memory (= identity) |
+//! | Range | `0 .. len()` | `0 .. storage.slots()` |
+//! | Stability | changes on every insert/remove | **constant while the element lives** (usable as a handle) |
+//! | How to get it | walk the chain from an endpoint; `Cursor::index()` | **handle**: `Cursor::slot` / `CursorMut::slot` /
+//!   `List::front_slot` / `back_slot` / `iter_slots` (all `O(1)`); the type is [`Slot`] (a raw index,
+//!   8 B, **no generation tag** ⇒ a stale handle is undetectable; for the trade-off vs `fast-list` see `PERFORMANCE.md` §9) |
+//! | Conversion | `slot_at(pos)`: walk the chain, `O(min(pos, len-1-pos))` | `pos_of(slot)`: walk the chain, `O(len)` |
 //!
-//! 公开 API 里带"位置"的都指**逻辑位置**：[`List::at`] / [`List::remove`] /
-//! [`Cursor::index`]（与 std 的 `Cursor::index` 一致：返回逻辑位置，幽灵位置为 `None`）/
-//! [`CursorMut::seek`] / [`CursorMut::move_steps`]。
+//! Any "position" in the public API means the **logical position**: [`List::at`] /
+//! [`List::remove`] / [`Cursor::index`] (matching std's `Cursor::index`: returns the
+//! logical position, `None` for the ghost position) / [`CursorMut::seek`] /
+//! [`CursorMut::move_steps`].
 //!
-//! **槽位是对外的一等公民**：拿到句柄之后可以 `cursor_at(_mut)` / `remove_slot` /
-//! `move_to_front` / `move_to_back` / `pos_of`，都不用先知道逻辑位置；不变量保证它在
-//! **元素存活期内**有效、插入删除不搬动别的元素。元素被删除后同一槽位会被复用，
-//! 于是**旧句柄不会失效**——它可能指向新元素（经典 ABA；同机对照与取舍见
-//! `PERFORMANCE.md` §9）。`head` / `tail` / `free_head` / `free_tail` 与 `storage`
-//! 里的下标仍然不公开。
+//! **Slots are a first-class part of the public surface**: once you have a handle you
+//! can call `cursor_at(_mut)` / `remove_slot` / `move_to_front` / `move_to_back` /
+//! `pos_of` without knowing the logical position first; the invariants guarantee the
+//! handle stays valid **while the element lives** and that inserts/removes do not move
+//! other elements. After an element is removed its slot is reused, so **an old handle
+//! does not become invalid** — it may point at the new element (classic ABA; for the
+//! same-machine comparison and trade-offs see `PERFORMANCE.md` §9). The indices in
+//! `head` / `tail` / `free_head` / `free_tail` and `storage` remain private.
 //!
-//! 三种内存布局共用**同一份实现**，区别只有"哪些字段排在一起"：
+//! The three memory layouts share **one implementation**; the only difference is
+//! "which fields sit together":
 //!
-//! | 别名 | 布局 | 排布 | 每槽（T=8 / T=64） |
+//! | alias | layout | arrangement | per slot (T=8 / T=64) |
 //! |---|---|---|---|
-//! | [`SplitList`] | [`Split`] | `data` / `prev` / `next` **三条流各自一个 `Vec`** | 24 / 80 B（`u32` 索引：16 / 72） |
-//! | [`PackedLinksList`] | [`PackedLinks`] | `data` 一个 `Vec`，`prev`/`next` **成对**放进同一个 `Link` | 24 / 80 B（`u32`：16 / 72） |
-//! | [`NodesList`] | [`Nodes`] | `data` + `prev` + `next` **整节点**放进一个 `Node` | 24 / 80 B（`u32`：16 / 72） |
+//! | [`SplitList`] | [`Split`] | `data` / `prev` / `next` **as three separate `Vec`s** | 24 / 80 B (`u32` index: 16 / 72) |
+//! | [`PackedLinksList`] | [`PackedLinks`] | `data` in one `Vec`, `prev`/`next` **paired** into a single `Link` | 24 / 80 B (`u32`: 16 / 72) |
+//! | [`NodesList`] | [`Nodes`] | `data` + `prev` + `next` **as a whole node** in one `Node` | 24 / 80 B (`u32`: 16 / 72) |
 //!
-//! 别名第二个参数是**索引宽度**（[`Ix`]），默认 [`DefaultIx`] = `usize`；开 `u32-index`
-//! feature 换成 `u32`：每槽省 1/3、`append` 快 37%，代价是槽位上限 2.1G
-//! （见 [`Ix::MAX_SLOTS`]）。**`PERFORMANCE.md` 里绝大多数数字是 `u32` 索引时代测的。**
+//! The alias's second parameter is the **index width** ([`Ix`]), defaulting to
+//! [`DefaultIx`] = `usize`; enabling the `u32-index` feature switches it to `u32`: a
+//! third less per slot and `append` 37% faster, at the cost of a 2.1G slot limit
+//! (see [`Ix::MAX_SLOTS`]). **Most numbers in `PERFORMANCE.md` were measured in the
+//! `u32`-index era.**
 //!
-//! 三者都是 [`List<T, S>`] 的别名，所有逻辑只写一遍，布局差异由
-//! [`Storage`] 策略提供。
+//! All three are aliases of [`List<T, S>`]: the logic is written once, and the layout
+//! differences come from the [`Storage`] strategy.
 //!
 //! # `no_std`
 //!
-//! 关掉默认的 `std` feature 就是 `no_std` + `alloc`：
+//! Turning off the default `std` feature gives `no_std` + `alloc`:
 //!
 //! ```text
-//! cargo check --no-default-features     # no_std 只用 check 验证
+//! cargo check --no-default-features     # no_std is only verified with check
 //! ```
 //!
-//! `std` 同时也是**基准与测试**的前提（criterion、测试里的 `std::rc`）：这个组合下
-//! bench target 会被 `required-features` 跳过，测试模块也不编译。
-//! 库本身只用 `core` 与 `alloc::vec::Vec`，没有别的依赖。
+//! `std` is also a prerequisite for **benches and tests** (criterion, `std::rc` in
+//! the tests): under this combination the bench target is skipped via
+//! `required-features` and the test module is not compiled. The library itself only
+//! uses `core` and `alloc::vec::Vec`, with no other dependencies.
 //!
-//! # 状态可搬运（可序列化 / 共享内存）
+//! # State is transportable (serializable / shared memory)
 //!
-//! 整条链的状态 = 槽位数组 + 五个数字，**没有指针**，所以可以直接落盘或放进共享内存。
-//! 公开入口是 [`List::into_raw`] / [`List::from_raw`]（配 [`RawList`] 的取值器）与各布局的
-//! `as_parts` / `into_parts` / `from_parts`；想逐槽取状态还有
-//! [`List::iter_slots`]（live）与 [`List::free_slots`]（free 链，LIFO）。
+//! The whole chain's state = the slot arrays plus five numbers, **no pointers**, so it
+//! can be written to disk or placed in shared memory directly. The public entry points
+//! are [`List::into_raw`] / [`List::from_raw`] (with [`RawList`]'s accessors) and each
+//! layout's `as_parts` / `into_parts` / `from_parts`; for per-slot state there is also
+//! [`List::iter_slots`] (live) and [`List::free_slots`] (the free chain, LIFO).
 //!
-//! # 与 `std::collections::LinkedList` 的对齐
+//! # Alignment with `std::collections::LinkedList`
 //!
-//! 公开 API 与语义都对齐 `LinkedList`：
+//! Both the public API and the semantics align with `LinkedList`:
 //!
-//! - `new`（`const fn`）、`Default`、`len`、`is_empty`、`clear`
-//! - `push_front` / `push_back`（返回 `()`）、`push_front_mut` / `push_back_mut`
+//! - `new` (`const fn`), `Default`, `len`, `is_empty`, `clear`
+//! - `push_front` / `push_back` (returning `()`), `push_front_mut` / `push_back_mut`
 //! - `pop_front` / `pop_back`
 //! - `front` / `back` / `front_mut` / `back_mut`
 //! - `cursor_front` / `cursor_front_mut` / `cursor_back` / `cursor_back_mut`
-//! - `iter` / `iter_mut` / `IntoIterator`（`&`、`&mut`、所有权）
-//! - `contains`、`retain`、`append`、`split_off`、`remove`
-//! - 游标的 std 对齐四件套：`remove_current_as_list` / `splice_before` /
-//!   `splice_after` / `split_before` / `split_after`（**复杂度与 std 不同**，见下）
-//! - `Clone`、`Debug`、`PartialEq`、`Eq`、`FromIterator`、`Extend`
-//! - 游标：[`Cursor`] / [`CursorMut`]，含“幽灵”位置、环形移动、
-//!   `insert_before` / `insert_after` / `remove_current` / `push_*` / `pop_*`
+//! - `iter` / `iter_mut` / `IntoIterator` (`&`, `&mut`, and owned)
+//! - `contains`, `retain`, `append`, `split_off`, `remove`
+//! - the std-aligned cursor methods: `remove_current_as_list` / `splice_before` /
+//!   `splice_after` / `split_before` / `split_after` (**complexity differs from std**, see below)
+//! - `Clone`, `Debug`, `PartialEq`, `Eq`, `FromIterator`, `Extend`
+//! - cursors: [`Cursor`] / [`CursorMut`], including the "ghost" position, wrap-around
+//!   movement, `insert_before` / `insert_after` / `remove_current` / `push_*` / `pop_*`
 //!   / `peek_*` / `as_cursor` / `as_list`
 //!
-//! 语义差异（都源于"槽位是同一块连续存储"这一个事实）：
+//! Semantic differences (all stemming from the single fact that "slots are one
+//! contiguous storage"):
 //!
-//! | 操作 | std | 本库 |
+//! | operation | std | this library |
 //! |---|---|---|
-//! | `append` | O(1) 指针拼接 | O(对方槽位数)：整段搬过来 + 下标加偏移（不变量让索引只写一遍） |
-//! | `split_before` / `split_after` / `split_off` | O(1) 切指针 | **O(N) 搬元素**，且**搬走的元素拿到新槽位**（旧 `Slot` 句柄作废） |
-//! | `splice_before` / `splice_after` | O(1) | O(搬入的元素数)，逐个插入 |
-//! | `remove_current_as_list` | O(1) 搬节点 | O(1)，但元素**换新槽位** |
+//! | `append` | O(1) pointer splice | O(other's slot count): move the whole run over + add an offset to the indices (the invariant lets each index be written once) |
+//! | `split_before` / `split_after` / `split_off` | O(1) pointer split | **O(N) element moves**, and the **moved elements get new slots** (old `Slot` handles become stale) |
+//! | `splice_before` / `splice_after` | O(1) | O(number of elements spliced in), inserting one by one |
+//! | `remove_current_as_list` | O(1) node move | O(1), but the element **gets a new slot** |
 //!
-//! `append` 的细节：
+//! `append` in detail:
 //!
-//! 不是 std 的 O(1) 指针拼接，而是把对方整段槽位搬过来
-//! （下标**一边搬一边加偏移**，索引只写一遍），O(other 的槽位总数)；
-//! **对方的空闲槽也一起接过来**。想要"逐元素搬到末尾、优先复用自己已有的空闲
-//! 槽"（按活元素计费，对方稀疏时特别划算），用 [`List::append_elementwise`]。
-//! 两条路的取舍与实测见该方法与 [`Storage::append`] 的文档。
+//! It is not std's O(1) pointer splice; instead it moves the other list's whole run of
+//! slots over (adding the offset **as it moves**, so each index is written once),
+//! O(other's total slot count); **the other list's free slots come along too**. For
+//! "move element by element to the back, preferring to reuse free slots we already
+//! have" (billed by live elements, especially worthwhile when the other list is
+//! sparse), use [`List::append_elementwise`]. See that method and [`Storage::append`]
+//! for the trade-offs between the two paths.
 //!
-//! # 实现要点：数组里没有哨兵值
+//! # Implementation notes: no sentinel values in the arrays
 //!
-//! `next` 数组里**每个值都是合法槽位下标**（两条链两端的"哑元"字段没人读，但同样是
-//! 合法下标）；`NIL` 只作为**标量**参数（`head`/`tail`/`free_head`/`free_tail` 的"空"）
-//! 和游标的幽灵位置 tag 使用。这正是 [`List::append`] 能把搬过来的整段下标无条件
-//! `+= base` 的原因——**空闲标记位也搭这趟车**：它在 `prev` 的最高位，
-//! `2^63 | v` 加上 `base` 仍是 `2^63 | (v + base)`（只要不溢出 `u64`）。
+//! **Every value in the `next` array is a valid slot index** (the "dummy" fields at the
+//! ends of the two chains are never read, but are still valid indices); `NIL` is used
+//! only as a **scalar** argument (the "empty" value of `head`/`tail`/`free_head`/
+//! `free_tail`) and as the cursor's ghost-position tag. This is exactly why
+//! [`List::append`] can unconditionally `+= base` the whole run of moved indices — **the
+//! free bit rides along**: it sits in the top bit of `prev`, and `2^63 | v` plus `base`
+//! is still `2^63 | (v + base)` (as long as `u64` does not overflow).
 //!
-//! `prev` 只在**live** 槽位上是"合法下标"；**空闲槽位的 `prev` 是陈旧值 + 标记位**
-//! ⇒ 因此有一条契约：**只在 live 槽位上读 `prev`**（[`Storage::prev`] 不做掩码，
-//! debug 构建里用 `debug_assert` 钉着；release 零成本）。
+//! `prev` is a "valid index" only on **live** slots; **a free slot's `prev` is a stale
+//! value plus the mark bit** ⇒ hence the contract: **read `prev` only on live slots**
+//! ([`Storage::prev`] does not mask; debug builds pin this with `debug_assert`, release
+//! pays nothing).
 //!
-//! 判定"槽位活没活"只看那个标记位，**绝不读 `data`**：空闲槽的 `data` 是未初始化的，
-//! 碰它就是 UB。
+//! To decide whether a slot is live, look only at that mark bit, **never read `data`**:
+//! a free slot's `data` is uninitialized, and touching it is UB.
 //!
-//! 由此有两条纪律：
+//! This yields two disciplines:
 //!
-//! - 沿链走**必须按个数**（两端的哑元不是 NIL）：[`Iter`] / [`IterMut`] 用
-//!   `remaining` 计数，`retain` / `clear` 按 `len` 收尾；
-//! - **四个端点字段在链为空时都归位 `NIL`**（`head`/`tail` 看 `len == 0`，
-//!   `free_head`/`free_tail` 看 free 链变空）：这样"空不空"就是读一个字段，
-//!   而不必算 `storage.slots() - len`——后者每次 free/alloc 都要跑，实测
-//!   `churn` 慢 3~6%；归位只在"变空"那一次写两个字段。
+//! - walking a chain **must be by count** (the end dummies are not NIL): [`Iter`] /
+//!   [`IterMut`] count with `remaining`, and `retain` / `clear` finish by `len`;
+//! - **all four endpoint fields reset to `NIL` when a chain becomes empty**
+//!   (`head`/`tail` when `len == 0`, `free_head`/`free_tail` when the free chain empties):
+//!   that way "is it empty" is a single field read instead of computing
+//!   `storage.slots() - len`, which would run on every free/alloc (measured ~3–6% slower
+//!   `churn`); the reset writes two fields only on the transition to empty.
 //!
-//! # 本库扩展（std 没有）
+//! # Extensions (not in std)
 //!
-//! - [`List::at`]：O(min(pos, len-1-pos)) 的随机定位，std 完全没有随机访问
-//! - [`List::with_capacity`] / [`List::reserve`]：预分配槽位容量
-//!   （节点在连续内存里，所以 std 的链表没有这个需求，我们有）
-//! - [`CursorMut::seek`] / [`CursorMut::move_steps`]：游标按位置/步长移动
-//! - [`CursorMut::is_head`] / [`CursorMut::is_tail`]：O(1) 端点判定
+//! - [`List::at`]: O(min(pos, len-1-pos)) random access; std has no random access at all
+//! - [`List::with_capacity`] / [`List::reserve`]: preallocate slot capacity
+//!   (nodes live in contiguous memory, so std's list has no such need — ours does)
+//! - [`CursorMut::seek`] / [`CursorMut::move_steps`]: move a cursor by position/stride
+//! - [`CursorMut::is_head`] / [`CursorMut::is_tail`]: O(1) endpoint checks
 //!
-//! # 性能
+//! # Performance
 //!
-//! 数字、机制解释、`append` 两个 API 的选型矩阵，以及**已试过并否掉的优化**都在仓库
-//! 根目录的 **`PERFORMANCE.md`**；基准本体在 `benches/list.rs`，它的表头写着读数纪律
-//! （噪声底、缺页计数、交替 A/B）。
+//! Numbers, mechanism explanations, the choice matrix for `append`'s two APIs, and the
+//! **optimizations already tried and rejected** are all in **`PERFORMANCE.md`** at the
+//! repository root; the benchmarks themselves are in `benches/list.rs`, whose header
+//! spells out the reading discipline (noise floor, page-fault counting, alternating A/B).
 //!
-//! # 有意不实现
+//! # Intentionally not implemented
 //!
-//! `PartialOrd` / `Ord` / `Hash`、`extract_if` / `retain_mut`、
+//! `PartialOrd` / `Ord` / `Hash`, `extract_if` / `retain_mut`,
 //! `CursorMut::splice_before` / `splice_after` / `split_before` /
-//! `split_after` / `remove_current_as_list`、分配器 API（`new_in`）。
+//! `split_after` / `remove_current_as_list`, and the allocator APIs (`new_in`).
 
 extern crate alloc;
 mod cursor;
@@ -149,7 +169,6 @@ mod list;
 mod slot;
 pub mod storage;
 
-#[cfg(test)]
 #[cfg(all(test, feature = "std"))]
 mod tests;
 
@@ -159,17 +178,18 @@ pub use list::{List, RawList};
 pub use slot::Slot;
 pub use storage::{DefaultIx, Ix, Nodes, PackedLinks, Split, Storage};
 
-/// `Split` 布局：`data` / `prev` / `next` 三个独立 `Vec`。
+/// `Split` layout: `data` / `prev` / `next` as three independent `Vec`s.
 ///
-/// 第二个参数是**索引宽度**（[`Ix`]：`u8` / `u16` / `u32` / `u64` / `usize`），
-/// 直接决定每槽多少字节：`T = 8` 时 `usize` 是 24 B/槽、`u32` 是 **16 B**、`u16` 是 12 B。
-/// 代价是槽位数上限（`u32` ⇒ 2.1G、`u16` ⇒ 32k、`u8` ⇒ 128，超过就 panic）。
+/// The second parameter is the **index width** ([`Ix`]: `u8` / `u16` / `u32` / `u64` /
+/// `usize`), which directly determines the bytes per slot: with `T = 8`, `usize` is
+/// 24 B/slot, `u32` is **16 B**, and `u16` is 12 B. The cost is a slot-count limit
+/// (`u32` ⇒ 2.1G, `u16` ⇒ 32k, `u8` ⇒ 128; exceeding it panics).
 pub type SplitList<T, I = DefaultIx> = List<T, Split<T, I>>;
 
-/// PackedLinks 布局：`data` 一个 `Vec`，`prev`/`next` 交错放在另一个 `Vec`。
-/// 第二个参数是索引宽度（同 [`SplitList`]）。
+/// PackedLinks layout: `data` in one `Vec`, `prev`/`next` interleaved in another `Vec`.
+/// The second parameter is the index width (same as [`SplitList`]).
 pub type PackedLinksList<T, I = DefaultIx> = List<T, PackedLinks<T, I>>;
 
-/// Nodes 布局：`data` / `prev` / `next` 放进单个 `Node`。
-/// 第二个参数是索引宽度（同 [`SplitList`]）。
+/// Nodes layout: `data` / `prev` / `next` in a single `Node`.
+/// The second parameter is the index width (same as [`SplitList`]).
 pub type NodesList<T, I = DefaultIx> = List<T, Nodes<T, I>>;

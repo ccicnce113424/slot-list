@@ -2,39 +2,59 @@
 name = "slot-list"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A doubly linked list over a contiguous slot arena, with stable O(1) slot handles, element-level cursors, three configurable memory layouts, and no_std support."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["linked-list", "no-std", "arena", "data-structures", "slots"]
+categories = ["data-structures", "no-std", "memory-management"]
+authors = ["ccicnce113424 <ccicnce113424@gmail.com>"]
+documentation = "https://docs.rs/slot-list"
+# The repository URL is intentionally left out until the project has a remote.
+exclude = [
+    "/.direnv",
+    "/.envrc",
+    "/.jj",
+    "/flake.lock",
+    "/flake.nix",
+    "/result",
+    "/result-*",
+]
 
 [lib]
 name = "slot_list"
 path = "src/lib.rs"
 
 [features]
-# 默认只有 `std`：基准跑在**系统 allocator** 上。
+# `std` is on by default and is a prerequisite for the tests and benchmarks
+# (criterion, `std::rc` in the tests). Turning it off gives `no_std` + `alloc`:
+#   cargo check --no-default-features
+# With it off the bench target is skipped by `required-features`.
 default = ["std"]
-# 关掉它就是 `no_std` + `alloc`。
-#   cargo check --no-default-features          # 验证 no_std 能编
-# 注意：`std` 也是**基准与测试**的前提（criterion、测试里的 `std::rc`），
-# `--no-default-features` 下 bench target 会被跳过（`required-features`）。
 std = []
-# 只影响**基准**：开它就用 mimalloc 当全局分配器（`PERFORMANCE.md` 里的数字都是这么测的）。
-#   cargo bench --features mimalloc            # 复现文档数字
-#   cargo bench                                # 系统 malloc（默认）
+# Benchmarks only: use mimalloc as the global allocator. The numbers in
+# PERFORMANCE.md were measured with it.
+#   cargo bench --features mimalloc            # reproduce the published numbers
+#   cargo bench                                # system malloc (default)
 mimalloc = []
-# 只影响基准：开它才对比 std `LinkedList` 的**游标**（`#![feature(linked_list_cursors)]`）
-# ⇒ 只有 nightly 能开，stable 上开它会是明确报错而不是静默少几行：
+# Benchmarks only: also compare against the cursor API of std `LinkedList`
+# (`#![feature(linked_list_cursors)]`), so this needs nightly:
 #   cargo bench --features linked-list-cursors
 linked-list-cursors = []
-# 把默认索引宽度（`DefaultIx`）从 `usize` 切成 `u32`：每槽省 1/3、`append` 快 37%，
-# 代价是槽位上限降到 `2^31-1`。**默认不启用**；测试用它在窄索引下跑全套。
+# Change the default link index width (`DefaultIx`) from `usize` to `u32`:
+# 1/3 fewer bytes per slot and a 37% faster `append`, at the cost of a
+# 2^31-1 slot ceiling. Off by default; tests use it to run the full suite with a
+# narrow index.
 u32-index = []
 
 [dev-dependencies]
 criterion = "0.8"
 mimalloc = "0.1"
-# 对照组：slotmap 索引 + 世代号（`LinkedListIndex`）的那套实现。
+# Reference implementation with a slotmap index + generation key.
 fast-list = "0.1.8"
 
 [[bench]]
 name = "list"
 harness = false
-# 基准跑不了 `no_std`：criterion 需要 std。
+# Benchmarks need std (criterion).
 required-features = ["std"]

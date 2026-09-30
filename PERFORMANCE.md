@@ -1,509 +1,569 @@
-# `slot-list` 性能总结
+# `slot-list` performance summary
 
-`List<T, S>` = **下标即指针**的双向链表：节点放在预分配的连续槽位里，删掉的槽位用
-free-list 串起来复用；三种内存布局（`SplitList` / `PackedLinksList` / `NodesList`）是同一个泛型
-类型的三个 `Storage` 参数。基线是 std 的 `LinkedList`、`VecDeque`、`Vec`。
+`List<T, S>` is a doubly linked list where **the index is the pointer**: nodes live in a
+preallocated array of contiguous slots, and removed slots are threaded onto a free list for reuse.
+The three memory layouts (`SplitList` / `PackedLinksList` / `NodesList`) are three `Storage`
+parameters of the same generic type. The baselines are std's `LinkedList`, `VecDeque` and `Vec`.
 
 ---
 
-## 0. 速览
+## 0. Overview
 
-| 问题 | 结论（当日全套，1M 元素） |
+| Question | Answer (full suite, 1M elements) |
 |---|---|
-| 端操作 `push`+`pop`（不预分配） | 比 `VecDeque` 慢 2.4~3.0×，与 `LinkedList` 同级（6.1~7.5 vs 5.8~6.0 ms）——这组由**缺页与拷贝量**支配（§3.1） |
-| 稳态端操作 `churn`（无分配） | **比 `LinkedList` 快 2.2×**（2.75 vs 6.15 ms），比 `VecDeque` 慢 1.6×（§3.4） |
-| 迭代 | 与 `LinkedList` 同级（1.21 vs 1.05 ms；~1.1 ns/元素 = 依赖加载下限）；**64 B 载荷下比它快 1.74×**（§3.2） |
-| 中间位置插删 | 与 `LinkedList` 同级、比 `VecDeque` 快 150×（后者每次要 memmove 50 万元素）（§3.3） |
-| 内存/槽 | **24 B**（T=8，默认 `usize` 索引；`u32` 索引是 16 B）；三种布局在 T=64 上统一 80 B（§2） |
-| 与 std `LinkedList` 的关键差异 | ① 无每节点分配（`churn` / `blob_end_ops` 领先的原因）；② `append` 不是 O(1) 指针拼接（§3.6） |
-| 已确认到顶 | **在本库这个形状内**：迭代的"沿链走"、`append` 的拷贝（已到带宽）——三条路线都实现/建模过并否掉（§4）。想更快只能换形状：分块 ≈ `LinkedList<Vec<T>>`，全项更快，但没有元素级游标/稳定句柄（§4 末） |
-| 独特价值（性能之外） | **稳定句柄 `Slot`（O(1) 进入/删除/搬移，实测比按位置快约 4 万倍）**、热路径零分配（有测试）、状态可搬运（有测试）、布局可换——见 §8 |
-| 最有效的旋钮 | 复用空闲槽（`append_elementwise`）与预置容量（`with_capacity`），其次是分配器/大页（§6） |
+| End operations `push`+`pop` (no preallocation) | 2.4–3.0× slower than `VecDeque`, on par with `LinkedList` (6.1–7.5 vs 5.8–6.0 ms) — this group is dominated by **page faults and bytes copied** (§3.1) |
+| Steady-state end operations `churn` (no allocation) | **2.2× faster than `LinkedList`** (2.75 vs 6.15 ms), 1.6× slower than `VecDeque` (§3.4) |
+| Iteration | On par with `LinkedList` (1.21 vs 1.05 ms; ~1.1 ns/element = the dependent-load floor); **1.74× faster with a 64 B payload** (§3.2) |
+| Middle insert/remove | On par with `LinkedList`, 150× faster than `VecDeque` (which memmoves 500k elements every time) (§3.3) |
+| Memory/slot | **24 B** (T=8, default `usize` index; the `u32` index is 16 B); all three layouts agree at 80 B for T=64 (§2) |
+| Key differences from std `LinkedList` | ① no per-node allocation (why `churn` / `blob_end_ops` win); ② `append` is not an O(1) pointer splice (§3.6) |
+| Confirmed at the ceiling | **within this crate's shape**: walking the chain during iteration and `append`'s copying (already at bandwidth) — three routes were implemented/modelled and rejected (§4). Going faster means changing the shape: chunking ≈ `LinkedList<Vec<T>>`, faster on every item but with no element-level cursor and no stable handle (end of §4) |
+| Unique value (beyond performance) | **stable handle `Slot` (O(1) entry/remove/move, measured ~40,000× faster than going by position)**, zero allocation on the hot path (tested), relocatable state (tested), swappable layout — see §8 |
+| Most effective knobs | reusing free slots (`append_elementwise`) and preallocating capacity (`with_capacity`), then the allocator / huge pages (§6) |
 
 ---
 
-## 1. 方法与读数纪律
+## 1. Method and reading discipline
 
-> **索引宽度口径（2026-09-30 起）**：本文件绝大多数数字是 **`u32` 索引**时代测的
-> （T=8 时 16 B/槽，`append` −37% 那条就是它的功劳）；**现在默认是 `usize`**（24 B/槽，
-> 那条 −37% 不再适用）。要跑哪一套：`cargo bench`（默认 `usize`）/
-> `cargo bench --features u32-index`（`u32`）。基准启动时会打印当前宽度。
+> **Index width**: most numbers in this document were measured with the **`u32` index** (16 B/slot
+> at T=8, which is what the `append` −37% figure belongs to); the **default is now `usize`**
+> (24 B/slot, so that −37% no longer applies). Run either configuration with `cargo bench` (default
+> `usize`) or `cargo bench --features u32-index` (`u32`); the benchmark prints the active width at
+> startup.
 
-- 单线程、`cargo bench`（criterion，`sample_size(10)`、`measurement_time(1s)`，报中位数）。
-- **噪声底：±5%**（`iteration` / `churn` / `cursor_update` 这类小工作集更小）；
-  `append*` / `blob_*` 这类大分配组 **±10~20%**——机器状态一漂，同一份代码的 `churn`
-  都能从 2.80 漂到 3.01 ms，而对照基线（`VecDeque`）不动，所以**必须看对照**。
-- **`end_ops` / `churn` / `append*` 是分配器/kernel 计量，不是代码计量**：`append` 同一
-  份代码在不同时刻能从 2 ms 漂到 16 ms（缺页 0 → 8187）。比较时看**计时区缺页数**。
-- 判定回归：两版**交替**跑（A/B/A/B），用外部基线（`Vec`/`VecDeque`/`LinkedList`）
-  当参照；差值得超出噪声底才算数。
-- **带宽敏感 vs 延迟敏感**：`clear` 的扫描支、`append*`、顺序扫描这类**纯带宽**项，
-  机器上有别的负载时同机就能膨胀 **3~4×**（实测满表扫描 0.13 ms ↔ 0.65 ms）；而
-  `churn`、游标、追链这类**延迟受限**项只动 ~25%（追链稳定在 ~1.08 ms）⇒
-  比这类值时**必须在同一次运行内取对照**，别拿不同时刻的两列相除。
-- 口径：`N` = 1M 元素（`usize`，8 B）；`LARGE_N` = 250k（`Blob64`，64 B）。
+- Single-threaded `cargo bench` (criterion, `sample_size(10)`, `measurement_time(1s)`, medians).
+- **Noise floor: ±5%** (less for small working sets such as `iteration` / `churn` / `cursor_update`);
+  **±10–20%** for the large-allocation groups `append*` / `blob_*` — when the machine drifts, the
+  same `churn` code moves from 2.80 to 3.01 ms while the `VecDeque` baseline does not budge, so
+  **always read the baseline alongside**.
+- **`end_ops` / `churn` / `append*` measure the allocator and the kernel, not the code**: the same
+  `append` code swings from 2 ms to 16 ms (page faults 0 → 8187). Compare **page faults inside the
+  timing region**.
+- Regression calls: run the two versions **alternating** (A/B/A/B), with an external baseline
+  (`Vec`/`VecDeque`/`LinkedList`) as reference; only a difference beyond the noise floor counts.
+- **Bandwidth-sensitive vs latency-sensitive**: purely bandwidth-bound items (`clear`'s scan arm,
+  `append*`, sequential scans) can inflate **3–4×** on the same machine when something else is
+  running (a full-table scan measured 0.13 ms ↔ 0.65 ms), whereas latency-bound items (`churn`,
+  cursors, chain-walking, which sits at ~1.08 ms) move only ~25% ⇒ **take the reference within the
+  same run**; never divide two columns measured at different times.
+- Scales: `N` = 1M elements (`usize`, 8 B); `LARGE_N` = 250k (`Blob64`, 64 B).
 
 ---
 
-## 2. 三种布局：内存与地址（实测核对过）
+## 2. The three layouts: memory and addresses (measured and checked)
 
-`Layout` 用「基址 + 步长 + 偏移」描述地址（下标 = 槽位号）：
+`Layout` describes addresses as base + stride + offset (the index is a slot number):
 
 ```text
-元素 i 的 data 地址 = data 基址 + i * data_stride + data_offset
-元素 i 的 prev 值   = *(prev 基址 + i * prev_stride)
-元素 i 的 next 值   = *(next 基址 + i * next_stride)
+data address of element i = data base + i * data_stride + data_offset
+prev value of element i   = *(prev base + i * prev_stride)
+next value of element i   = *(next base + i * next_stride)
 ```
 
-| 布局 | 内存/槽（T=8 / T=64，`u32` 索引） | `data_stride` | `data_offset` | `prev`·`next` 步长 | 结构 |
+| Layout | Memory/slot (T=8 / T=64, `u32` index) | `data_stride` | `data_offset` | `prev`·`next` stride | Structure |
 |---|---|---|---|---|---|
-| `Split<T, I>` | **16 / 72** B | 8 / 64 | 0 | 4 | 三个独立 `Vec` |
-| `PackedLinks<T, I>` | **16 / 72** B | 8 / 64 | 0 | 8（`Link<I>`） | `data` + `Link{prev,next}` 交错 |
-| `Nodes<T, I>` | **16 / 72** B | 16 / 72 | 0 | 16 / 72 | 一个 `Vec<Node<T, I>>` |
+| `Split<T, I>` | **16 / 72** B | 8 / 64 | 0 | 4 | three separate `Vec`s |
+| `PackedLinks<T, I>` | **16 / 72** B | 8 / 64 | 0 | 8 (`Link<I>`) | `data` interleaved with `Link{prev,next}` |
+| `Nodes<T, I>` | **16 / 72** B | 16 / 72 | 0 | 16 / 72 | a single `Vec<Node<T, I>>` |
 
-（上表是**索引宽度 `u32`** 的实测值；**现在默认是 `usize`**，三种布局每槽全部 +8 B
-——`Split`/`PackedLinks` 24 B、`Nodes` 24 B（T=64 时 80 B，`Node` 越过 cache line 后 padding 无处可省）。
-`data_offset` 三种布局、两种宽度下实测都是 0。）
+(The table is for the **`u32` index**; with the **default `usize`** every layout adds 8 B/slot —
+`Split`/`PackedLinks` 24 B, `Nodes` 24 B, and 80 B for T=64, where a `Node` crossing a cache line
+leaves no padding to save. `data_offset` is 0 for all three layouts at both widths.)
 
-关于 `Node<T>` 的字段次序（`repr(Rust)`）：
+On the field order of `Node<T>` (`repr(Rust)`):
 
-- 编译器**有权重排字段**。本仓库实测它保留了声明次序 `[data][prev][next]`
-  （三个字段对齐都 ≤ 8、没有 padding 可省 ⇒ 排序稳定），所以 `data_offset` 是 0。
-- **crate 不依赖这个**：偏移一律用 `offset_of!` 现取。把 `data` 挪到中间后
-  `data_offset` 变 8，20/20 测试原样通过（迭代器走的是 `Layout`）。
-- 实测两种次序：cache line 集合**逐档相同**（`next` 永远在 `T+8`，`prev`/`data` 只互换），
-  性能差在噪声内；唯一风险是**过度对齐**的 `T`（align ≥ 16）配 `#[repr(C)]` 时
-  `data` 居中会把节点撑大 50%（32→48、64→96）。`repr(Rust)` 下编译器自己会避免这个。
+- The compiler **may reorder fields**. This repository measures it keeping the declaration order
+  `[data][prev][next]` (all three fields are aligned ≤ 8 and no padding is available to save, so
+  the order is stable), hence `data_offset` is 0.
+- **The crate does not rely on this**: offsets always come from `offset_of!`. Moving `data` into
+  the middle makes `data_offset` 8, and all 20 tests still pass unchanged (the iterator goes
+  through `Layout`).
+- Both orders measured: the cache-line sets are **identical step by step** (`next` is always at
+  `T+8`, `prev`/`data` merely swap) and the performance difference is inside the noise. The only
+  risk is an **over-aligned** `T` (align ≥ 16) with `#[repr(C)]`, where centering `data` grows the
+  node by 50% (32→48, 64→96); under `repr(Rust)` the compiler avoids this itself.
 
 ---
 
-## 3. 全套结果
+## 3. Full results
 
-> **2026-09-29：索引宽度做成参数并设为默认 `u32`**（§4 第 5 条）：每槽 16 B、`append` −37%。
-> **2026-09-30：默认改成 `usize`**（`DefaultIx`；`u32-index` feature 可切回上一条那套口径）。
-> 下面各表已按新默认重测（1M 元素）；`iteration` 与 `churn` 的变化最明显，
-> 其余在 ±5% 噪声内。`§3.2` 的"三层拆解"与 `§3.6` 的带宽对账仍是 `usize` 时代量级。
+> Default index width `usize` (24 B/slot); the `u32-index` feature switches to `u32` (16 B/slot).
+> The tables below were measured at 1M elements; `iteration` and `churn` are the most sensitive to
+> the width and the rest stay within ±5% noise. The three-layer breakdown in §3.2 and the byte
+> accounting in §3.6 are `usize`-era magnitudes.
 
-### 3.1 端操作 `end_ops`（1M 次 push + 1M 次 pop）
+### 3.1 End operations `end_ops` (1M pushes + 1M pops)
 
-同一份 `push_back`/`pop_front` 与 `push_front`/`pop_back` 流程，五种实现：
+The same `push_back`/`pop_front` and `push_front`/`pop_back` flows across five implementations:
 
-| 形态（1M 次 push + 1M 次 pop，不预分配） | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
+| Shape (1M pushes + 1M pops, no preallocation) | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
 |---|---|---|---|---|---|
 | `push_back` + `pop_front` | 6.08 ms | 6.44 ms | 6.13 ms | 2.53 ms | 5.79 ms |
 | `push_front` + `pop_back` | 7.49 ms | 6.24 ms | 5.64 ms | 2.10 ms | 5.99 ms |
 
-这一组**不预分配**，量的是"边扩边搬 + 每页首次触碰"：每槽 16 B（`VecDeque` 是 8 B）⇒ 页数
-与拷贝量都是 3×，`VecDeque` 那 2.1~2.5 ms 的优势主要来自这里，不是代码快。组内布局差异
-（最大 ±23%）落在本组噪声底（±10~20%）内，别硬读。
+This group does **not** preallocate, so it measures "grow-and-copy plus the first touch of every
+page": 16 B/slot (against `VecDeque`'s 8 B) ⇒ three times the pages and the bytes copied, and that
+is where `VecDeque`'s 2.1–2.5 ms advantage mostly comes from, not from faster code. Layout
+differences within the group (at most ±23%) sit inside the group's ±10–20% noise floor — do not
+over-read them.
 
-### 3.2 迭代 `iteration` / `blob_iter`
+### 3.2 Iteration `iteration` / `blob_iter`
 
-| 形态 | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList | Vec |
+| Shape | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList | Vec |
 |---|---|---|---|---|---|---|
-| `iteration`（1M × 8 B，全量迭代） | 1.21 ms | **1.10 ms** | **1.32 ms** | 310.4 µs | 1.05 ms | 80.7 µs |
-| `blob_iter`（250k × 64 B） | 378.8 µs | 473.0 µs | 562.7 µs | 240.6 µs | 660.4 µs | 240.9 µs |
+| `iteration` (1M × 8 B, full traversal) | 1.21 ms | **1.10 ms** | **1.32 ms** | 310.4 µs | 1.05 ms | 80.7 µs |
+| `blob_iter` (250k × 64 B) | 378.8 µs | 473.0 µs | 562.7 µs | 240.6 µs | 660.4 µs | 240.9 µs |
 
-把迭代拆成三层（内部探针，min/9 轮，ns/元素）：
+Splitting iteration into three layers (internal probe, min of 9 rounds, ns/element):
 
-| 布局 | 公开 `iter()` | 自己沿链走 | 顺序扫槽位（不碰链） |
+| Layout | public `iter()` | walking the chain by hand | sequential slot scan (no chain) |
 |---|---|---|---|
 | SplitList | 1.08 | 1.14 | **0.062** |
 | PackedLinksList | 1.31 | 1.37 | **0.063** |
 | NodesList | 1.29 | 1.34 | **0.478** |
-| `Vec` 顺序扫（对照） | — | — | 0.062 |
+| `Vec` sequential scan (reference) | — | — | 0.062 |
 
-- **迭代器实现本身没有浪费**：`iter()` 只比"自己沿链走"慢 ~5%（双层判断 + 计数）。
-- **顺序扫槽位：Split/PackedLinks 与 `Vec` 同速**；**Nodes 退化 7.7×**（节点交错后每 24 B 只用
-  8 B）。但公开 API 没有"按槽位顺序扫全体"的操作 ⇒ 那只是上限，不是任何调用的成本。
-- **真正贵的是"沿链走"**：~1.1 ns/元素 = "读 `next` → 去那个槽位"这次**依赖加载的
-  延迟**（~4 周期/元素），不是带宽。这是链表结构的固有下限，三条改进路线都试过（§4）。
-- **载荷大时反超 `LinkedList`**：`blob_iter` 378.8 µs vs 660.4 µs（快 1.74×）——它的节点
-  是独立分配 ⇒ 每取一个 64 B 元素都要追一次指针、还可能缺页；我们 80 B 的槽位是连续的，
-  硬件预取能一路走。
-- 数字依赖**链的局部性**（这里是 `push_back` 构造 ⇒ 链就是 0,1,2,… 递增，硬件预取猜
-  得中）；`random_remove_insert` 之后链会碎，`iter()` 落到"每步一次 miss"的量级。
+- **The iterator itself wastes nothing**: `iter()` is only ~5% slower than walking the chain by
+  hand (a two-level check plus a counter).
+- **Sequential slot scan: Split/PackedLinks match `Vec`**; **`Nodes` degrades 7.7×** (interleaved
+  nodes use only 8 of every 24 B). But no public API scans all slots in slot order ⇒ that is only a
+  ceiling, not the cost of any call.
+- **The expensive part is walking the chain**: ~1.1 ns/element is the **dependent-load latency** of
+  "read `next` → go to that slot" (~4 cycles/element), not bandwidth. This is the inherent floor of
+  a linked structure, and three improvement routes were tried (§4).
+- **With a large payload it beats `LinkedList`**: `blob_iter` 378.8 µs vs 660.4 µs (1.74× faster) —
+  `LinkedList` allocates each node separately, so every 64 B element costs a pointer chase and
+  possibly a page fault, while our contiguous 80 B slots let the hardware prefetcher run.
+- The numbers depend on **chain locality** (this chain is built with `push_back`, so it is
+  0,1,2,… ascending and the prefetcher guesses right); after `random_remove_insert` the chain is
+  fragmented and `iter()` drops to roughly one miss per step.
 
-### 3.3 定位与中间插删 `middle_access` / `middle_insert_remove`
+### 3.3 Locating and middle insert/remove `middle_access` / `middle_insert_remove`
 
-| 形态 | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
+| Shape | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
 |---|---|---|---|---|---|
-| `middle_access`（100 次定位到 N/2） | 54.02 ms | 55.61 ms | 66.96 ms | 56.8 ns | 59.77 ms |
-| `middle_insert_remove`（1000 次插入+删除） | 546.9 µs | 569.0 µs | 670.4 µs | 82.46 ms | 495.8 µs |
+| `middle_access` (100 locates at N/2) | 54.02 ms | 55.61 ms | 66.96 ms | 56.8 ns | 59.77 ms |
+| `middle_insert_remove` (1000 inserts + removes) | 546.9 µs | 569.0 µs | 670.4 µs | 82.46 ms | 495.8 µs |
 
-`at(pos)` 走 `O(min(pos, len-1-pos))` 步，所以 `middle_access` 的每一"次"其实是在 1M
-元素的链上走 50 万步 ≈ 0.5 ms —— 换算成每步约 1 ns，和 §3.2 的"沿链走"完全一致。
-`VecDeque` 那 56 ns 是 O(1) 索引，两者不是同一个数量级的操作，列出来只为标明差距。
+`at(pos)` walks `O(min(pos, len-1-pos))` steps, so each "call" in `middle_access` actually walks
+500k steps over a 1M-element chain ≈ 0.5 ms — about 1 ns per step, exactly matching the chain-walk
+cost in §3.2. `VecDeque`'s 56 ns is an O(1) index; the two are not operations of the same order, and
+the column is there only to mark the gap.
 
-`middle_insert_remove` = 在链中间"插入 + 移一步 + 删除"1000 次，**三种布局与 `VecDeque`
-同量级**：这条路径的瓶颈不在链，而在**分配/释放槽位**（free-list 弹出/压入的随机访存），
-所以布局差异（各槽数组的位置）几乎看不出来。
+`middle_insert_remove` = insert + step + remove 1000 times in the middle of the chain, and **all
+three layouts are on `VecDeque`'s scale**: the bottleneck here is not the chain but **allocating and
+freeing slots** (random accesses popping/pushing the free list), so the layout difference — where
+each per-slot array sits — is nearly invisible.
 
-### 3.4 稳态与扰动 `churn` / `random_remove_insert` / `cursor_update`
+### 3.4 Steady state and perturbation `churn` / `random_remove_insert` / `cursor_update`
 
-| 形态 | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
+| Shape | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
 |---|---|---|---|---|---|
-| `churn`（1M 次 pop_front+push_back） | 2.75 ms | 3.00 ms | 2.72 ms | 1.68 ms | 6.15 ms |
-| `random_remove_insert`（100 次随机位置删+插） | 28.55 ms | 32.44 ms | 37.52 ms | 4.60 ms | 32.18 ms |
-| `cursor_update`（链中点原地读写 1M 次） | 1.19 ms | 1.26 ms | 1.34 ms | 672.2 µs | 2.45 ms |
+| `churn` (1M × pop_front+push_back) | 2.75 ms | 3.00 ms | 2.72 ms | 1.68 ms | 6.15 ms |
+| `random_remove_insert` (100 random-position removes + inserts) | 28.55 ms | 32.44 ms | 37.52 ms | 4.60 ms | 32.18 ms |
+| `cursor_update` (1M in-place read/writes at the chain midpoint) | 1.19 ms | 1.26 ms | 1.34 ms | 672.2 µs | 2.45 ms |
 
-- `churn` **完全不分配**（列表预先建好、槽位循环复用），所以它量的是**纯代码**：我们每次
-  `pop_front`+`push_back` 要改 ~4~8 个链接字段（两个邻居 + free-list），`VecDeque` 只改两个
-  下标 ⇒ 1.63× 的差距全在这里；而 `LinkedList` 每个节点都要 `malloc`/`free` ⇒ 我们快 2.3×，
-  **这就是"连续槽位 + free-list"最直接的收益**。
-- `random_remove_insert` 把链打碎、位置随机 ⇒ 三种布局都落到 28~38 ms（`Split` 最好），
-  `VecDeque` 只 4.6 ms——因为它在中间删插只是 memmove，而我们要走链（`at(pos)` 是 O(N)）。
-- `cursor_update` 在链中点原地读写：`Nodes` 最慢（1.34 ms，节点交错 ⇒ 每次读 `data` 都多跨
-  内存），`LinkedList` 2.45 ms（每步追一次指针）。
+- `churn` **allocates nothing at all** (the list is built up front and slots cycle), so it measures
+  **pure code**: each `pop_front`+`push_back` touches ~4–8 link fields (two neighbours plus the
+  free list) while `VecDeque` touches only two indices ⇒ the whole 1.63× gap is here; and since
+  `LinkedList` `malloc`s/`free`s every node, we are 2.3× faster — **the most direct payoff of
+  "contiguous slots + free list"**.
+- `random_remove_insert` fragments the chain and randomizes positions ⇒ all three layouts land at
+  28–38 ms (`Split` best) while `VecDeque` needs only 4.6 ms — middle insert/remove is a memmove for
+  it, whereas we must walk the chain (`at(pos)` is O(N)).
+- `cursor_update` reads and writes a point in the middle of the chain in place: `Nodes` is slowest
+  (1.34 ms, interleaved nodes force an extra hop to reach `data` each time), `LinkedList` 2.45 ms
+  (one pointer chase per step).
 
-### 3.5 大载荷 `blob_end_ops`（`Blob64`，64 B/元素，250k）
+### 3.5 Large payload `blob_end_ops` (`Blob64`, 64 B/element, 250k)
 
-| 形态 | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
+| Shape | SplitList | PackedLinksList | NodesList | VecDeque | LinkedList |
 |---|---|---|---|---|---|
-| `blob_end_ops`（250k × 64 B push + pop） | 4.40 ms | 3.99 ms | 4.22 ms | 3.24 ms | 4.59 ms |
+| `blob_end_ops` (250k × 64 B push + pop) | 4.40 ms | 3.99 ms | 4.22 ms | 3.24 ms | 4.59 ms |
 
-载荷大了链接开销被摊薄：`VecDeque` 只领先 1.36×（8 B 时是 2.4~3.0×），而且**我们比
-`LinkedList` 快**（4.2 vs 4.6 ms）——它的每个 64 B 节点都是独立分配。
+With a large payload the link overhead amortizes: `VecDeque` leads by only 1.36× (vs 2.4–3.0× at
+8 B), and **we beat `LinkedList`** (4.2 vs 4.6 ms), whose every 64 B node is a separate allocation.
 
-每槽 80 B（64 载荷 + 16 链接）⇒ 载荷占 80%。这是"我们的链接开销在载荷大时被摊薄"的
-典型场景：8 B 元素时 24 B/槽是载荷的 3 倍，64 B 时只多 25%。
+80 B/slot (64 B payload + 16 B links) ⇒ the payload is 80% of it. This is the archetypal "our link
+overhead amortizes with a large payload" case: at 8 B elements, 24 B/slot is 3× the payload; at
+64 B it is only 25% more.
 
-### 3.6 `append`：两个 API（本库与 std 语义不同的地方）
+### 3.6 `append`: two APIs (where this crate differs from std's semantics)
 
-两个 API 的**计费单位**不同，选哪个看形态：
+The two APIs **bill different units**; pick by shape:
 
-- `append`（对齐 `LinkedList::append`）：整块搬对方**全部槽位**（下标一边搬一边加偏移），
-  按 **对方槽位数 + 自己存储规模** 付账，与对方活元素数无关。
-- `append_elementwise`（本库扩展）：逐元素搬，优先填自己**已有的空闲槽**，按 **活元素数**
-  付账。
+- `append` (mirrors `LinkedList::append`): moves **all of the other list's slots** as one block
+  (adding the offset to indices as it goes). It bills **the other list's slot count + your own
+  storage size**, independent of the other side's live element count.
+- `append_elementwise` (this crate's extension): moves element by element, preferring to fill your
+  **existing free slots**. It bills **the live element count**.
 
-`LinkedList::append` 是 O(1) 指针拼接（实测 144 ns，与载荷无关）；我们为了迭代局部性
-（槽位连续）放弃了这一点，**这是设计选择**。
+`LinkedList::append` is an O(1) pointer splice (measured 144 ns, independent of payload); we gave
+that up for iteration locality (contiguous slots) — **a deliberate design choice**.
 
-| 形态 | SplitList | PackedLinksList | NodesList | VecDeque | Vec | LinkedList |
+| Shape | SplitList | PackedLinksList | NodesList | VecDeque | Vec | LinkedList |
 |---|---|---|---|---|---|---|
-| `append`（1M ⊕ 1M，两边都要扩容） | 4.53 ms | 4.01 ms | 3.88 ms | 1.37 ms | 1.15 ms | 172.1 ns |
-| `append_blob`（250k ⊕ 250k，64 B 元素） | 3.24 ms | 3.24 ms | 2.93 ms | 2.19 ms | 2.06 ms | 178.9 ns |
-| 同上，`::elementwise`（目标预先留 250k 空闲槽） | 1.76 ms | 1.90 ms | 1.75 ms | — | — | — |
+| `append` (1M ⊕ 1M, both sides must grow) | 4.53 ms | 4.01 ms | 3.88 ms | 1.37 ms | 1.15 ms | 172.1 ns |
+| `append_blob` (250k ⊕ 250k, 64 B elements) | 3.24 ms | 3.24 ms | 2.93 ms | 2.19 ms | 2.06 ms | 178.9 ns |
+| same, `::elementwise` (target has 250k free slots up front) | 1.76 ms | 1.90 ms | 1.75 ms | — | — | — |
 
-**整块 `append` 比 `Vec::append` 慢 2.6 倍？字节对账（mimalloc，1M⊕1M）：**
+**Is a block `append` 2.6× slower than `Vec::append`? Byte accounting (mimalloc, 1M⊕1M):**
 
-| 形态 | 时间 | 实搬字节 | 有效带宽 |
+| Shape | Time | Bytes actually moved | Effective bandwidth |
 |---|---|---|---|
-| `SplitList::append`（3×usize，需扩容） | 3.84 ms | ~96 MB | 25.0 GB/s |
-| `Vec<usize>::append`（需扩容） | 1.45 ms | ~32 MB | 22.1 GB/s |
-| 裸 Vec×(usize, u32, u32)（需扩容） | 2.82 ms | ~64 MB | 22.7 GB/s |
-| 裸 Vec×3 usize（目标预置容量，不扩容） | 1.93 ms | ~48 MB | 24.8 GB/s |
-| `Vec<usize>`（目标预置容量，不扩容） | 0.60 ms | ~16 MB | 26.6 GB/s |
-| 热目标 8 MB `extend_from_slice` | 0.58 ms | ~16 MB | 27.4 GB/s |
-| 热目标 8 MB `extend(map(\|i\| i + base))` | 0.52 ms | ~16 MB | 30.9 GB/s |
+| `SplitList::append` (3×usize, must grow) | 3.84 ms | ~96 MB | 25.0 GB/s |
+| `Vec<usize>::append` (must grow) | 1.45 ms | ~32 MB | 22.1 GB/s |
+| bare Vec×(usize, u32, u32) (must grow) | 2.82 ms | ~64 MB | 22.7 GB/s |
+| bare Vec×3 usize (target capacity up front, no growth) | 1.93 ms | ~48 MB | 24.8 GB/s |
+| `Vec<usize>` (target capacity up front, no growth) | 0.60 ms | ~16 MB | 26.6 GB/s |
+| hot target 8 MB `extend_from_slice` | 0.58 ms | ~16 MB | 27.4 GB/s |
+| hot target 8 MB `extend(map(\|i\| i + base))` | 0.52 ms | ~16 MB | 30.9 GB/s |
 
-- **下标改写免费**：`extend(map(|i| i + base))` 与 `extend_from_slice` 同速（甚至更快，
-  省掉 memcpy 库调用）⇒ 加偏移不是开销来源。
-- 差距全是**搬的字节数**：每槽 16 B（data+prev+next，`u32` 索引）对 `Vec` 的 8 B；两边都因扩容把
-  每个字节搬两遍（`realloc` 搬旧数据 + 追加拷贝）= 4× 载荷。所有测点落在同一带宽区间
-  （21~31 GB/s），我们 per-byte 甚至略好。
-- 想追平只有两条（都实测）：索引降到 u32（**曾设为默认，现由 `u32-index` feature 提供**）⇒ 16 B/槽、**−37%**；目标预置容量不扩容
-  ⇒ **−57%**（后者要求分配器保持页热）。
+- **Index rewriting is free**: `extend(map(|i| i + base))` runs at the same speed as
+  `extend_from_slice` (even faster, as it skips the memcpy library call) ⇒ adding the offset is not
+  a source of cost.
+- The whole gap is **the number of bytes moved**: 16 B/slot (data+prev+next, `u32` index) against
+  `Vec`'s 8 B, and both sides move every byte twice because of growth (`realloc` moves the old data,
+  then the append copies it) = 4× the payload. Every measurement lands in the same bandwidth band
+  (21–31 GB/s), and our per-byte figure is even slightly better.
+- Only two ways to close it (both measured): drop the index to `u32` (**supplied by the
+  `u32-index` feature**) ⇒ 16 B/slot, **−37%**; preallocate the target so it never grows ⇒ **−57%**
+  (the latter requires the allocator to keep pages hot).
 
-**整块搬的代价几乎全在"目标要不要新页"**（同一形态，只换环境）：
+**The cost of a block move is almost entirely "does the target need fresh pages"** (same shape, only
+the environment changes):
 
-| 环境 | SplitList | PackedLinksList | NodesList | 计时区缺页 |
+| Environment | SplitList | PackedLinksList | NodesList | Page faults in the timing region |
 |---|---|---|---|---|
-| mimalloc（`--features mimalloc`） | 3.7 ~ 4.3 ms | 3.6 ~ 4.0 ms | 3.4 ~ 3.7 ms | 0 |
-| 系统 malloc（不留 `mimalloc` feature） | 8.2 ms | 17.0 ms | 11.3 ms | 4095 / 8095 / 12003 |
-| 系统 malloc + `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | 2.8 ms | 4.2 ms | 2.4 ms | 8 / 17 / 24 |
-| 对照：`mmap` 24 MB、每页只写 1 字节、**不做拷贝** | 8.2 ~ 9.4 ms | — | — | 5860 |
+| mimalloc (`--features mimalloc`) | 3.7 ~ 4.3 ms | 3.6 ~ 4.0 ms | 3.4 ~ 3.7 ms | 0 |
+| system malloc (no `mimalloc` feature) | 8.2 ms | 17.0 ms | 11.3 ms | 4095 / 8095 / 12003 |
+| system malloc + `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | 2.8 ms | 4.2 ms | 2.4 ms | 8 / 17 / 24 |
+| reference: `mmap` 24 MB, write 1 byte per page, **no copying** | 8.2 ~ 9.4 ms | — | — | 5860 |
 
-⇒ 这条路的成本按**页**计费（本机每页首次触碰 ~1.2 µs）。想读"算法本身多快"看 mimalloc
-那行（0 缺页）；比较版本时**必须同时看缺页数**。
+⇒ this path bills **per page** (~1.2 µs for the first touch of a page on this machine). For "how
+fast is the algorithm itself", read the mimalloc row (0 page faults); when comparing versions
+**always look at the page-fault count as well**.
 
-**大载荷（`Blob64`，250k）**：
+**Large payload (`Blob64`, 250k):**
 
-| 形态 | 时间 | 实搬 | 带宽 |
+| Shape | Time | Moved | Bandwidth |
 |---|---|---|---|
 | SplitList | 2.87 ~ 3.20 ms | ~80 MB | 25.0 GB/s |
 | PackedLinksList | 2.86 ~ 2.94 ms | ~80 MB | 28.0 GB/s |
 | NodesList | 2.80 ~ 2.92 ms | ~80 MB | 28.6 GB/s |
 | VecDeque | 2.22 ms | ~64 MB | 28.8 GB/s |
-| `Vec`（基线） | 1.98 ~ 2.40 ms | ~64 MB | 26.7 GB/s |
-| `LinkedList`（O(1) 指针拼接） | 144 ns | 0 | — |
-| 对照：裸 3 数组预置容量（不扩容） | 1.17 ms | ~40 MB | 34.2 GB/s |
+| `Vec` (baseline) | 1.98 ~ 2.40 ms | ~64 MB | 26.7 GB/s |
+| `LinkedList` (O(1) pointer splice) | 144 ns | 0 | — |
+| reference: three bare arrays with capacity up front (no growth) | 1.17 ms | ~40 MB | 34.2 GB/s |
 
-载荷大了差距变小（8 B 时比 `Vec` 慢 2.6×，64 B 时只慢 ~1.2~1.35×：每槽多出的 16 B 在
-大载荷下只占 20%）；布局差异这时才看得见但依旧很小（Nodes ≈ PackedLinks ≲ Split，5~12%）。
+The gap shrinks with a large payload (2.6× slower than `Vec` at 8 B, only ~1.2–1.35× at 64 B: the
+extra 16 B/slot is just 20% there); the layout difference only becomes visible now, and is still
+small (`Nodes` ≈ `PackedLinks` ≲ `Split`, 5–12%).
 
-**同一目标形态下两个 API 的对照**（目标预先留 250k 空闲槽；mimalloc，每槽 80 B）：
+**Both APIs on the same target shape** (target has 250k free slots up front; mimalloc, 80 B/slot):
 
-| 形态 | `append_elementwise` | `append` |
+| Shape | `append_elementwise` | `append` |
 |---|---|---|
-| 目标有 250k 空闲槽 + 源 250k 密 | **1.78 ms** | 3.83 ms |
-| 目标有 250k 空闲槽 + 源稀疏（250k 槽 / 100 活） | **0.001 ms** | 3.59 ms |
-| 目标 0 空闲槽 + 源 250k 密 | 3.07 ms | **2.85 ms** |
-| 目标 0 空闲槽 + 源稀疏 | **0.001 ms** | 2.40 ms |
+| target has 250k free slots + source 250k dense | **1.78 ms** | 3.83 ms |
+| target has 250k free slots + source sparse (250k slots / 100 live) | **0.001 ms** | 3.59 ms |
+| target 0 free slots + source 250k dense | 3.07 ms | **2.85 ms** |
+| target 0 free slots + source sparse | **0.001 ms** | 2.40 ms |
 
-逐元素成本随载荷近似线性：**≈ 2 ns + 0.08 ns × 载荷字节 / 元素**（每个元素都要"出源、
-进目标"搬两次，不是流式带宽）：实测 8 B 2.1 ns、64 B 6.9 ns、256 B 22.4 ns；整块则只按
-字节走带宽（21~28 GB/s），与元素个数无关。所以"目标装不下"那一格载荷越大两条路越接近。
+The per-element cost is approximately linear in the payload: **≈ 2 ns + 0.08 ns × payload bytes per
+element** (every element is moved twice, out of the source and into the target, so this is not
+streaming bandwidth): measured 2.1 ns at 8 B, 6.9 ns at 64 B, 22.4 ns at 256 B. A block move, by
+contrast, just runs at bandwidth over bytes (21–28 GB/s) regardless of the element count. So in the
+"target cannot hold it" cell the two paths converge as the payload grows.
 
-**两个 API × 输入形态（目标固定 1M 活元素，N = 1M，min/3 轮，分配器已预热）**：
+**Both APIs × input shapes (target fixed at 1M live elements, N = 1M, min of 3 rounds, allocator
+warmed up)**:
 
-| 目标空闲槽 \ 源 | 密 1M | 稀疏 1M 槽 / 100 活 | 密 100 |
+| Target free slots \ Source | dense 1M | sparse 1M slots / 100 live | dense 100 |
 |---|---|---|---|
-| 0 | 逐元素 4.9 / **整块 3.5** → 用 `append` | 逐元素 **0.001** / 整块 3.4 → **必须用 `append_elementwise`** | ~0 / ~0 |
-| 1 000 | 逐元素 4.7 / **整块 3.5** → `append` | **逐元素 0.001** / 整块 4.1 | ~0 / ~0 |
-| 1M | **逐元素 2.1** / 整块 4.9 | **逐元素 0.001** / 整块 4.4 | ~0 / ~0 |
+| 0 | element-wise 4.9 / **block 3.5** → use `append` | element-wise **0.001** / block 3.4 → **`append_elementwise` is mandatory** | ~0 / ~0 |
+| 1 000 | element-wise 4.7 / **block 3.5** → `append` | **element-wise 0.001** / block 4.1 | ~0 / ~0 |
+| 1M | **element-wise 2.1** / block 4.9 | **element-wise 0.001** / block 4.4 | ~0 / ~0 |
 
 
-### 3.7 句柄入口 vs 位置入口（`slot_entry` 组）
+### 3.7 Handle entry vs position entry (`slot_entry` group)
 
-**同一份工作，只有"怎么找到元素"不同**：100 次"随机位置删一个、原地插回去"
-（`cursor_at(handle)` + `remove_current` + `insert_before` vs `at(pos)` + 同样两步）：
+**The same work, differing only in how the element is found**: 100 × "remove at a random position,
+insert back in place" (`cursor_at(handle)` + `remove_current` + `insert_before` vs `at(pos)` + the
+same two steps):
 
-| 入口 | SplitList | PackedLinksList | NodesList |
+| Entry | SplitList | PackedLinksList | NodesList |
 |---|---|---|---|
-| 按句柄 `cursor_at`（`O(1)`） | **0.8 µs** | **0.6 µs** | **0.6 µs** |
-| 按位置 `at(pos)`（走链 `O(min(pos, len-1-pos))`） | 31.7 ms | 34.9 ms | 39.4 ms |
+| by handle `cursor_at` (`O(1)`) | **0.8 µs** | **0.6 µs** | **0.6 µs** |
+| by position `at(pos)` (walks the chain `O(min(pos, len-1-pos))`) | 31.7 ms | 34.9 ms | 39.4 ms |
 
-（单位是 100 次操作的总时间；换成每次：**~8 ns vs ~317~394 µs**，差约 **4 万倍**。）
-按句柄那一列是"100 个受害槽位在缓存里"的稳态（LRU 里常见）；即便受害槽位是冷的，
-也只是多几次 miss（几百 ns），结论不变。
+(Units are totals for 100 operations; per operation: **~8 ns vs ~317–394 µs**, a gap of about
+**40,000×**.) The by-handle column is the steady state where the 100 victim slots sit in cache (the
+common case in an LRU); even with cold victim slots it is only a few extra misses (hundreds of ns),
+so the conclusion is unchanged.
 
 ---
 
-## 4. 已试过并否掉的优化（都有实测数字，别再走一遍）
+## 4. Optimizations tried and rejected (all with measured numbers — don't retry them)
 
-| # | 方案 | 收益 | 代价 / 为什么否 |
+| # | Approach | Gain | Cost / why rejected |
 |---|---|---|---|
-| 1 | 分块（分组）布局 + 块内**仍每槽显式链接** | **−55%（更慢）** | 那次依赖加载还在，还多了下标算术 |
-| 2 | 分块 + 块内顺序**由位置隐含**（= unrolled linked list） | 迭代 **8~13×**（实测 0.084~0.136 vs 1.10 ns/元素） | 插删要搬块内元素 ⇒ **下标不再稳定**；而且**不需要自己写**——见 §4 末 |
-| 3 | 维护顺行位图（每槽 1 bit：`next(i)==i+1`） | 迭代 **2.5×** | 每次链写入 +1 store ⇒ `churn` **2.80 → 5.66 ms（慢一倍）** |
-| 4 | 迭代器侧探路（段用尽时并行读 8 个 `next` 候选） | 独立探针 1.6× | crate 内实测 **2.40 vs 1.09 ns/元素（慢一倍）**，原因未定位 ⇒ 不发货 |
-| 5 | 索引降到 u32 | **已实现**（`Ix` 参数；2026-09-29 曾设为默认，2026-09-30 起默认改回 `usize`、由 `u32-index` feature 提供）：`append` **−37%**（T=8，3.07 vs 4.86 ms）、内存 24→**16 B/槽**；`churn`/`iteration`/`middle_access` 持平（±1%） | 槽位上限 2.1G（`u32` 的最高位留给空闲标记）；踩过一个坑：`grow` 里的触顶 `assert!` 带 `{}` 参数会把格式化机器拖进去 ⇒ 内联器放弃内联 `alloc_slot` ⇒ **churn +47%**（循环里出现 `call`），改用 `#[cold]` helper 后归零 |
-| 6 | `append` 前先 `reserve` | 无可测收益 | std 的 `Vec::append` 内部本来就先 reserve；`reserve_exact` 反而更贵（实测 3.9→7.5 ms） |
-| 7 | `Nodes` 字段次序（`data` 居中/前置） | 噪声内 | 见 §2：cache line 集合相同 |
-| 8 | 库内 `madvise(MADV_HUGEPAGE)` | 好时 8.2 → 1.1~1.4 ms | 本机 THP `madvise` 模式 + `nr_hugepages=0`，复测不稳定（5860 缺页）⇒ 只能靠环境变量 |
-| 9 | `clear` 改成**按内存顺序扫 `data`**、用 `is_free` 判断（不追链） | 满表（无 Drop glue）**7.1×**（1.08 → 0.15 ms） | **稀疏（1M 槽位、1000 live）1.1 µs → 0.11 ms，慢 100×**（带 64 B glue 的稀疏 `Nodes`：2 µs → 2.7 ms）；满表 + glue 只打平（0.95~1.11×）；打平点随宽度/布局动（`u32` 0.25~0.50、`usize` 索引 0.50~0.75）⇒ **采用混合：`2 * len >= slots` 时走扫描**（阈值 0.5 = 六种组合打平点的上界，任何组合都不会挑到更慢的路；代价是 `u32` 下 0.25~0.5 那段 2~4× 收益不要了）。证据：`src/tests.rs::probe_clear_vs_scan` |
-| 10 | 标记空闲改成**只写标志位所在的那一个字节**（省掉读-改-写里的 load） | IR 上确实少一次 load（`--emit llvm-ir`：`store i8 -128` 对 `load i64`+`or`+`store`；RISC 后端从 `ldrb`/`orr`/`strb` 三条降到 `strb` 一条） | 本机 x86-64 实测 `churn` **慢 5.5~7.5%**（Split/PackedLinks，四次测量、对照 `VecDeque` 持平、布局扰动底 ±2%）⇒ 否；换 ISA 需重测。**注意：整函数 diff 显示差异不止那一条指令**——crate 里 `|=` 是 `movabs`（提出循环）+ `or %r9,(mem)`，字节写是 `movb`，另外寄存器分配、栈帧、指令数（133→126）与**循环对齐**（热块入口 `mod 64` 从 0 到 60）都变了 ⇒ 那 7% 不能归给单条指令；片段级汇编不可外推（见 `FREE_BIT` 文档） |
+| 1 | Chunked (grouped) layout with **per-slot explicit links inside the chunk** | **−55% (slower)** | the dependent load is still there, plus extra index arithmetic |
+| 2 | Chunking with in-chunk order **implied by position** (= unrolled linked list) | iteration **8–13×** (measured 0.084–0.136 vs 1.10 ns/element) | insert/remove must move elements within the chunk ⇒ **indices stop being stable**; and you **don't have to write it** — see the end of §4 |
+| 3 | Maintaining an adjacency bitmap (1 bit/slot: `next(i)==i+1`) | iteration **2.5×** | one extra store per link write ⇒ `churn` **2.80 → 5.66 ms (2× slower)** |
+| 4 | Iterator-side lookahead (reading 8 `next` candidates in parallel when a segment runs out) | 1.6× in a standalone probe | measured in-crate at **2.40 vs 1.09 ns/element (2× slower)**, cause not identified ⇒ not shipped |
+| 5 | Dropping the index to `u32` | **Implemented** (the `Ix` parameter; not the default, supplied by the `u32-index` feature): `append` **−37%** (T=8, 3.07 vs 4.86 ms), memory 24 → **16 B/slot**; `churn`/`iteration`/`middle_access` unchanged (±1%) | slot ceiling 2.1G (the top bit of `u32` is reserved for the free bit); one trap: a `{}`-argument ceiling `assert!` in `grow` drags the formatting machinery in, so the inliner gives up on `alloc_slot` ⇒ **churn +47%** (a `call` appears in the loop); moving it into a `#[cold]` helper took that back to zero |
+| 6 | `reserve` before `append` | no measurable gain | std's `Vec::append` already reserves internally; `reserve_exact` is actually more expensive (3.9 → 7.5 ms) |
+| 7 | `Nodes` field order (`data` centred / first) | within noise | see §2: the cache-line sets are the same |
+| 8 | In-crate `madvise(MADV_HUGEPAGE)` | 8.2 → 1.1–1.4 ms at best | on this machine THP is in `madvise` mode with `nr_hugepages=0` and reruns are unstable (5860 page faults) ⇒ environment variable only |
+| 9 | Making `clear` **scan `data` in memory order** and test `is_free` (no chain walk) | full table (no Drop glue) **7.1×** (1.08 → 0.15 ms) | **sparse (1M slots, 1000 live) 1.1 µs → 0.11 ms, 100× slower** (sparse `Nodes` with 64 B glue: 2 µs → 2.7 ms); full table + glue only breaks even (0.95–1.11×); the break-even point moves with width/layout (`u32` 0.25–0.50, `usize` index 0.50–0.75) ⇒ **adopt the hybrid: scan when `2 * len >= slots`** (threshold 0.5 = the upper bound of the break-even point across all six combinations, so no combination picks the slower path; the price is forgoing the 2–4× gain in the `u32` 0.25–0.5 band). Evidence: `src/tests.rs::probe_clear_vs_scan` |
+| 10 | Marking a slot free by **writing only the byte holding the flag** (saving the load in the read-modify-write) | the emitted IR does save one load | on x86-64 `churn` is **5.5–7.5% slower** (Split/PackedLinks, four measurements, `VecDeque` reference flat, layout perturbation floor ±2%) ⇒ rejected; would need re-measuring on another ISA. **Note: the whole-function diff shows more than that one instruction changed** — register allocation, stack frame, instruction count and **loop alignment** all move ⇒ the ~7% cannot be attributed to a single instruction, and snippet-level assembly does not extrapolate (see the `FREE_BIT` documentation) |
 
 ---
 
-### "分块"值不值得自己写：不值得（std 组合就够了）
+### Is chunking worth writing yourself? No (a std combination suffices)
 
-把"分块"直接用 std 拼出来（`LinkedList<Vec<usize>>`，块内加一个头偏移使两端都 O(1)），
-K=64，与我们的 `SplitList` 同机同期对照：
+Assembling "chunking" directly out of std (`LinkedList<Vec<usize>>`, with a head offset inside the
+chunk so both ends stay O(1)), K=64, compared against our `SplitList` on the same machine in the
+same session:
 
-| 指标（1M × `usize`） | 本库 `SplitList` | `LinkedList<Vec<usize>>` K=64 | 倍数 |
+| Metric (1M × `usize`) | this crate's `SplitList` | `LinkedList<Vec<usize>>` K=64 | Ratio |
 |---|---|---|---|
-| 迭代 | 1.08 ns/元素 | **0.112** | 9.6× |
-| `at(N/2)`（走到中间） | 1.08 ns/元素 | **0.013** | 83× |
-| `churn`（`pop_front`+`push_back`） | 2.81 ns/op | **1.70** | 1.65× |
-| `end_ops`（push 1M + pop 1M，不预分配） | 3.04 ns/op | **0.93** | 3.3× |
-| 内存/槽 | 16 B | **~9 B** | 1.8× |
-| 元素级游标 / 稳定槽位身份 | ✓ | ✗ | — |
+| iteration | 1.08 ns/element | **0.112** | 9.6× |
+| `at(N/2)` (walk to the middle) | 1.08 ns/element | **0.013** | 83× |
+| `churn` (`pop_front`+`push_back`) | 2.81 ns/op | **1.70** | 1.65× |
+| `end_ops` (push 1M + pop 1M, no preallocation) | 3.04 ns/op | **0.93** | 3.3× |
+| memory/slot | 16 B | **~9 B** | 1.8× |
+| element-level cursor / stable slot identity | ✓ | ✗ | — |
 
-- "分块"就是 **unrolled linked list ≈ `LinkedList<Vec<T>>` 这一类**（块内连续 + 块间链）。
-  迭代那 8~13× 不是某种自有设计的功劳，std 组合同样拿得到；`VecDeque` 当块反而更差
-  （K=64 时迭代 0.303 vs `Vec` 块 0.094——deque 的内容可能跨环回卷，迭代器流不起来）。
-- 而且它在上面四项上**全面赢本库**：块内是裸数组（一次 `Vec::push` / `head += 1`），我们每次
-  端操作要改 4~8 个链接字段（两个邻居 + free-list 的 push/pop），内存还高 1.8 倍（16 vs ~9 B/槽）
-  ⇒ 端到端输在**每槽字节数**，`churn` 输在**每操作字段数**。
-- 本库剩下的差异只有三条，全在**语义**而不是吞吐上：
-  ① **元素级游标**（`at(pos)` / `insert_before` / `insert_after` / 幽灵位置 / 环形移动）；
-  ② **稳定的槽位身份**（"下标即指针"——分块恰恰要丢掉它）；
-  ③ **热身后零分配**（一整块 slab：`churn` 一个字节都不申请；链块每 K 个元素要 `malloc`/`free`
-  一次块，本机实测每次 ~2 ns 摊销）。
-- ⇒ 要"分块的性能"就别把它塞进本库：用 `LinkedList<Vec<T>>`，或者把块当元素放进本库
-  （`List<Vec<T>, Split<Vec<T>>>`——块下标仍然稳定、块内连续、两端 O(1)）。
+- "Chunking" is exactly **the unrolled-linked-list family ≈ `LinkedList<Vec<T>>`** (contiguous
+  within a chunk, chained between chunks). That 8–13× on iteration is not the credit of some
+  home-grown design — the std combination gets the same; using `VecDeque` as the chunk is actually
+  worse (K=64: iteration 0.303 vs 0.094 for `Vec` chunks — a deque's contents can wrap around the
+  ring, so the iterator cannot stream).
+- And it **beats this crate on all four items above**: inside a chunk it is a bare array (one
+  `Vec::push` / `head += 1`), while every end operation here touches 4–8 link fields (two neighbours
+  plus the free-list push/pop) and memory is 1.8× higher (16 vs ~9 B/slot) ⇒ end-to-end we lose on
+  **bytes per slot** and `churn` loses on **fields per operation**.
+- What still differs here is only three things, all in **semantics** rather than throughput:
+  ① **element-level cursors** (`at(pos)` / `insert_before` / `insert_after` / ghost position /
+  circular movement); ② **stable slot identity** ("the index is the pointer" — which chunking
+  precisely discards); ③ **zero allocation once warm** (one whole slab: `churn` allocates not a
+  single byte; a chunked list `malloc`s/`free`s one block every K elements, ~2 ns amortized per
+  element as measured here).
+- ⇒ To get "chunked performance", don't stuff it into this crate: use `LinkedList<Vec<T>>`, or put
+  chunks into this crate as elements (`List<Vec<T>, Split<Vec<T>>>` — chunk indices stay stable,
+  within-chunk storage is contiguous, both ends O(1)).
 
-## 5. 内部探针（解释机制，不是公开 API 的调用成本）
+## 5. Internal probes (explaining mechanisms, not the cost of public API calls)
 
-| 项目 | 数字 | 出处 |
+| Item | Numbers | Source |
 |---|---|---|
-| `clear` vs "一直 `pop` 到空" | 8 B **1.2×**、64 B **2.9×**、512 B **24.5×**（带 Drop glue 时 64 B 只剩 1.6×） | `List::clear` 文档 |
-| `clear`：追链表 vs 扫描槽位（1M 槽位、`u32` 索引） | 满表 1.08 → **0.15 ms（扫描快 7.1×）**、打平点 0.25；稀疏（1000 live）**1.1 µs → 0.11 ms（慢 100×）**；满表 + Drop glue 平手（2.45 vs 2.57） ⇒ **混合：`2 * len >= slots` 走扫描（阈值 0.5）** | `List::clear` 文档 + `src/tests.rs::probe_clear_vs_scan` |
-| 扫描版的阈值（按布局/宽度） | 打平点：`u32` 下 `Split` 0.25 / `PackedLinks` 0.25 / `Nodes` 0.50；`usize` 索引下三种布局 0.50（≥1.5× 要到 0.75）。**混合阈值取 0.5**：该档六种组合实测 0.99~1.43×（最坏打平，没有组合会明显变慢） | 同上 |
-| 扫描版的**满表收益** | 安静机器：`u32` 3.4~7.1×、`usize` 1.9~2.3×；有环境负载时：1.65~2.96× ——扫描是带宽受限的（见 §1），追链那列稳定 ⇒ **报比值必须在同一次运行内取** | 同上 |
-| 同上、`u64` 索引（与旧记录对账） | 满表 1.08 → 0.58 ms（快 1.9×）、稀疏 1.0 µs → 0.43 ms（慢 430×）；旧记录"2.2× / 327×"就是这一代的数字 ⇒ 标志位那遍由 8 B 降到 4 B 是把阈值从 0.50 降到 0.25 的原因 | 同上 |
-| `Drop`：只走 live 链就地析构 vs 经 `clear`（1M、`u32`） | `usize` 1.098 ms → **1.9 µs**（析构链被消掉）；带 64 B glue **`Split` 2.498 → 1.889 ms（1.32×）**、`PackedLinks` 2.888 → 2.062（1.40×）、`Nodes` 3.569 → 2.069（1.72×）；"只析构"那列还含释放整块槽位数组 ⇒ 比值是下界 | `List` 的 `Drop` 文档 + `clear_drop` 组 |
-| 迭代三层拆解（1M×`usize`，ns/元素） | `iter()` 1.08 / 自己沿链走 1.14 / 顺序扫槽位 **0.062**（Split）；Nodes 1.29 / 1.34 / 0.478 | 本文 §3.2 |
-| `append` 字节对账（mimalloc，1M⊕1M） | 我们 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **差距全在搬的字节数**（16 B/槽 vs 8 B/槽，各自因扩容搬两遍） | §3.6 |
-| 下标改写（`map(\|i\| i + base)`）成本 | 与 `extend_from_slice` 同速（甚至更快）⇒ **加偏移免费** | §3.6 |
-| 尺寸固定开销 | 16 B/槽（`u32`）：T=8 时是载荷的 2×，T=64 时是 12.5% | §2 |
+| `clear` vs "keep `pop`ping until empty" | 8 B **1.2×**, 64 B **2.9×**, 512 B **24.5×** (with Drop glue 64 B is only 1.6×) | `List::clear` docs |
+| `clear`: chain walk vs slot scan (1M slots, `u32` index) | full table 1.08 → **0.15 ms (scan 7.1× faster)**, break-even at 0.25; sparse (1000 live) **1.1 µs → 0.11 ms (100× slower)**; full table + Drop glue break even (2.45 vs 2.57) ⇒ **hybrid: scan when `2 * len >= slots` (threshold 0.5)** | `List::clear` docs + `src/tests.rs::probe_clear_vs_scan` |
+| Scanning threshold, by layout/width | break-even points: with `u32`, `Split` 0.25 / `PackedLinks` 0.25 / `Nodes` 0.50; with the `usize` index, 0.50 for all three layouts (≥1.5× needs 0.75). Narrowing the free-bit pass from 8 B to 4 B is what moved the break-even point down (0.50 → 0.25). **The hybrid threshold is 0.5**: at that density the six combinations measure 0.99–1.43× (break-even at worst; no combination is clearly slower) | same |
+| Full-table gain of the scanning arm | quiet machine: `u32` 3.4–7.1×, `usize` 1.9–2.3×; with background load 1.65–2.96× — the scan is bandwidth-bound (see §1) while the chain-walk column is stable ⇒ **report ratios taken within a single run** | same |
+| `Drop`: dropping in place along the live chain vs going through `clear` (1M, `u32`) | `usize` 1.098 ms → **1.9 µs** (the drop chain is eliminated); with 64 B glue **`Split` 2.498 → 1.889 ms (1.32×)**, `PackedLinks` 2.888 → 2.062 (1.40×), `Nodes` 3.569 → 2.069 (1.72×); the "drop only" column also frees the whole slot array, so the ratios are lower bounds | `List`'s `Drop` docs + the `clear_drop` group |
+| Three-layer iteration breakdown (1M × `usize`, ns/element) | `iter()` 1.08 / walk the chain by hand 1.14 / sequential slot scan **0.062** (Split); Nodes 1.29 / 1.34 / 0.478 | §3.2 of this document |
+| `append` byte accounting (mimalloc, 1M⊕1M) | ours 25.0 GB/s vs `Vec` 22.1 GB/s ⇒ **the whole gap is the number of bytes moved** (16 B/slot vs 8 B/slot, each moved twice because of growth) | §3.6 |
+| Cost of index rewriting (`map(\|i\| i + base)`) | same speed as `extend_from_slice` (even faster) ⇒ **adding the offset is free** | §3.6 |
+| Fixed size overhead | 16 B/slot (`u32`): 2× the payload at T=8, 12.5% at T=64 | §2 |
 
 ---
 
-## 6. 选型指南
+## 6. Selection guide
 
-**布局**
+**Layout**
 
-- 迭代密集（写少读多）→ `SplitList` / `PackedLinksList`（`Nodes` 在 64 B 载荷上迭代慢 ~22%）。
-- 中间位置读写多 → `PackedLinksList`（`prev`/`next` 同处一条 `Link`，同一条线）。
-- 想让分配与内存最简单 / 元素 ≤ 48 B → `NodesList`（一个 `Vec`，一次 realloc）。
-- 元素 ≥ 64 B 想省内存 → `SplitList` / `PackedLinksList`（每槽少 8 B）。
+- Iteration-heavy (many reads, few writes) → `SplitList` / `PackedLinksList` (`Nodes` iterates ~22% slower at a 64 B payload).
+- Frequent reads/writes at middle positions → `PackedLinksList` (`prev`/`next` share one `Link`, hence one cache line).
+- Simplest allocation and memory / elements ≤ 48 B → `NodesList` (one `Vec`, one realloc).
+- Elements ≥ 64 B and memory matters → `SplitList` / `PackedLinksList` (8 B less per slot).
 
-**`append` 两个 API**（这是本库与 std 语义不同的地方，`LinkedList::append` 是 O(1) 指针拼接）
+**The two `append` APIs** (where this crate differs from std, whose `LinkedList::append` is an O(1) pointer splice)
 
-- 目标**有**空闲槽、或源稀疏 → `append_elementwise`（按活元素计费；源稀疏时快三个数量级）。
-- 目标要扩容、源稠密 → `append`（整块按字节走带宽，与元素个数无关）。
+- Target **has** free slots, or the source is sparse → `append_elementwise` (billed per live element; three orders of magnitude faster on a sparse source).
+- Target must grow and the source is dense → `append` (a block move runs at bandwidth over bytes, independent of the element count).
 
-**最大的两个旋钮**
+**The two biggest knobs**
 
-1. `with_capacity` / `reserve`：目标预置容量不扩容 ⇒ `append` **−50~60%**。
-2. 复用已触碰的槽（`append_elementwise`）：不产生新页 ⇒ 冷分配器下差别是数量级的。
+1. `with_capacity` / `reserve`: preallocate the target so it never grows ⇒ `append` **−50~60%**.
+2. Reusing already-touched slots (`append_elementwise`): no fresh pages ⇒ orders of magnitude on a cold allocator.
 
-**环境（库外，但对 `append*` 影响最大）**
+**Environment (outside the crate, but the biggest influence on `append*`)**
 
 ```sh
-cargo bench                                  # 系统 malloc（默认）：看缺页，别看墙钟
-cargo bench --features mimalloc              # mimalloc：本文档绝大多数数字的配置
-GLIBC_TUNABLES=glibc.malloc.hugetlb=1 cargo bench   # glibc ≥ 2.35，让大块走大页
-MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc：别把页还给内核
+cargo bench                                  # system malloc (default): watch page faults, not wall clock
+cargo bench --features mimalloc              # mimalloc: the configuration behind most numbers here
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1 cargo bench   # glibc ≥ 2.35, route large blocks through huge pages
+MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc: don't give pages back to the kernel
 ```
 
 ---
 
-## 7. 复现
+## 7. Reproduction
 
 ```sh
-cargo bench                        # 全套；报告在 target/criterion/report/index.html
-cargo bench -- 'FastList'          # 只看 fast-list 对照组（§9）
-cargo bench -- 'clear_drop'        # clear/Drop 对照（§5）
-cargo test --release -- --ignored --nocapture probe_clear_vs_scan   # clear 的密度曲线与交叉点（§5）
-cargo bench --features linked-list-cursors   # nightly：把 std 游标那三行对照加回来
-cargo bench -- 'iteration|churn'   # 过滤（正则）
-cargo test                         # 正确性（20 项，含不变量逐槽校验）
-cargo miri test                    # 严格 provenance（迭代器走裸地址）
+cargo bench                        # full suite; report in target/criterion/report/index.html
+cargo bench -- 'FastList'          # only the fast-list comparison group (§9)
+cargo bench -- 'clear_drop'        # clear/Drop comparison (§5)
+cargo test --release -- --ignored --nocapture probe_clear_vs_scan   # clear's density curve and crossing point (§5)
+cargo bench --features linked-list-cursors   # nightly: add the three std-cursor comparison rows back
+cargo bench -- 'iteration|churn'   # filter (regex)
+cargo test                         # correctness (20 tests, including per-slot invariant checks)
+cargo miri test                    # strict provenance (the iterator goes through raw addresses)
 ```
 
-`benches/list.rs` 在 stable 上同样可编译：对比 std `LinkedList` 游标的三行对照
-（`middle_insert_remove` / `random_remove_insert` / `cursor_update` 的 `LinkedList`）需要
-`#![feature(linked_list_cursors)]`，由 **`linked-list-cursors` feature**（**不在 `default`**）
-控制 ⇒ stable 上 `cargo bench` 直接可用，nightly 想要那三行就
-`cargo bench --features linked-list-cursors`。
-用 feature 而不是 `build.rs` 自动探测通道，是因为这是库：`build.rs` 会在每个下游用户
-编译本 crate 时都跑一次，而 feature 显式、下游零成本，也和 `mimalloc` 一致。
+`benches/list.rs` compiles on stable as well: the three comparison rows against std `LinkedList`
+cursors (the `LinkedList` columns of `middle_insert_remove` / `random_remove_insert` /
+`cursor_update`) need `#![feature(linked_list_cursors)]`, gated behind the
+**`linked-list-cursors` feature** (**not in `default`**) ⇒ `cargo bench` works directly on stable,
+and on nightly `cargo bench --features linked-list-cursors` adds those three rows. A feature rather
+than a `build.rs` channel probe, because this is a library: `build.rs` would run for every
+downstream user compiling this crate, while a feature is explicit, costs downstream nothing, and
+matches `mimalloc`.
 
-本文件里的"内部探针"数字多数来自临时探针（`#[test]` + `Instant`，min/9 轮），跑完即删；
-`clear` / `Drop` 的对照（`cargo bench -- 'clear_drop'`）已经**常驻**成 `clear_drop` 组：
-密集 / 稀疏 / `clear` 后重填 / 析构，三种布局 × 无 glue 与带 64 B Drop glue。
-机制与结论写在这里与 crate 文档里（`List::clear`、`List` 的 `Drop`、`Storage::append`、`benches/list.rs`）。
-
----
-
-## 8. 性能之外：本库真正独特的四条
-
-吞吐不是本库的卖点（§4 末：分块 ≈ `LinkedList<Vec<T>>` 全项更快）。真正独一无二的是
-下面四条，前两条**已经有永久测试**（可以当契约看）。
-
-1. **稳定槽位身份，现在是公开句柄（[`Slot`]）**：插入/删除不搬动别的元素，槽位在元素
-   存活期内不变；`Storage::append` 甚至能把整段下标直接 `+= base`。
-   - **拿句柄**：`Cursor::slot` / `CursorMut::slot` / `List::front_slot` / `List::back_slot` /
-     `List::iter_slots`（全 `O(1)`）；**用句柄**：`List::cursor_at` / `cursor_at_mut` /
-     `remove_slot` / `move_to_front` / `move_to_back`（全 `O(1)`，不需要逻辑位置）。
-   - **实测收益**（§3.7）：同样的工作按句柄 **~8 ns/次**，按位置 **~317~394 µs/次**
-     —— **约 4 万倍**，差别全在"要不要走链找它"。
-   - **"活没活"是 `O(1)` 可判定的**：空闲标记位放在 `prev` 的**最高位**，判定时
-     **不碰未初始化的 `data`**（否则就是 UB）。它只在"变成空闲"时写一次（读-改-写），
-     链接写入路径上**没有任何额外操作**；`append` 的整段 `+= base` **自己带着它走**
-     （`2^63 | v` 加 `base` 仍是 `2^63 | (v + base)`）。
-   - 试过把这次写改成**直接赋值** `prev = FREE_BIT`（想省掉一次 load）：两轮交替 A/B
-     下 `churn` **稳定慢 7~8%**（Split 2.79/2.83 → 2.99/3.04、PackedLinks 2.77/2.81 → 2.96/2.98，
-     对照 `VecDeque` 持平）⇒ **保留读-改-写**。这是个反直觉但可复现的结果。
-   - 读 `prev` **不掩码**（省一条 and，也短一环取地址的依赖链）：两轮交替 A/B 与三种
-     测法下都是**中性**（±1~3%，方向不一致，对照同步漂移）⇒ 采用。代价是把"**只在 live
-     槽位上读 `prev`**"变成显式契约：`Storage::prev` 在 debug 构建里带 `debug_assert`
-     （release 零成本），24 项测试全绿说明现有每条路径都守约。
-     实测代价：`churn` / `blob_end_ops` 两轮交替 A/B 落在噪声内（Split churn 2.78/2.96 →
-     3.78/2.80，PackedLinks/Nodes 持平）⇒ **不花钱**。
-   - **取舍：不做世代校验**。句柄只回答"这个槽位现在活没活"；槽位被 free-list 复用后，
-     旧句柄会指向**新元素**（经典 ABA，测试里把这个行为钉住了）。要"陈旧句柄也能被测出来"，
-     就用 `slotmap` / `fast-list`（`LinkedListIndex` 是世代 key、`contains_key` 即校验）——
-     代价是同机基准比我们慢 1.7~3×（iteration 1.90 vs 1.14 ms、churn 5.02 vs 2.81 ns/op）。
-
-2. **热路径零分配**：容量备好后 `pop_front`/`push_back` 一次 `malloc` 都不发生
-   （测试 `churn_does_not_allocate`：三种布局 1M 次 churn = **0** 次；对照 `LinkedList`
-   1,000,000 次、链块 K=64 31,250 次）。配合固定 16 B/槽与 `with_capacity` ⇒ 内存与延迟
-   都可预测（`clear` 后槽位进 free-list 复用，不还给内核）。
-3. **状态可搬运、无指针（现在是公开 API）**：整条链的全部状态 = 每槽 `(T, prev, next)` +
-   `head`/`tail`/`free_head`/`free_tail`/`len`（测试 `state_is_relocatable`：原样搬进新容器，
-   迭代与不变量全一致）⇒ 可以直接序列化 / 放进共享内存 / `mmap`，**不需要指针修正**。
-   入口：[`List::into_raw`] / [`List::from_raw`]（配 `RawList` 的取值器）+ 各布局的
-   `as_parts` / `into_parts` / `from_parts`（`Link`/`Node` 已公开）+ 逐槽的
-   `iter_slots()`（live）/ `free_slots()`（free 链，LIFO）。
-   这是不变量"数组里每个值都是合法下标、`NIL` 从不写进数组"换来的。
-4. **布局是参数**：`Split`/`PackedLinks`/`Nodes` 共用同一份实现，`Layout` 用「基址 + 步长 + 偏移」
-   把三种布局统一成迭代器要的裸地址。这既是本仓库能做横向基准的原因，也让"换布局"变成
-   一次类型参数改动（三种布局的实测取舍见 §2、§3）。
-
-⇒ 一句话定位：**本库不是"最快的链表"，而是"能当 `LinkedHashMap` / LRU 的存储引擎、同时
-保留元素级链表 API、稳定句柄与确定性内存"的那个**；想要分块级的吞吐，就用
-`LinkedList<Vec<T>>`（或把块当元素：`List<Vec<T>, Split<Vec<T>>>`）。
+Most of the "internal probe" numbers in this document come from throwaway probes (`#[test]` +
+`Instant`, min of 9 rounds) that were deleted after the run; the `clear` / `Drop` comparison
+(`cargo bench -- 'clear_drop'`) is **permanent** as the `clear_drop` group: dense / sparse / refilled
+after `clear` / drop, three layouts × no glue and 64 B Drop glue. The mechanisms and conclusions
+live here and in the crate documentation (`List::clear`, `List`'s `Drop`, `Storage::append`,
+`benches/list.rs`).
 
 ---
 
-## 9. 与 `fast-list` 0.1.8 的对照
+## 8. Four things unique beyond throughput
 
-同一格子里最接近的对手：slotmap 索引 + 世代号（`LinkedListIndex`）。事实逐条来自两边源码；
-数字是同机同一次 `cargo bench`（`benches/list.rs` 里的 `FastList` 系列），中位数。
+Throughput is not this crate's selling point (end of §4: chunking ≈ `LinkedList<Vec<T>>` is faster
+on every item). What is genuinely unique is the four points below, the first two of which
+**already have permanent tests** (read them as contracts).
 
-### 9.1 性能
+1. **Stable slot identity, now a public handle ([`Slot`])**: insert/remove never moves other
+   elements, and a slot stays put for the element's whole lifetime; `Storage::append` can even
+   `+= base` a whole range of indices.
+   - **Getting a handle**: `Cursor::slot` / `CursorMut::slot` / `List::front_slot` /
+     `List::back_slot` / `List::iter_slots` (all `O(1)`); **using one**: `List::cursor_at` /
+     `cursor_at_mut` / `remove_slot` / `move_to_front` / `move_to_back` (all `O(1)`, no logical
+     position needed).
+   - **Measured gain** (§3.7): the same work is **~8 ns/op** by handle and **~317–394 µs/op** by
+     position — **about 40,000×** — the whole difference being "does it have to walk the chain to
+     find it".
+   - **"Is it live?" is decidable in `O(1)`**: the free bit lives in the **top bit of `prev`** and
+     the test **never touches uninitialized `data`** (that would be UB). It is written once, when
+     the slot becomes free (read-modify-write), and the link-write path has **no extra operation**;
+     `append`'s bulk `+= base` **carries it along** (`2^63 | v` plus `base` is still
+     `2^63 | (v + base)`).
+   - Writing `prev = FREE_BIT` directly (to save a load) makes `churn` **7–8% slower** ⇒ the
+     read-modify-write stays. Counter-intuitive, but reproducible.
+   - Reading `prev` **without masking** (saving an `and` and shortening the address-generating
+     dependency chain) is **neutral** (±1–3%, inconsistent direction, reference drifting along) ⇒
+     adopted. The cost is making "**read `prev` only on live slots**" an explicit contract:
+     `Storage::prev` carries a `debug_assert` (zero cost in release), and all 24 tests green show
+     every existing path honours it. Measured cost: `churn` / `blob_end_ops` stay inside the noise
+     ⇒ **free**.
+   - **Trade-off: no generation check**. A handle answers only "is this slot live right now"; once
+     the free list reuses a slot, an old handle points at the **new element** (classic ABA, pinned
+     by a test). If you need stale handles to be detectable, use `slotmap` / `fast-list` (whose
+     `LinkedListIndex` is a generation key, checked by `contains_key`) — at the cost of running
+     1.7–3× slower on same-machine benchmarks.
 
-| 组（规模） | 本库 `SplitList` | `FastList` | 倍数 | `LinkedList` | `VecDeque` |
+2. **Zero allocation on the hot path**: once capacity is in place, `pop_front`/`push_back` never
+   `malloc`s (test `churn_does_not_allocate`: 1M churns = **0** allocations across all three
+   layouts; `LinkedList` in the same test does 1,000,000, and a chunked list with K=64 does
+   31,250). With a fixed 16 B/slot and `with_capacity` ⇒ both memory and latency are predictable
+   (after `clear`, slots go back onto the free list instead of to the kernel).
+
+3. **Relocatable, pointer-free state (now a public API)**: the entire state of the chain = per slot
+   `(T, prev, next)` plus `head`/`tail`/`free_head`/`free_tail`/`len` (test `state_is_relocatable`:
+   moved verbatim into a new container, with iteration and invariants identical) ⇒ it can be
+   serialized, placed in shared memory, or `mmap`ed with **no pointer fixup**. Entry points:
+   [`List::into_raw`] / [`List::from_raw`] (with `RawList` accessors) plus each layout's
+   `as_parts` / `into_parts` / `from_parts` (`Link`/`Node` are public) and the per-slot
+   `iter_slots()` (live) / `free_slots()` (the free chain, LIFO). This is bought by the invariant
+   "every value in the array is a valid index and `NIL` is never written into the arrays".
+
+4. **Layout is a parameter**: `Split`/`PackedLinks`/`Nodes` share one implementation, and `Layout`
+   (base + stride + offset) unifies all three into the raw addresses the iterator wants. That is
+   both what makes the cross-layout benchmarks in this repository possible and what makes "change
+   the layout" a one-type-parameter edit (measured trade-offs of the three layouts in §2, §3).
+
+⇒ In one line: **this crate is not "the fastest linked list" but "the one you can use as the storage
+engine of a `LinkedHashMap` / LRU while keeping an element-level list API, stable handles and
+deterministic memory"**; for chunk-level throughput, use `LinkedList<Vec<T>>` (or put chunks in as
+elements: `List<Vec<T>, Split<Vec<T>>>`).
+
+---
+
+## 9. Comparison with `fast-list` 0.1.8
+
+The closest opponent in this niche: slotmap index + generation (`LinkedListIndex`). Every fact below
+comes from both sides' source; the numbers are medians from one same-machine `cargo bench` (the
+`FastList` series in `benches/list.rs`).
+
+### 9.1 Performance
+
+| Group (scale) | this crate's `SplitList` | `FastList` | Ratio | `LinkedList` | `VecDeque` |
 |---|---|---|---|---|---|
-| `end_ops/push_back_pop_front`（1M push + 1M pop） | **7.11 ms** | 12.54 ms | 1.8× | 5.37 ms | 2.58 ms |
-| `iteration`（1M 元素） | **1.21 ms** | 1.72 ms | 1.4× | 1.05 ms | 0.31 ms |
-| `middle_access`（100 次 N/2） | **54.4 ms** | 85.3 ms | 1.6× | 54.5 ms | 68 ns |
-| `middle_insert_remove`（N/2 处 1000 次插删） | **561 µs** | 821 µs | 1.5× | 489 µs | 96.6 ms |
-| `churn`（1M 次 pop+push） | **2.75 ms** | 5.09 ms | 1.9× | 6.15 ms | 1.68 ms |
-| `random_remove_insert`（100 个随机位置） | **28.8 ms** | 43.3 ms | 1.5× | 29.8 ms | 4.67 ms |
-| `slot_entry::by_handle`（100 次句柄入口） | **664 ns** | 43.5 ms | **6.5 万×** | — | — |
-| `slot_entry::by_pos`（100 次位置入口） | **29.0 ms** | 43.8 ms | 1.5× | — | — |
+| `end_ops/push_back_pop_front` (1M pushes + 1M pops) | **7.11 ms** | 12.54 ms | 1.8× | 5.37 ms | 2.58 ms |
+| `iteration` (1M elements) | **1.21 ms** | 1.72 ms | 1.4× | 1.05 ms | 0.31 ms |
+| `middle_access` (100 × N/2) | **54.4 ms** | 85.3 ms | 1.6× | 54.5 ms | 68 ns |
+| `middle_insert_remove` (1000 insert/removes at N/2) | **561 µs** | 821 µs | 1.5× | 489 µs | 96.6 ms |
+| `churn` (1M × pop+push) | **2.75 ms** | 5.09 ms | 1.9× | 6.15 ms | 1.68 ms |
+| `random_remove_insert` (100 random positions) | **28.8 ms** | 43.3 ms | 1.5× | 29.8 ms | 4.67 ms |
+| `slot_entry::by_handle` (100 handle entries) | **664 ns** | 43.5 ms | **60,000×** | — | — |
+| `slot_entry::by_pos` (100 position entries) | **29.0 ms** | 43.8 ms | 1.5× | — | — |
 
-读数注意：`end_ops` 量的是分配器（本文件 §1 的读数纪律，±20%），其余组 ±5%。
+Reading note: `end_ops` measures the allocator (the reading discipline in §1, ±20%); the other
+groups ±5%.
 
-**为什么 `by_handle` 那一格差 6 万倍**（这是世代号语义的直接后果，不是实现质量）：
+**Why the `by_handle` cell differs by 60,000×** (a direct consequence of generation semantics, not
+implementation quality):
 
-- 基准体是"随机位置删一个 + 原地插回"，criterion 会**反复跑**这段循环。
-- `fast-list` 的 `LinkedListIndex` 带世代号：一次 `remove` + 重新插入之后，**原句柄就作废了**
-  （新元素拿新世代）。所以第一轮之后句柄全失效，唯一出路是 `contains_key` 发现失效后
-  **按位置重找**（O(N)）——基准里就是这么写的，于是 `by_handle` ≈ `by_pos`。
-- 本库的 `Slot` 是裸下标：`remove` + `insert_before` 之后槽位被 LIFO 复用，**旧句柄依旧有效**
-  且仍指向这一格（ABA 语义），所以是 O(1)。代价是：**它不会告诉你元素已经被换过了**。
+- The benchmark body is "remove at a random position, insert back in place", and criterion **runs
+  that loop repeatedly**.
+- `fast-list`'s `LinkedListIndex` carries a generation: after a `remove` plus a re-insert, **the old
+  handle is dead** (the new element gets a new generation). So after the first round every handle is
+  invalid, and the only way out is, once `contains_key` reports death, **to find the element by
+  position** (O(N)) — which is what the benchmark does, making `by_handle` ≈ `by_pos`.
+- This crate's `Slot` is a raw index: after `remove` + `insert_before` the slot is reused LIFO,
+  **so the old handle is still valid** and still points at that cell (ABA semantics), hence O(1).
+  The price: **it will not tell you that the element has been swapped out**.
 
-⇒ 两边的差异不是"谁快"，而是**句柄在变更后的语义**：他们保证"失效可检测"，我们保证"身份不搬动"。
-要在这类工作负载里用好 `fast-list`，得自己在外部维护"元素 → 当前句柄"的映射（每次插删都要更新），
-本库则天生不需要（代价就是 ABA）。
+⇒ The difference between the two sides is not "who is faster" but **handle semantics after
+mutation**: they guarantee "invalidation is detectable", we guarantee "identity never moves". To use
+`fast-list` well on such workloads you must maintain an external "element → current handle" map
+(updated on every insert/remove), whereas this crate does not need one (the price being ABA).
 
-### 9.2 功能
+### 9.2 Features
 
-| 维度 | 本库 | `fast-list` 0.1.8 |
+| Dimension | this crate | `fast-list` 0.1.8 |
 |---|---|---|
-| 句柄类型 | `Slot`（裸下标 `usize`，8 B，无世代） | `LinkedListIndex`（slotmap key：`u32` 下标 + `u32` 世代，8 B） |
-| 陈旧句柄 / ABA | ✗ **查不出来**：槽位复用后旧句柄指向新元素（测试钉住了这个行为） | ✓ `contains_key()` 即时校验（世代不匹配即 `false`） |
-| 句柄 → 元素 | ✓ `cursor_at(_mut)` / `remove_slot`，O(1) | ✓ `get` / `get_mut` / `remove`，O(1) |
-| 位置 → 句柄 | ✓ `slot_at(pos)`，O(N) | ✓ `nth(pos)`，O(N) |
-| **元素级游标** | ✓✓ `Cursor`/`CursorMut`：跨插入/删除保持位置、幽灵位置、`move_prev/next/steps`、`peek` 邻居 | ✗ 只有 `cursor_next/prev`（遍历时取邻居的助手），没有"停在某个元素上"的对象 |
-| 删除后"我原来在哪" | ✓ 游标留在原位，`insert_before` 放回同一处 | ✗ `remove` 之后要自己拿 `LinkedListItem::next_index`/`prev_index` 当锚点（基准就是这么写的） |
-| `move_to_front` / `move_to_back` | ✓ O(1) 内建 | ✗ 要 `insert_*` + `remove` 两步，且**产生新 index ⇒ 旧句柄失效** |
-| 整段搬运 `append` | ✓ O(1) 槽位重编号 + 下标整段偏移 | ✗ 只有 `extend`（逐个 push） |
-| 附带数据 | ✗ 无内建（但 `Slot` 是普通下标，能直接当任何 map/数组的键） | ✓ `new_data::<V>()` / `new_data_sparse::<V>()`（slotmap 的 `SecondaryMap`，键就是句柄） |
-| 整条链状态进出口 | ✓ `into_raw` / `from_raw` + `as_parts` / `from_parts` + `iter_slots` / `free_slots`（可落盘 / 共享内存，有 round-trip 测试） | ✗ 只能靠 `iter()` 逐个抄 |
-| 无序遍历 | ✓ `iter_slots() -> (Slot, &T)` | ✓ `iter_unordered() -> &LinkedListItem<T>` |
-| 有序遍历 / `retain` / `split_off` | ✓ | ✓ |
-| 按**值**查找 `contains` | ✓ | ✗（只有按句柄的 `contains_key`） |
-| 布局可选 | ✓ 三种（Split / PackedLinks / Nodes） | ✗ 一种 |
-| 每槽内存（T=8） | **16 B**（data + prev + next，索引 `u32`，§2 已核对） | `LinkedListItem<usize>` = **32 B**（value + index + next + prev），**外加** slotmap 每槽的版本/占用元数据 |
-| 热路径零分配 | ✓ `churn_does_not_allocate` | ✓ 同一测试里也钉了（两边都是 0 次 malloc） |
-| 可见的 `unsafe` | 核心是 unchecked 读写 + 裸地址迭代器，靠 miri + 全套测试兜 | **0 处**（整包 `unsafe` 计数为 0）⇒ 审计/信任成本更低 |
-| 依赖 / `no_std` | 无依赖；关掉 `std` feature 即 `no_std` + `alloc` | `slotmap`（+ 可选 `unstable` 开 `Walker`）；只用 `core`，未声明 `no_std` |
-| 派生实现 | `Clone` / `Debug` / `PartialEq` / `Eq` / `Default` / `FromIterator` / `Extend` / `IntoIterator` | 只有 `Debug` |
+| Handle type | `Slot` (raw `usize` index, 8 B, no generation) | `LinkedListIndex` (slotmap key: `u32` index + `u32` generation, 8 B) |
+| Stale handle / ABA | ✗ **undetectable**: after a slot is reused the old handle points at the new element (pinned by a test) | ✓ `contains_key()` validates immediately (a generation mismatch is `false`) |
+| Handle → element | ✓ `cursor_at(_mut)` / `remove_slot`, O(1) | ✓ `get` / `get_mut` / `remove`, O(1) |
+| Position → handle | ✓ `slot_at(pos)`, O(N) | ✓ `nth(pos)`, O(N) |
+| **Element-level cursor** | ✓✓ `Cursor`/`CursorMut`: survives insert/remove, ghost position, `move_prev/next/steps`, `peek` neighbours | ✗ only `cursor_next/prev` (helpers for taking neighbours while traversing), no object that "stays on an element" |
+| "Where was I" after a removal | ✓ the cursor stays in place, `insert_before` puts it back in the same spot | ✗ after `remove` you must use `LinkedListItem::next_index`/`prev_index` yourself as the anchor (which is what the benchmark does) |
+| `move_to_front` / `move_to_back` | ✓ built in, O(1) | ✗ needs `insert_*` + `remove`, and **produces a new index ⇒ the old handle dies** |
+| Bulk move `append` | ✓ O(1) slot renumbering plus a range-wide index offset | ✗ only `extend` (push one by one) |
+| Attached data | ✗ none built in (but `Slot` is an ordinary index, usable directly as a key into any map/array) | ✓ `new_data::<V>()` / `new_data_sparse::<V>()` (slotmap's `SecondaryMap`, keyed by the handle) |
+| Whole-chain state import/export | ✓ `into_raw` / `from_raw` + `as_parts` / `from_parts` + `iter_slots` / `free_slots` (can be persisted / shared in memory, with a round-trip test) | ✗ only copying element by element via `iter()` |
+| Unordered traversal | ✓ `iter_slots() -> (Slot, &T)` | ✓ `iter_unordered() -> &LinkedListItem<T>` |
+| Ordered traversal / `retain` / `split_off` | ✓ | ✓ |
+| Find by **value** `contains` | ✓ | ✗ (only the by-handle `contains_key`) |
+| Layout choice | ✓ three (Split / PackedLinks / Nodes) | ✗ one |
+| Memory per slot (T=8) | **16 B** (data + prev + next, `u32` index, checked in §2) | `LinkedListItem<usize>` = **32 B** (value + index + next + prev), **plus** slotmap's per-slot version/occupancy metadata |
+| Zero allocation on the hot path | ✓ `churn_does_not_allocate` | ✓ pinned in the same test (both sides do 0 mallocs) |
+| Visible `unsafe` | the core is unchecked reads/writes plus a raw-address iterator, backed by miri and the full test suite | **0 occurrences** (the whole package's `unsafe` count is 0) ⇒ cheaper to audit/trust |
+| Dependencies / `no_std` | none; turning off the `std` feature gives `no_std` + `alloc` | `slotmap` (+ optional `unstable` for `Walker`); uses only `core`, does not declare `no_std` |
+| Derived impls | `Clone` / `Debug` / `PartialEq` / `Eq` / `Default` / `FromIterator` / `Extend` / `IntoIterator` | only `Debug` |
 
-**结论**：同一数据结构的两种取舍，不是替代关系。
+**Conclusion**: two trade-offs of the same data structure, not replacements for each other.
 
-- 要**世代校验**（陈旧句柄必须能被发现）、要 slotmap 的 `SecondaryMap` 顺便带数据、或者想少一份 `unsafe`
-  ⇒ 用 `fast-list`；代价是槽更大（32 B vs 24 B + slotmap 元数据）、句柄在每次插删后作废、
-  没有游标 / `move_to_*` / `append`。
-- 要**游标语义**（删除后还在原地、幽灵位置、相对移动）、**三种布局**、**整段搬运**、**更小的槽**、
-  **句柄跨变更不失效** ⇒ 用本库；代价是陈旧句柄**测不出来**（要么自己配世代号，要么接受 ABA 语义，
-  要么用 `new_data` 那类外部映射自己维护）。
+- Need a **generation check** (stale handles must be detectable), want slotmap's `SecondaryMap` to
+  carry payload alongside, or want one less `unsafe` ⇒ use `fast-list`; the price is larger slots
+  (32 B vs 24 B plus slotmap metadata), handles dying on every insert/remove, and no cursor /
+  `move_to_*` / `append`.
+- Need **cursor semantics** (staying in place after a removal, ghost position, relative movement),
+  **three layouts**, **bulk moves**, **smaller slots**, **handles that survive mutation** ⇒ use this
+  crate; the price is that stale handles are **undetectable** (bring your own generation counter,
+  accept ABA semantics, or maintain an external map such as `new_data`).

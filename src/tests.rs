@@ -1,11 +1,12 @@
-//! 三种布局共用一套测试：实现是同一份，所以只需要泛型函数 ×3。
+//! One test suite shared by all three layouts: the implementation is a single
+//! one, so generic functions ×3 suffice.
 
 use super::*;
 use crate::storage::{NIL, Storage};
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// 对三种布局各跑一遍 `$check`（`i32` 元素）。
+/// Run `$check` once per layout (`i32` elements).
 macro_rules! each_layout {
     ($check:ident) => {
         $check::<Split<i32>>();
@@ -15,7 +16,7 @@ macro_rules! each_layout {
 }
 
 // ============================================================
-// 基本操作
+// Basic operations
 // ============================================================
 
 fn check_basics<S: Storage<i32> + Default>() {
@@ -58,7 +59,7 @@ fn check_basics<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 迭代
+// Iteration
 // ============================================================
 
 fn check_iteration<S: Storage<i32> + Default>() {
@@ -129,7 +130,7 @@ fn check_iteration<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 游标：std 语义
+// Cursor: std semantics
 // ============================================================
 
 fn check_cursor_read<S: Storage<i32> + Default>() {
@@ -152,18 +153,18 @@ fn check_cursor_read<S: Storage<i32> + Default>() {
     cursor.move_prev();
     assert_eq!(cursor.index(), Some(0));
 
-    // 从首元素 move_prev 进入幽灵位置。
+    // move_prev from the first element enters the ghost position.
     cursor.move_prev();
     assert_eq!(cursor.index(), None);
     assert_eq!(cursor.current(), None);
     assert_eq!(cursor.peek_next().copied(), Some(0));
     assert_eq!(cursor.peek_prev().copied(), Some(2));
 
-    // 幽灵位置 move_next 回到首元素。
+    // move_next from the ghost position returns to the first element.
     cursor.move_next();
     assert_eq!(cursor.index(), Some(0));
 
-    // 从尾元素 move_next 进入幽灵位置。
+    // move_next from the last element enters the ghost position.
     let mut cursor = list.cursor_back();
 
     assert_eq!(cursor.index(), Some(2));
@@ -201,7 +202,7 @@ fn check_cursor_write<S: Storage<i32> + Default>() {
 
     assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![10, 20, 2]);
 
-    // insert_before / insert_after 后游标仍指向原节点。
+    // After insert_before / insert_after the cursor still points at the original node.
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -222,7 +223,7 @@ fn check_cursor_write<S: Storage<i32> + Default>() {
         vec![10, 15, 20, 25, 2]
     );
 
-    // remove_current：游标移到下一个元素。
+    // remove_current: the cursor moves to the next element.
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -237,7 +238,7 @@ fn check_cursor_write<S: Storage<i32> + Default>() {
         vec![10, 20, 25, 2]
     );
 
-    // 删尾元素 -> 幽灵位置。
+    // Removing the tail element -> ghost position.
     {
         let back = list.len() - 1;
         let mut cursor = list.at(back).unwrap();
@@ -249,7 +250,7 @@ fn check_cursor_write<S: Storage<i32> + Default>() {
 
     assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![10, 20, 25]);
 
-    // 幽灵位置的 insert_before 追加到末尾，insert_after 插到最前。
+    // At the ghost position, insert_before appends at the back and insert_after inserts at the front.
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -285,7 +286,7 @@ fn check_cursor_push_pop<S: Storage<i32> + Default>() {
     {
         let mut cursor = list.cursor_front_mut();
 
-        cursor.move_next(); // 指向 1，pos 1
+        cursor.move_next(); // points at 1, pos 1
 
         cursor.push_front(-1);
         assert_eq!(cursor.index(), Some(2));
@@ -309,7 +310,7 @@ fn check_cursor_push_pop<S: Storage<i32> + Default>() {
 
     assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
 
-    // pop_front 删掉游标所指元素时，游标移到新队首。
+    // When pop_front removes the element the cursor points at, the cursor moves to the new front.
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -318,7 +319,7 @@ fn check_cursor_push_pop<S: Storage<i32> + Default>() {
         assert_eq!(*cursor.current().unwrap(), 1);
     }
 
-    // pop_back 删掉游标所指元素时，游标移到幽灵位置。
+    // When pop_back removes the element the cursor points at, the cursor moves to the ghost position.
     {
         let mut cursor = list.cursor_back_mut();
 
@@ -366,7 +367,7 @@ fn check_cursor_extras<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 批量操作与 trait
+// Bulk operations and traits
 // ============================================================
 
 fn check_bulk<S: Storage<i32> + Default>() {
@@ -412,19 +413,19 @@ fn check_bulk<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 不变量
+// Invariants
 // ============================================================
 
-/// 检查 `List` 文档里列出的全部不变量（只读，不改状态）。
-/// 槽位是否在 free 链上（测试用）。按**个数**走（free 链的尾巴是自环，
-/// `NIL` 从不进数组，所以不能"走到 NIL 为止"）。
+/// Check every invariant listed in the `List` docs (read-only, no state changes).
+/// Whether a slot is on the free chain (test helper). Walk by **count** (the free
+/// chain's tail is a self-loop and `NIL` never enters the array, so we cannot "walk until NIL").
 fn free_set<S: Storage<T>, T>(list: &List<T, S>) -> Vec<bool> {
     let mut on_free = vec![false; list.storage.slots()];
     let free = list.storage.slots() - list.len();
     let mut slot = list.free_head;
 
     for step in 0..free {
-        assert!(!on_free[slot], "free 链有环（第 {step} 步）");
+        assert!(!on_free[slot], "free chain has a cycle (step {step})");
         on_free[slot] = true;
         slot = list.storage.next(slot);
     }
@@ -436,35 +437,41 @@ fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
     let slots = list.storage.slots();
     let len = list.len();
 
-    // 1) `next` 里每个值都是合法下标（**没有哨兵值**：`append` 能把整段下标直接
-    //    `+= base`，靠的就是这条）；`prev` 只对 **live** 槽位要求合法——空闲槽的
-    //    `prev` 是陈旧值（唯一用途是那个空闲标记位），不参与任何运算。
+    // 1) Every value in `next` is a valid index (**no sentinel values**: this is
+    //    what lets `append` shift a whole block of indices by `+= base`); `prev`
+    //    must be valid only for **live** slots — a free slot's `prev` is stale (its only use is the free bit) and never participates in arithmetic.
     for i in 0..slots {
-        assert!(list.storage.next(i) < slots, "next[{i}] 不是合法下标");
+        assert!(
+            list.storage.next(i) < slots,
+            "next[{i}] is not a valid index"
+        );
 
         if !list.storage.is_free(i) {
-            assert!(list.storage.prev(i) < slots, "prev[{i}] 不是合法下标");
+            assert!(
+                list.storage.prev(i) < slots,
+                "prev[{i}] is not a valid index"
+            );
         }
     }
 
-    // 2) 空表时两个端点字段归位
-    assert_eq!(list.head == NIL, len == 0, "head 与 len 不一致");
-    assert_eq!(list.tail == NIL, len == 0, "tail 与 len 不一致");
+    // 2) Both endpoint fields reset when the list is empty
+    assert_eq!(list.head == NIL, len == 0, "head disagrees with len");
+    assert_eq!(list.tail == NIL, len == 0, "tail disagrees with len");
 
     let mut seen = vec![false; slots];
     let mut node = list.head;
     let mut last = NIL;
 
-    // 3) live 链：从 head 走 len 步恰好覆盖所有 live 节点，并停在 tail
+    // 3) live chain: walking len steps from head covers exactly the live nodes and stops at tail
     for step in 0..len {
-        assert!(node != NIL, "live 链比 len 短");
-        assert!(!seen[node], "live 链有重复节点（第 {step} 步）");
+        assert!(node != NIL, "live chain is shorter than len");
+        assert!(!seen[node], "live chain has a duplicate node (step {step})");
         seen[node] = true;
 
         let prev = list.storage.prev(node);
         let next = list.storage.next(node);
 
-        // 两端的"哑元"字段只在有真实邻居时才要求互逆
+        // The endpoint "dummy link" fields are required to be mutually inverse only when a real neighbour exists
         if node != list.head {
             assert_eq!(list.storage.next(prev), node, "next(prev(node)) != node");
         }
@@ -478,21 +485,32 @@ fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
     }
 
     if len > 0 {
-        assert_eq!(last, list.tail, "走完 len 步没停在 tail");
+        assert_eq!(last, list.tail, "did not stop at tail after len steps");
     }
 
-    // 4) free 链：长度恰好是 `slots - len`，与 live 链不相交，终点是 free_tail
+    // 4) free chain: length is exactly `slots - len`, disjoint from the live chain, ending at free_tail
     let free = slots - len;
 
-    assert_eq!(list.free_head == NIL, free == 0, "free_head 与空闲数不一致");
-    assert_eq!(list.free_tail == NIL, free == 0, "free_tail 与空闲数不一致");
+    assert_eq!(
+        list.free_head == NIL,
+        free == 0,
+        "free_head disagrees with the free count"
+    );
+    assert_eq!(
+        list.free_tail == NIL,
+        free == 0,
+        "free_tail disagrees with the free count"
+    );
 
     let mut node = list.free_head;
     let mut last = NIL;
 
     for step in 0..free {
-        assert!(node != NIL, "free 链比空闲数短");
-        assert!(!seen[node], "槽位同时在 live 链和 free 链（第 {step} 步）");
+        assert!(node != NIL, "free chain is shorter than the free count");
+        assert!(
+            !seen[node],
+            "slot is on both the live and free chains (step {step})"
+        );
         seen[node] = true;
 
         last = node;
@@ -500,30 +518,30 @@ fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
     }
 
     if free > 0 {
-        assert_eq!(last, list.free_tail, "free 链没走到 free_tail");
+        assert_eq!(last, list.free_tail, "free chain did not reach free_tail");
     }
 
-    assert!(seen.iter().all(|&s| s), "有槽位不在任何链上");
+    assert!(seen.iter().all(|&s| s), "some slot is on neither chain");
 
-    // 5) 空闲标记位必须与"在不在 free 链上"完全一致（句柄的存活判定全靠它）：
-    //    free 链上的槽位 → `is_free` 为真；live 链上的 → 为假。
+    // 5) The free bit must agree exactly with "is on the free chain" (handle
+    //    liveness detection relies on it): slots on the free chain → `is_free` true; slots on the live chain → false.
     let on_free_chain = free_set(list);
 
     for (i, &on_free) in on_free_chain.iter().enumerate() {
         assert_eq!(
             list.storage.is_free(i),
             on_free,
-            "槽位 {i} 的空闲标记位与 free 链不一致"
+            "slot {i}'s free bit disagrees with the free chain"
         );
     }
 }
 
-/// 一长串操作，每步之后都验一遍不变量。
+/// A long sequence of operations; invariants are checked after every step.
 fn check_invariants_seq<S: Storage<i32> + Default>() {
     let mut list: List<i32, S> = List::default();
     assert_invariants(&list);
 
-    // 空表 → 单节点 → 多节点
+    // Empty -> one node -> many nodes
     list.push_back(0);
     assert_invariants(&list);
     list.push_back(1);
@@ -535,7 +553,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
         assert_invariants(&list);
     }
 
-    // 端点删除（含删到只剩一个）
+    // Endpoint removal (including down to a single element)
     for _ in 0..3 {
         list.pop_front();
         assert_invariants(&list);
@@ -546,17 +564,17 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
         assert_invariants(&list);
     }
 
-    // 中间删除 + free 链复用
+    // Middle removal + free-chain reuse
     list.remove(0);
     assert_invariants(&list);
     list.remove(list.len() - 1);
     assert_invariants(&list);
 
-    // retain（可能删掉链头、链尾，也可能删空）
+    // retain (may remove the head, the tail, or everything)
     list.retain(|value| *value % 2 == 0);
     assert_invariants(&list);
 
-    // 游标插入 / 删除（含插在两端）
+    // Cursor insertion / removal (including at both ends)
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -571,7 +589,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
         assert_invariants(cursor.as_list());
     }
 
-    // 在链头之前 / 链尾之后插入
+    // Insert before the chain head / after the chain tail
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -586,7 +604,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
         assert_invariants(cursor.as_list());
     }
 
-    // clear：所有槽位进 free 链，再重填到超过原有槽位数
+    // clear: all slots enter the free chain, then refill past the original slot count
     let slots = list.storage.slots();
     list.clear();
     assert_invariants(&list);
@@ -597,7 +615,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
         assert_invariants(&list);
     }
 
-    // 删空：端点字段必须归位成 NIL
+    // Empty it: the endpoint fields must reset to NIL
     while !list.is_empty() {
         list.pop_front();
         assert_invariants(&list);
@@ -609,7 +627,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
     assert_invariants(&list);
     assert_invariants(&tail);
 
-    // 用 retain 删空
+    // Empty it with retain
     let mut list: List<i32, S> = (0..5).collect();
     list.retain(|_| false);
     assert_invariants(&list);
@@ -621,7 +639,7 @@ fn check_invariants_seq<S: Storage<i32> + Default>() {
 // ============================================================
 
 fn check_append<S: Storage<i32> + Default>() {
-    // 空 ⊕ 空
+    // Empty ⊕ empty
     let mut a: List<i32, S> = List::default();
     let mut b: List<i32, S> = List::default();
 
@@ -630,7 +648,7 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 空 ⊕ 非空（`a` 一个槽位都没有：base == 0）
+    // Empty ⊕ non-empty (`a` has no slots at all: base == 0)
     let mut b: List<i32, S> = (0..5).collect();
 
     a.append(&mut b);
@@ -641,7 +659,7 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 非空 ⊕ 空（对方一个槽位都没有：直接返回）
+    // Non-empty ⊕ empty (the other side has no slots: returns immediately)
     let mut b: List<i32, S> = List::default();
 
     a.append(&mut b);
@@ -649,8 +667,8 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_eq!(a.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
     assert_invariants(&a);
 
-    // 非空 ⊕ 非空：自己没有空闲槽、对方够密 ⇒ 走整块搬运，
-    // 对方的空闲槽也要一起接过来
+    // Non-empty ⊕ non-empty: no free slots here and the other side is dense
+    // enough ⇒ whole-block move, carrying the other side's free slots along
     let a_slots = a.storage.slots();
     let a_free = a.storage.slots() - a.len();
     let mut b: List<i32, S> = (10..20).collect();
@@ -673,27 +691,34 @@ fn check_append<S: Storage<i32> + Default>() {
     );
     assert_eq!(a.storage.slots(), a_slots + 10);
     assert!(b.is_empty());
-    assert_eq!(b.storage.slots(), 0, "槽位搬走了，容量留下");
+    assert_eq!(
+        b.storage.slots(),
+        0,
+        "slots moved out, capacity stays behind"
+    );
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 搬过来的空闲槽必须能被复用（free 链拼接正确）
+    // The moved-in free slots must be reusable (free chains spliced correctly)
     let free = a.storage.slots() - a.len();
     let slots = a.storage.slots();
 
-    assert_eq!(free, a_free + b_free, "空闲槽数不对");
+    assert_eq!(free, a_free + b_free, "wrong number of free slots");
 
     for i in 0..free {
         a.push_back(i as i32);
     }
 
-    assert_eq!(a.storage.slots(), slots, "空闲槽没有全部复用");
+    assert_eq!(a.storage.slots(), slots, "not all free slots were reused");
 
     a.push_back(-1);
-    assert!(a.storage.slots() > slots, "空闲槽用完之后应该扩容");
+    assert!(
+        a.storage.slots() > slots,
+        "should grow once free slots are exhausted"
+    );
     assert_invariants(&a);
 
-    // `self` 空但带空闲槽（clear 之后）：仍然走整块搬运
+    // `self` empty but holding free slots (after clear): still a whole-block move
     let mut a: List<i32, S> = (0..3).collect();
 
     a.clear();
@@ -706,7 +731,7 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_eq!(a.len(), 4);
     assert_invariants(&a);
 
-    // 连续追加多次，链越来越长（多段拼接之后下标仍然自洽）
+    // Append repeatedly; the chain grows (indices stay consistent across splices)
     for round in 0..3 {
         let mut b: List<i32, S> = (0..4).collect();
 
@@ -722,7 +747,7 @@ fn check_append<S: Storage<i32> + Default>() {
         vec![0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
     );
 
-    // 追加到空表：`base == 0`，但两条链都要接对
+    // Append to an empty list: `base == 0`, but both chains must be spliced correctly
     let mut a: List<i32, S> = List::default();
     let mut b: List<i32, S> = (0..6).collect();
 
@@ -745,7 +770,7 @@ fn check_append<S: Storage<i32> + Default>() {
         vec![2, 1, 0, 1, 2, 3, 4]
     );
 
-    // 自己接不下（空闲槽 0 < 对方 9 个活元素）⇒ 整块连接
+    // Cannot fit here (0 free slots < the other side's 9 live elements) ⇒ whole-block splice
     let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (300..310).collect();
 
@@ -765,7 +790,7 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 对方很稀疏：整块连接照**槽位数**搬（36 个死槽也跟着过来）
+    // The other side is very sparse: the whole-block splice moves by **slot count** (36 dead slots come along)
     let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (0..40).collect();
 
@@ -790,13 +815,13 @@ fn check_append<S: Storage<i32> + Default>() {
     assert_eq!(
         a.storage.slots(),
         a_slots + b_slots,
-        "整块连接会把对方的槽位（含死槽）一起接过来"
+        "the whole-block splice carries the other side's slots (including dead ones) along"
     );
     assert_eq!(b.storage.slots(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 对方是"空表但带槽位"：整块连接会把那些空槽也接过来
+    // The other side is "empty but holding slots": the whole-block splice carries those free slots along too
     let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (0..5).collect();
 
@@ -808,15 +833,19 @@ fn check_append<S: Storage<i32> + Default>() {
     a.append(&mut b);
 
     assert_eq!(a.len(), 4);
-    assert_eq!(a.storage.slots(), a_slots + b_slots, "空槽也被整块接过来");
+    assert_eq!(
+        a.storage.slots(),
+        a_slots + b_slots,
+        "free slots are carried along by the whole-block splice"
+    );
     assert_eq!(b.storage.slots(), 0);
     assert_invariants(&a);
     assert_invariants(&b);
 }
 
-/// `append_elementwise`：逐元素搬，优先填自己已有的空闲槽（不扩容、不搬对方槽位）。
+/// `append_elementwise`: moves element by element, preferring this list's own free slots (no growth, the other side's slots stay put).
 fn check_append_elementwise<S: Storage<i32> + Default>() {
-    // a: 10 槽 / 4 活（6 空闲）；b: 3 槽 / 3 活 ⇒ 全部塞进空闲槽
+    // a: 10 slots / 4 live (6 free); b: 3 slots / 3 live ⇒ all fit into the free slots
     let mut a: List<i32, S> = (0..10).collect();
 
     for _ in 0..6 {
@@ -836,14 +865,22 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![6, 7, 8, 9, 200, 201, 202]
     );
-    assert_eq!(a.storage.slots(), a_slots, "复用空闲槽，不该扩容");
+    assert_eq!(
+        a.storage.slots(),
+        a_slots,
+        "reuses free slots, should not grow"
+    );
     assert_eq!(a.storage.slots() - a.len(), 6 - 3);
     assert!(b.is_empty());
-    assert_eq!(b.storage.slots(), b_slots, "对方的槽位留在对方那里");
+    assert_eq!(
+        b.storage.slots(),
+        b_slots,
+        "the other side's slots stay with the other side"
+    );
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 对方稀疏（1M 槽位只剩 100 活的情形在基准里量）：只搬活元素，不碰对方的死槽
+    // The other side is sparse (the 1M-slots-100-live case is measured in the benches): move live elements only, leaving its dead slots untouched
     let mut a: List<i32, S> = (0..8).collect();
 
     for _ in 0..4 {
@@ -865,12 +902,20 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
         a.iter().copied().collect::<Vec<_>>(),
         vec![4, 5, 6, 7, 36, 37, 38, 39]
     );
-    assert_eq!(a.storage.slots(), a_slots, "只搬活元素，不动对方的死槽");
-    assert_eq!(b.storage.slots(), b_slots, "死槽留在对方那里");
+    assert_eq!(
+        a.storage.slots(),
+        a_slots,
+        "moves live elements only, leaves the other side's dead slots alone"
+    );
+    assert_eq!(
+        b.storage.slots(),
+        b_slots,
+        "dead slots stay with the other side"
+    );
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 自己装不下 ⇒ 边塞边扩容，仍然正确
+    // Cannot fit here ⇒ grows while filling, still correct
     let mut a: List<i32, S> = (0..4).collect();
     let mut b: List<i32, S> = (300..310).collect();
 
@@ -889,7 +934,7 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
     assert_invariants(&a);
     assert_invariants(&b);
 
-    // 对方是"空表但带槽位"：什么都不做（对方槽位留在对方那里）
+    // The other side is "empty but holding slots": nothing happens (its slots stay put)
     let mut a: List<i32, S> = (0..5).collect();
     let mut b: List<i32, S> = (0..5).collect();
 
@@ -907,7 +952,7 @@ fn check_append_elementwise<S: Storage<i32> + Default>() {
     assert_invariants(&b);
 }
 
-/// `append` 之后元素的所有权必须完整移交：析构次数不多不少。
+/// After `append` ownership of elements must transfer completely: drop counts neither too high nor too low.
 fn check_append_drop<S: Storage<Tracked> + Default>() {
     let count = Rc::new(Cell::new(0));
 
@@ -927,7 +972,7 @@ fn check_append_drop<S: Storage<Tracked> + Default>() {
 
         a.append(&mut b);
 
-        // 12 个元素，搬移过程中不该析构任何一个；只有被 pop 的那个已析构
+        // 12 elements; none should be dropped during the move, only the popped one is already dropped
         assert_eq!(count.get(), 1);
         assert_eq!(a.len(), 11);
 
@@ -938,7 +983,7 @@ fn check_append_drop<S: Storage<Tracked> + Default>() {
     assert_eq!(count.get(), 12);
 }
 
-/// `append_elementwise` 之后所有权同样完整移交（逐元素搬，不重复析构）。
+/// After `append_elementwise` ownership transfers completely as well (moves element by element, no double drops).
 fn check_append_elementwise_drop<S: Storage<Tracked> + Default>() {
     let count = Rc::new(Cell::new(0));
 
@@ -995,11 +1040,11 @@ fn check_traits<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 容量预留（本库扩展）
+// Capacity reservation (library extension)
 // ============================================================
 
 fn check_reserve<S: Storage<i32> + Default>() {
-    // 预留后构造，槽位地址在填满预留容量前不应改变。
+    // Built after reserving; slot addresses must not change until the reserved capacity is filled.
     let mut list: List<i32, S> = List::with_capacity(64);
 
     assert!(list.is_empty());
@@ -1013,14 +1058,14 @@ fn check_reserve<S: Storage<i32> + Default>() {
     assert_eq!(
         list.storage.layout().data,
         data_before,
-        "预留容量内不应该重新分配"
+        "should not reallocate within the reserved capacity"
     );
     assert_eq!(
         list.iter().copied().collect::<Vec<_>>(),
         (0..64).collect::<Vec<_>>()
     );
 
-    // 创建后也能 reserve。
+    // reserve works after construction too.
     let mut list: List<i32, S> = List::default();
 
     list.reserve(64);
@@ -1038,7 +1083,7 @@ fn check_reserve<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// free-list 复用
+// free-list reuse
 // ============================================================
 
 fn check_free_list_reuse<S: Storage<i32> + Default>() {
@@ -1069,7 +1114,7 @@ fn check_free_list_reuse<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 析构
+// Drop
 // ============================================================
 
 #[derive(Clone)]
@@ -1121,7 +1166,7 @@ fn check_clear<S: Storage<Tracked> + Default>() {
 
     list.clear();
 
-    // 每个元素恰好析构一次，槽位容量保留，容器回到空状态。
+    // Each element is dropped exactly once, slot capacity is retained, the container is empty again.
     assert_eq!(count.get(), 50);
     assert!(list.is_empty());
     assert!(list.front().is_none());
@@ -1129,7 +1174,7 @@ fn check_clear<S: Storage<Tracked> + Default>() {
     assert!(list.iter().next().is_none());
     assert_eq!(list.storage.slots(), slots);
 
-    // 清空后重新填充应复用槽位，不扩容。
+    // Refilling after a clear should reuse slots without growing.
     for _ in 0..50 {
         list.push_back(Tracked(Rc::clone(&count)));
     }
@@ -1143,7 +1188,7 @@ fn check_clear<S: Storage<Tracked> + Default>() {
 }
 
 // ============================================================
-// IterMut 的地址计算（元素大小/对齐与 usize 不同）
+// IterMut address computation (element size/alignment differs from usize)
 // ============================================================
 
 fn check_iter_mut_narrow<S: Storage<u8> + Default>() {
@@ -1180,10 +1225,10 @@ fn check_iter_mut_wide<S: Storage<[u64; 3]> + Default>() {
     );
 }
 
-/// free-list 复用会让 live 链在内存里变得非顺序（甚至完全逆序），
-/// 这是 `IterMut` 地址计算最容易出错的情形。
+/// free-list reuse makes the live chain non-sequential in memory (even fully reversed),
+/// which is the easiest place for `IterMut` address computation to go wrong.
 fn check_iter_mut_scrambled_chain<S: Storage<i32> + Default>() {
-    // 1) 删中间两个再插回去：链变成 3 → 0 → 1 → 4 → 5 → 6 → 7 → 2
+    // 1) Remove two in the middle and insert them back: the chain becomes 3 → 0 → 1 → 4 → 5 → 6 → 7 → 2
     let mut list: List<i32, S> = (0..8).collect();
 
     assert_eq!(list.remove(3), 3);
@@ -1213,7 +1258,7 @@ fn check_iter_mut_scrambled_chain<S: Storage<i32> + Default>() {
         vec![101, 8, 7, 6, 5, 2, 1, 201]
     );
 
-    // 2) 清空后重填：槽位按 LIFO 复用，live 链与内存顺序完全相反
+    // 2) Clear then refill: slots are reused LIFO, so the live chain is exactly reversed in memory
     let mut list: List<i32, S> = (0..8).collect();
 
     list.clear();
@@ -1236,7 +1281,7 @@ fn check_iter_mut_scrambled_chain<S: Storage<i32> + Default>() {
         vec![1, 11, 21, 31, 41, 51, 61, 71]
     );
 
-    // 3) 游标遍历同样要在乱序链上工作
+    // 3) Cursor traversal must work on a scrambled chain too
     {
         let mut cursor = list.cursor_front_mut();
 
@@ -1253,7 +1298,7 @@ fn check_iter_mut_scrambled_chain<S: Storage<i32> + Default>() {
 }
 
 // ============================================================
-// 具体类型的额外检查
+// Extra checks for concrete types
 // ============================================================
 
 #[test]
@@ -1284,7 +1329,7 @@ fn remove_out_of_bounds_panics() {
 }
 
 // ============================================================
-// 三种布局各跑一遍
+// Run once per layout
 // ============================================================
 
 #[test]
@@ -1362,7 +1407,7 @@ fn reserve_capacity() {
     each_layout!(check_reserve);
 }
 
-/// 第 0 个元素的析构会 panic，用来钉住"析构中途 panic"的行为。
+/// Element 0's drop panics, pinning down the "panic during drop" behaviour.
 struct PanicOnDrop {
     count: Rc<Cell<usize>>,
     id: usize,
@@ -1373,7 +1418,7 @@ impl Drop for PanicOnDrop {
         self.count.set(self.count.get() + 1);
 
         if self.id == 0 {
-            panic!("析构里 panic");
+            panic!("panic inside Drop");
         }
     }
 }
@@ -1392,14 +1437,14 @@ fn check_drop_panic<S: Storage<PanicOnDrop> + Default>() {
     let before = count.get();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(list)));
 
-    assert!(result.is_err(), "`T::drop` 里的 panic 必须传播出去");
-    // 按 `Vec` 的约定：头一个 panic，剩下 9 个**泄漏**（既不析构，也绝不重复析构）。
+    assert!(result.is_err(), "a panic in `T::drop` must propagate out");
+    // Per `Vec`'s convention: the first panics and the remaining 9 **leak** (neither dropped nor dropped twice).
     assert_eq!(count.get(), before + 1);
 }
 
-/// `Drop` 中途 panic 的语义：泄漏剩余元素，但绝不重复析构（照 `Vec::clear` 的约定）。
-/// 索引宽度可调：每种宽度跑同一套不变量检查。`IterMut` 的裸地址链接读按宽度分派，
-/// 4 字节那条路只有窄索引才会走到 —— 不测就是未覆盖的 UB 面。
+/// Semantics of a panic mid-`Drop`: the remaining elements leak but are never dropped twice (per `Vec::clear`'s convention).
+/// Index width is configurable: the same invariant checks run for every width. `IterMut`'s raw-address link reads dispatch by width, and
+/// the 4-byte path is only reached with narrow indices — leaving it untested would be an uncovered UB surface.
 fn check_index_width<S: Storage<i32> + Default>(count: usize) {
     let mut list: List<i32, S> = List::with_capacity(4);
 
@@ -1417,7 +1462,7 @@ fn check_index_width<S: Storage<i32> + Default>(count: usize) {
         (0..count as i32).collect::<Vec<_>>()
     );
 
-    // 删几个再插回去：free 链 + 空闲标记位都要在窄整数上正确（标记位是 Ix 的最高位）
+    // Remove a few and insert them back: both the free chain and the free bit must work on narrow integers (the bit is Ix's top bit)
     for _ in 0..count / 4 {
         let value = list.pop_front().unwrap();
 
@@ -1433,7 +1478,7 @@ fn check_index_width<S: Storage<i32> + Default>(count: usize) {
 
 #[test]
 fn index_widths_all_behave() {
-    // 上限：u8 ⇒ 128、u16 ⇒ 32768 ⇒ 这里分别用 127 / 1000 个元素
+    // Caps: u8 ⇒ 128, u16 ⇒ 32768 ⇒ 127 / 1000 elements respectively here
     check_index_width::<Split<i32, u8>>(127);
     check_index_width::<Split<i32, u16>>(1000);
     check_index_width::<Split<i32, u32>>(1000);
@@ -1447,7 +1492,7 @@ fn index_widths_all_behave() {
     check_index_width::<Nodes<i32, u32>>(1000);
 }
 
-/// 每槽字节数只由 `T` 与索引宽度决定。
+/// Bytes per slot depend only on `T` and the index width.
 #[test]
 fn per_slot_bytes_by_index_width() {
     fn per_slot<T, I: Ix>() -> usize {
@@ -1467,8 +1512,8 @@ fn per_slot_bytes_by_index_width() {
     assert_eq!(per_slot::<usize, u8>(), 10);
     assert_eq!(per_slot::<[u64; 8], u32>(), 64 + 4 + 4);
 
-    // 默认宽度是 `DefaultIx`（默认 `usize`；`u32-index` feature 下是 `u32`）⇒
-    // T=8 上每槽 = 8 + 2 * size_of::<DefaultIx>()
+    // The default width is `DefaultIx` (`usize` by default; `u32` under the
+    // `u32-index` feature) ⇒ with T=8 each slot is 8 + 2 * size_of::<DefaultIx>()
     let per_slot_default = 8 + 2 * core::mem::size_of::<DefaultIx>();
 
     let mut split: Split<usize> = Split::new();
@@ -1488,19 +1533,19 @@ fn per_slot_bytes_by_index_width() {
             "PackedLinks",
             links.layout().data_stride + links.layout().prev_stride,
         ),
-        // Nodes 的 data 就在 Node 里 ⇒ 每槽就是 Node 的大小（strides 都是它，别重复算）
+        // Nodes keeps data inside the Node ⇒ a slot is exactly the Node size (all strides equal it, don't count it twice)
         ("Nodes", nodes.layout().data_stride),
     ] {
         assert_eq!(
             bytes, per_slot_default,
-            "{name} 的默认每槽字节数（T=8, Ix=DefaultIx）"
+            "{name}: default bytes per slot (T=8, Ix=DefaultIx)"
         );
     }
 }
 
-/// `PackedLinks` 触顶同样要 panic。
+/// `PackedLinks` must panic on overflow too.
 #[test]
-#[should_panic(expected = "槽位数超出索引宽度上限")]
+#[should_panic(expected = "slot count exceeds the index width limit")]
 fn packed_links_index_caps_out() {
     let mut list = PackedLinksList::<u8, u8>::new();
 
@@ -1509,9 +1554,9 @@ fn packed_links_index_caps_out() {
     }
 }
 
-/// `Nodes` 触顶同样要 panic。
+/// `Nodes` must panic on overflow too.
 #[test]
-#[should_panic(expected = "槽位数超出索引宽度上限")]
+#[should_panic(expected = "slot count exceeds the index width limit")]
 fn nodes_index_caps_out() {
     let mut list = NodesList::<u8, u8>::new();
 
@@ -1520,9 +1565,9 @@ fn nodes_index_caps_out() {
     }
 }
 
-/// 触顶要**响亮地 panic**，不能静默截断（否则就是内存错乱）。
+/// Overflow must **panic loudly**, not silently truncate (which would corrupt memory).
 #[test]
-#[should_panic(expected = "槽位数超出索引宽度上限")]
+#[should_panic(expected = "slot count exceeds the index width limit")]
 fn narrow_index_caps_out() {
     let mut list = SplitList::<u8, u8>::new();
 
@@ -1532,10 +1577,10 @@ fn narrow_index_caps_out() {
 }
 
 // ============================================================
-// 四个"补齐"的 API：capacity/shrink、裸状态（可搬运）、游标 std 对齐
+// Four "gap-filling" APIs: capacity/shrink, raw state (relocatable), cursor std parity
 // ============================================================
 
-/// `into_raw` / `from_raw`：**不析构元素**、原样放回、顺序与槽位身份都不变。
+/// `into_raw` / `from_raw`: **no element drops**, put back as-is, order and slot identity unchanged.
 fn check_raw_roundtrip<S: Storage<i32> + Default>() {
     let mut list: List<i32, S> = List::with_capacity(8);
 
@@ -1549,7 +1594,11 @@ fn check_raw_roundtrip<S: Storage<i32> + Default>() {
     let slots_before: Vec<usize> = list.iter_slots().map(|(slot, _)| slot.to_usize()).collect();
     let free_before: Vec<usize> = list.free_slots().map(|slot| slot.to_usize()).collect();
 
-    assert_eq!(free_before.len(), 2, "两个槽位应当回到 free 链");
+    assert_eq!(
+        free_before.len(),
+        2,
+        "two slots should return to the free chain"
+    );
     assert_eq!(list.capacity(), 5);
     assert_eq!(list.len(), 3);
 
@@ -1587,8 +1636,8 @@ fn check_raw_roundtrip<S: Storage<i32> + Default>() {
     assert_invariants(&list);
 }
 
-/// `into_raw` 只释放数组、**不析构 `T`**（`Vec::into_raw_parts` 的语义）。
-// `into_raw` 的定义就是**不析构**元素（`Vec::into_raw_parts` 语义），本测试在断言这一点 ⇒ miri 的泄漏检查必然报，属预期。
+/// `into_raw` frees the array only, **without dropping `T`** (`Vec::into_raw_parts` semantics).
+// `into_raw` is defined to **not drop** elements (`Vec::into_raw_parts` semantics), and this test asserts exactly that ⇒ miri's leak check will necessarily fire, as expected.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn into_raw_does_not_drop_elements() {
@@ -1603,18 +1652,22 @@ fn into_raw_does_not_drop_elements() {
 
         let raw = list.into_raw();
 
-        assert_eq!(count.get(), 0, "`into_raw` 不该析构元素");
+        assert_eq!(count.get(), 0, "`into_raw` must not drop elements");
 
         drop(raw);
 
-        assert_eq!(count.get(), 0, "丢掉 `RawList` 也不该析构元素");
+        assert_eq!(
+            count.get(),
+            0,
+            "dropping the `RawList` must not drop elements either"
+        );
     }
 }
 
-/// 裸部件 + `from_fields` 组成一次完整的"序列化 → 反序列化"。
+/// Raw parts + `from_fields` make a complete "serialize → deserialize" round trip.
 #[test]
 fn raw_parts_roundtrip() {
-    // 1) 取状态
+    // 1) Take the state
     let mut split: SplitList<i32, u32> = SplitList::with_capacity(8);
 
     for value in [1, 2, 3, 4, 5, 6] {
@@ -1629,7 +1682,7 @@ fn raw_parts_roundtrip() {
 
     let raw = split.into_raw();
 
-    // 2) 序列化：数组逐字节拷出去 + 记住五个数字
+    // 2) Serialize: copy the arrays out byte by byte + record the five numbers
     let (data, prev, next) = raw.storage().as_parts();
     let (data, prev, next) = (data.to_vec(), prev.to_vec(), next.to_vec());
     let fields = (
@@ -1641,7 +1694,7 @@ fn raw_parts_roundtrip() {
     );
     drop(raw);
 
-    // 3) 反序列化：装回存储、再拼回 List
+    // 3) Deserialize: rebuild the storage, then reassemble the List
     let storage = unsafe { Split::<i32, u32>::from_parts(data, prev, next) };
     let (head, tail, free_head, free_tail, len) = fields;
     let list = unsafe {
@@ -1664,7 +1717,7 @@ fn raw_parts_roundtrip() {
     );
 }
 
-/// `capacity` / `shrink_to_fit`：槽位数与句柄在收缩前后**不变**。
+/// `capacity` / `shrink_to_fit`: slot count and handles are **unchanged** by shrinking.
 fn check_capacity<S: Storage<i32> + Default>() {
     let mut list: List<i32, S> = List::with_capacity(64);
 
@@ -1682,14 +1735,18 @@ fn check_capacity<S: Storage<i32> + Default>() {
 
     list.shrink_to_fit();
 
-    assert_eq!(list.capacity(), capacity, "收缩只还多余容量，槽位数不变");
+    assert_eq!(
+        list.capacity(),
+        capacity,
+        "shrinking returns only excess capacity; the slot count is unchanged"
+    );
     assert_eq!(list.len(), 9);
     assert_eq!(
         list.iter_slots()
             .map(|(s, _)| s.to_usize())
             .collect::<Vec<_>>(),
         slots_before,
-        "句柄不受收缩影响"
+        "handles are unaffected by shrinking"
     );
     assert_invariants(&list);
 }
@@ -1708,15 +1765,15 @@ fn raw_state_roundtrips() {
     check_raw_roundtrip::<Nodes<i32>>();
 }
 
-/// 游标的 std 对齐四件套，对着 `Vec` 模型比。
+/// The four cursor std-parity operations, compared against a `Vec` model.
 #[test]
 fn cursor_std_parity() {
     let mut list: SplitList<i32> = (1..=3).collect();
     let other: SplitList<i32> = (10..=12).collect();
 
-    // 游标在作用域里持有 `list` 的可变借用；出了这个块才能再直接读 `list`
+    // The cursor holds a mutable borrow of `list` for this scope; only after it can `list` be read directly again
     {
-        // splice_before：按原顺序接到 2 之前，游标仍在 2
+        // splice_before: attach in original order before 2; the cursor stays on 2
         let mut cursor = list.at(1).unwrap();
 
         cursor.splice_before(other);
@@ -1727,7 +1784,7 @@ fn cursor_std_parity() {
             vec![1, 10, 11, 12, 2, 3]
         );
 
-        // splice_after：接在 2 之后，顺序保持
+        // splice_after: attach after 2, order preserved
         let other: SplitList<i32> = (20..=21).collect();
 
         cursor.splice_after(other);
@@ -1738,7 +1795,7 @@ fn cursor_std_parity() {
             vec![1, 10, 11, 12, 2, 20, 21, 3]
         );
 
-        // remove_current_as_list：摘成单元素表，游标移到 20
+        // remove_current_as_list: detach into a single-element list; the cursor moves to 20
         let one = cursor.remove_current_as_list().unwrap();
 
         assert_eq!(one.iter().copied().collect::<Vec<_>>(), vec![2]);
@@ -1749,7 +1806,7 @@ fn cursor_std_parity() {
             vec![1, 10, 11, 12, 20, 21, 3]
         );
 
-        // split_after：20 之后的部分摘走
+        // split_after: the part after 20 is detached
         let tail = cursor.split_after();
 
         assert_eq!(tail.iter().copied().collect::<Vec<_>>(), vec![21, 3]);
@@ -1759,7 +1816,7 @@ fn cursor_std_parity() {
         );
         assert_eq!(*cursor.current().unwrap(), 20);
 
-        // split_before：20 之前的部分摘走，游标现在指着链头
+        // split_before: the part before 20 is detached; the cursor now points at the chain head
         let head = cursor.split_before();
 
         assert_eq!(
@@ -1774,11 +1831,11 @@ fn cursor_std_parity() {
     assert_invariants(&list);
 }
 
-/// `PhantomData<T>`（`List::marker`）带来的两条**编译期**性质：能编过即成立。
+/// Two **compile-time** properties brought by `PhantomData<T>` (`List::marker`): if it compiles, it holds.
 ///
-/// - 对 `T` **协变**（与三种 `Storage` 一致）⇒ `&'static` 版本能当 `&'a` 版本用；
-///   若哪天换成 `PhantomData<fn(T) -> T>` 之类，`covariant` 就编不过了。
-/// - `Send` / `Sync` 跟着 `T` 走；`List<MutexGuard<'_>, _>` 之类仍然正确地不是 `Send`。
+/// - **Covariant** in `T` (consistent with all three `Storage` types) ⇒ a `&'static` version can be used where `&'a` is expected;
+///   if it were ever changed to something like `PhantomData<fn(T) -> T>`, `covariant` would stop compiling.
+/// - `Send` / `Sync` follow `T`; something like `List<MutexGuard<'_>, _>` correctly remains non-`Send`.
 #[test]
 fn auto_traits_and_variance() {
     fn assert_send_sync<X: Send + Sync>() {}
@@ -1796,7 +1853,7 @@ fn auto_traits_and_variance() {
     assert!(covariant(list).is_empty());
 }
 
-// drop 中途 panic ⇒ 剩下的元素本来就不可达，本测试就是在断言"会漏" ⇒ miri 的泄漏检查必然报，属预期。
+// A panic mid-drop ⇒ the remaining elements are unreachable anyway, and this test asserts exactly that "they leak" ⇒ miri's leak check will necessarily fire, as expected.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn drop_panic_leaks_rest() {
@@ -1835,7 +1892,7 @@ fn iter_mut_scrambled_chain() {
 }
 
 // ============================================================
-// 两条**独特性**契约（不是性能指标，是语义保证）
+// Two **uniqueness** contracts (semantic guarantees, not performance claims)
 // ============================================================
 
 use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
@@ -1843,7 +1900,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-/// 数分配次数的全局分配器（仅测试用）。
+/// Global allocator that counts allocations (test-only).
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
@@ -1873,16 +1930,16 @@ fn count_alloc<F: FnMut()>(mut f: F) -> usize {
     ALLOCS.load(Ordering::Relaxed) - before
 }
 
-/// 规模：Miri 是解释执行 + 逐字节记录来源，1M 元素会跑成小时级；而这个属性
-/// （热路径零分配）**与规模无关**，所以 Miri 下用小规模。
+/// Scale: Miri interprets and records provenance byte by byte, so 1M elements would take hours;
+/// and this property (zero allocations on the hot path) is **scale-independent**, so a small scale is used under Miri.
 fn churn_scale() -> usize {
     if cfg!(miri) { 64 } else { 1_000_000 }
 }
 
-/// **端操作不开分配**：容量备好之后，`pop_front` / `push_back` 走的是
-/// free-list 与现成槽位，一次 `malloc` 都不发生（对照：`LinkedList` 每个元素
-/// 一次分配；"链块"每 K 个元素一次）。这是"延迟可预测"的基础，
-/// 也是 [`List::with_capacity`] + 固定 24 B/槽 的直接推论。
+/// **Endpoint operations allocate nothing**: once capacity is in place, `pop_front` / `push_back` use the
+/// free list and existing slots, so not a single `malloc` occurs (compare: `LinkedList` allocates per element;
+/// a "chain block" allocates once per K elements). This underpins "predictable latency" and
+/// follows directly from [`List::with_capacity`] plus a fixed 24 B/slot.
 fn check_churn_does_not_allocate<S: Storage<usize> + Default>() {
     let n = churn_scale();
     let mut list: List<usize, S> = List::with_capacity(n);
@@ -1898,7 +1955,7 @@ fn check_churn_does_not_allocate<S: Storage<usize> + Default>() {
         }
     });
 
-    assert_eq!(allocs, 0, "热身后 churn 不该分配内存");
+    assert_eq!(allocs, 0, "churn should not allocate after warm-up");
     assert_eq!(list.len(), n);
 }
 
@@ -1908,7 +1965,7 @@ fn churn_does_not_allocate() {
     check_churn_does_not_allocate::<PackedLinks<usize>>();
     check_churn_does_not_allocate::<Nodes<usize>>();
 
-    // 分配计数器本身的体检：std 的链表每个元素一次分配
+    // Sanity check the allocation counter itself: std's list allocates once per element
     let n = churn_scale();
     let mut ll: std::collections::LinkedList<usize> = (0..n).collect();
 
@@ -1919,10 +1976,10 @@ fn churn_does_not_allocate() {
         }
     });
 
-    assert!(allocs > 0, "分配计数器没工作");
+    assert!(allocs > 0, "the allocation counter is not working");
 
-    // 对照 2：`fast-list`（slotmap 索引）同样靠复用空槽做到零分配 ——
-    // 这条是 PERFORMANCE.md §9 功能对照表里"零分配"那一格的证据。
+    // Control 2: `fast-list` (slotmap-indexed) likewise reaches zero allocation by reusing free slots —
+    // this is the evidence for the "zero allocation" cell of the PERFORMANCE.md §9 feature comparison table.
     let mut fast: fast_list::LinkedList<usize> = fast_list::LinkedList::new();
 
     for i in 0..n {
@@ -1936,14 +1993,14 @@ fn churn_does_not_allocate() {
         }
     });
 
-    assert_eq!(allocs, 0, "fast-list 的 churn 也应当零分配");
+    assert_eq!(allocs, 0, "fast-list churn should be zero-allocation too");
 }
 
-/// **状态可搬运**：整条链的全部状态就是「每槽 `(T, prev, next)` + `head` /
-/// `tail` / `free_head` / `free_tail` / `len`」，**没有任何指针**（这正是不变量
-/// "数组里每个值都是合法下标、`NIL` 从不写进数组"的用处）。所以把原始数组原样
-/// 搬进另一个容器、不做任何链接修正，语义必须完全一致（⇒ 可以直接序列化 /
-/// 放进共享内存 / mmap，不需要指针修正）。
+/// **Relocatable state**: the whole state of the chain is just "per slot `(T, prev, next)` + `head` /
+/// `tail` / `free_head` / `free_tail` / `len`" with **no pointers at all** (this is what the invariant
+/// "every value in the array is a valid index, `NIL` is never written into the array" buys). So moving the raw arrays
+/// as-is into another container with no link fixup must yield exactly the same semantics (⇒ direct serialization /
+/// shared memory / mmap, no pointer fixup needed).
 fn check_state_is_relocatable<S: Storage<i32> + Default>() {
     let mut src: List<i32, S> = List::with_capacity(16);
 
@@ -1951,7 +2008,7 @@ fn check_state_is_relocatable<S: Storage<i32> + Default>() {
         src.push_back(v);
     }
 
-    let removed = src.remove(1); // 留一个空闲槽，逼出非空 free 链
+    let removed = src.remove(1); // leave one free slot to force a non-empty free chain
     assert_eq!(removed, 20);
     src.push_back(60);
 
@@ -1969,7 +2026,7 @@ fn check_state_is_relocatable<S: Storage<i32> + Default>() {
         })
         .collect();
 
-    // 全新的容器：只写数组与标量，不做任何"链接修正"
+    // A brand-new container: write only the arrays and scalars, no "link fixup"
     let mut dst: List<i32, S> = List::with_capacity(16);
 
     while dst.storage.slots() < slots {
@@ -2008,10 +2065,10 @@ fn state_is_relocatable() {
 }
 
 // ============================================================
-// 句柄（Slot）
+// Handles (Slot)
 // ============================================================
 
-/// 句柄的入口/出口、O(1) 增删搬移、失效语义（**不做世代校验**是可接受的取舍）。
+/// Handle entry/exit, O(1) insert/remove/move, and invalidation semantics (**no generation check** is an accepted trade-off).
 fn check_slots<S: Storage<i32> + Default>() {
     let mut list: List<i32, S> = (0..5).collect(); // 0 1 2 3 4
 
@@ -2024,26 +2081,26 @@ fn check_slots<S: Storage<i32> + Default>() {
     assert_eq!(list.pos_of(head), Some(0));
     assert_eq!(list.pos_of(tail), Some(4));
 
-    // O(1) 删除：不需要逻辑位置
+    // O(1) removal: no logical position needed
     assert_eq!(list.remove_slot(mid), Some(2));
     assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![0, 1, 3, 4]);
     assert_invariants(&list);
 
-    // 失效句柄：槽位进了 free 链 ⇒ None（且判定时**不碰**空闲槽的 MaybeUninit）
+    // Stale handle: the slot entered the free chain ⇒ None (and the check **does not touch** the free slot's MaybeUninit)
     assert!(list.cursor_at(mid).is_none());
     assert!(list.cursor_at_mut(mid).is_none());
     assert!(list.remove_slot(mid).is_none());
     assert!(list.pos_of(mid).is_none());
 
-    // 槽位被复用后，旧句柄指向**新元素**（不世代校验 = 已知取舍，这里把行为钉住）
-    list.push_back(99); // free 链 LIFO ⇒ 正好复用刚空出来的那个槽位
+    // Once the slot is reused, the old handle points at the **new element** (no generation check = known trade-off; this pins the behaviour)
+    list.push_back(99); // free chain is LIFO ⇒ it reuses exactly the slot just freed
     assert_eq!(
         list.cursor_at(mid).unwrap().current(),
         Some(&99),
-        "旧句柄会指向复用后的新元素（没有世代校验）"
+        "a stale handle points at the new element after reuse (no generation check)"
     );
 
-    // O(1) 搬移（LRU 原语）
+    // O(1) move (LRU primitive)
     assert_eq!(list.move_to_front(tail), Some(()));
     assert_eq!(
         list.iter().copied().collect::<Vec<_>>(),
@@ -2057,11 +2114,11 @@ fn check_slots<S: Storage<i32> + Default>() {
     assert_eq!(list.len(), 5);
     assert_invariants(&list);
 
-    // 首尾句柄随搬移更新
+    // Front/back handles update with the move
     assert_eq!(list.pos_of(list.front_slot().unwrap()), Some(0));
     assert_eq!(list.pos_of(list.back_slot().unwrap()), Some(4));
 
-    // 按句柄进入的游标：位置未知 ⇒ index()/move_steps 按需走链算出来
+    // Cursor entered by handle: position unknown ⇒ index()/move_steps walk the chain on demand
     let mut cursor = list.cursor_at_mut(list.front_slot().unwrap()).unwrap();
     assert_eq!(cursor.index(), Some(0));
     cursor.move_next();
@@ -2069,7 +2126,7 @@ fn check_slots<S: Storage<i32> + Default>() {
     assert!(cursor.move_steps(2));
     assert_eq!(cursor.index(), Some(3));
 
-    // 空表边界
+    // Empty-list boundary
     let empty: List<i32, S> = List::default();
     assert_eq!(empty.front_slot(), None);
     assert_eq!(empty.back_slot(), None);
@@ -2083,7 +2140,7 @@ fn slots() {
     check_slots::<Nodes<i32>>();
 }
 
-/// 句柄当别的容器的 key（LRU / `LinkedHashMap` 用法的最小验证）。
+/// Handle as a key in another container (minimal check of the LRU / `LinkedHashMap` use case).
 fn check_slot_as_key<S: Storage<i32> + Default>() {
     use std::collections::HashMap;
 
@@ -2091,7 +2148,7 @@ fn check_slot_as_key<S: Storage<i32> + Default>() {
     let mut keys: Vec<Slot> = list.iter_slots().map(|(slot, _)| slot).collect();
     let mut map: HashMap<Slot, i32> = list.iter_slots().map(|(slot, &v)| (slot, v)).collect();
 
-    // 用句柄 O(1) 改值、搬位置、删除——全程不需要"第几个"
+    // Change the value, move the position, and remove in O(1) via the handle — no "which index" anywhere
     for (i, &slot) in keys.iter().enumerate() {
         map.insert(slot, 100 + i as i32);
         assert_eq!(list.move_to_front(slot), Some(()));
@@ -2105,7 +2162,7 @@ fn check_slot_as_key<S: Storage<i32> + Default>() {
     assert_eq!(list.remove_slot(victim), Some(1));
     assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![3, 2, 0]);
 
-    // 剩下的句柄仍然有效，且能取回自己的位置
+    // The remaining handles are still valid and can recover their positions
     for &slot in &keys {
         assert!(list.cursor_at(slot).is_some());
         assert!(list.pos_of(slot).is_some());
@@ -2120,10 +2177,10 @@ fn slot_as_key() {
     check_slot_as_key::<Nodes<i32>>();
 }
 
-/// 混合 `clear` 的两条路径（`2 * len >= slots` 走扫描，否则追链）都必须：只析构
-/// **live** 元素、保持不变量、把槽位全部还回 free 链并且能全部复用。
+/// Both paths of the hybrid `clear` (`2 * len >= slots` scans, otherwise walks the chain) must: drop only
+/// **live** elements, preserve the invariants, and return every slot to the free chain so all can be reused.
 ///
-/// `SLOTS = 16` ⇒ `live >= 8` 走扫描、`live < 8` 走追链，阈值两侧都覆盖。
+/// `SLOTS = 16` ⇒ `live >= 8` scans, `live < 8` walks the chain, covering both sides of the threshold.
 fn check_clear_paths<S: Storage<Tracked> + Default>() {
     const SLOTS: usize = 16;
 
@@ -2145,15 +2202,23 @@ fn check_clear_paths<S: Storage<Tracked> + Default>() {
 
         list.clear();
         assert_eq!(list.len(), 0);
-        assert_eq!(count.get(), SLOTS, "live = {live}：每个元素恰好析构一次");
+        assert_eq!(
+            count.get(),
+            SLOTS,
+            "live = {live}: each element is dropped exactly once"
+        );
         assert_invariants(&list);
 
-        // 被清掉的槽位要能全部复用（free 链完整、顺序不重要）
+        // Every cleared slot must be reusable (free chain complete; order is irrelevant)
         for _ in 0..SLOTS {
             list.push_back(Tracked(Rc::clone(&count)));
         }
 
-        assert_eq!(list.len(), SLOTS, "live = {live}：槽位没有全部回到 free 链");
+        assert_eq!(
+            list.len(),
+            SLOTS,
+            "live = {live}: not all slots returned to the free chain"
+        );
         assert_invariants(&list);
     }
 }
@@ -2166,12 +2231,12 @@ fn clear_paths() {
 }
 
 // ============================================================
-// `clear`：**追链表** vs **顺序扫槽位 + 判 `prev` 最高位**（`List::clear` 文档引用这里）
+// `clear`: **walk the chain** vs **scan slots in order + test `prev`'s top bit** (referenced by `List::clear`'s docs)
 //
 //   cargo test --release -- --ignored --nocapture probe_clear_vs_scan
 //
-// 不复用 criterion：这里要的是一条**密度曲线**（live/slots 从 1 扫到 0.001）来找交叉点，
-// 以及两种 clear 之后 free 链的局部性差异。`Drop` 的对照在 benches 的 `clear_drop` 组。
+// Not reusing criterion: this wants a **density curve** (live/slots swept from 1 to 0.001) to find the crossover,
+// plus the free-chain locality difference between the two clears. The `Drop` comparison lives in the benches' `clear_drop` group.
 // ============================================================
 #[cfg(test)]
 mod probe_clear_vs_scan {
@@ -2182,9 +2247,9 @@ mod probe_clear_vs_scan {
     const PN: usize = 1_000_000;
     const PROUNDS: usize = 9;
 
-    /// min/9 轮；`make` 在计时之外，只计 `f`。
+    /// min over 9 rounds; `make` is outside the timing, only `f` is measured.
     fn p_bench_state<St, M: FnMut() -> St, F: FnMut(&mut St)>(mut make: M, mut f: F) -> f64 {
-        f(&mut make()); // 预热
+        f(&mut make()); // warm-up
         let mut samples = Vec::with_capacity(PROUNDS);
         for _ in 0..PROUNDS {
             let mut st = make();
@@ -2194,7 +2259,7 @@ mod probe_clear_vs_scan {
             black_box(&mut st);
         }
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        samples[0] // min：本仓库读数约定
+        samples[0] // min: this repository's reading convention
     }
 
     fn p_trim<T, S: Storage<T>>(list: &mut List<T, S>, live: usize) {
@@ -2203,14 +2268,14 @@ mod probe_clear_vs_scan {
         }
     }
 
-    /// 追链版 clear：混合实现里 `2 * len < slots` 那一支的等价物（只碰 live 槽位）。
+    /// Chain-walking clear: the equivalent of the `2 * len < slots` branch of the hybrid implementation (touches only live slots).
     ///
-    /// 探针**不能**拿 `clear()` 代表追链——它现在是混合的，密集时会走扫描。
+    /// The probe **cannot** use `clear()` to represent chain walking — it is now hybrid and scans when dense.
     fn p_walk_clear<T, S: Storage<T>>(list: &mut List<T, S>) {
         while list.len > 0 {
             let slot = list.head;
 
-            // 先取下一个：`push_free` 会改写该槽位自己的 `next`
+            // Take the next one first: `push_free` rewrites this slot's own `next`
             list.head = list.storage.next(slot);
 
             unsafe { list.storage.data_mut(slot).assume_init_drop() };
@@ -2223,9 +2288,9 @@ mod probe_clear_vs_scan {
         list.tail = NIL;
     }
 
-    /// 扫描版 clear：按内存顺序遍历**全部槽位**，用 `is_free` 判断是否 live。
-    /// 和生产代码用同一个 `push_free`（挂链头），只差 `drop_live = false` 那一档是
-    /// 探针专属（不析构，用来隔离"标志位那遍内存"的代价）。
+    /// Scanning clear: walk **all slots** in memory order, using `is_free` to tell live from free.
+    /// Uses the same `push_free` (push to the chain head) as the production code; only the `drop_live = false` variant is
+    /// probe-specific (no drops, isolating the cost of the bit-flag pass over memory).
     fn p_scan_clear<T, S: Storage<T>>(list: &mut List<T, S>, drop_live: bool) {
         let slots = list.storage.slots();
 
@@ -2246,7 +2311,7 @@ mod probe_clear_vs_scan {
         list.len = 0;
     }
 
-    /// 带 Drop glue 的 64 B 载荷（和 benches 里同构：真读一下字段，钉住析构）。
+    /// 64 B payload with Drop glue (same shape as in the benches: really read a field to pin the drop).
     struct P64([u64; 8]);
 
     impl P64 {
@@ -2286,13 +2351,13 @@ mod probe_clear_vs_scan {
             println!("--- {} ---", $label);
             println!(
                 "{:<28} {:>12} {:>12} {:>12} {:>9}",
-                "形状", "追链 live", "扫槽位", "walk/scan", "live/slots"
+                "shape", "walk live", "scan slots", "walk/scan", "live/slots"
             );
 
-            // 无 Drop glue：密度曲线
-            // 曲线是**降序**扫的 ⇒ 后赋值的密度更小；区分两个点：
-            //   `tie`   = 最小的"扫描不亏"密度（≈打平点）
-            //   `worth` = 最小的"扫描快 ≥1.5×"密度（真正值得切换的阈值）
+            // No Drop glue: density curve
+            // The curve is swept in **descending** order ⇒ later assignments have lower density;
+            // two points are tracked:
+            //   `tie`   = smallest density where scanning breaks even (≈ crossover); `worth` = smallest density where scanning is ≥1.5× faster (the threshold that genuinely justifies switching)
             let mut tie: Option<f64> = None;
             let mut worth: Option<f64> = None;
 
@@ -2334,25 +2399,25 @@ mod probe_clear_vs_scan {
 
             let show = |v: Option<f64>| match v {
                 Some(d) => format!("live/slots ≳ {d:.2}"),
-                None => "整条曲线都不划算".to_string(),
+                None => "not worth it across the whole curve".to_string(),
             };
-            println!("{:<28} ⇒ {}", "打平点", show(tie));
-            println!("{:<28} ⇒ {}\n", "值得切换（≥1.5×）", show(worth));
+            println!("{:<28} ⇒ {}", "crossover", show(tie));
+            println!("{:<28} ⇒ {}\n", "worth switching (≥1.5×)", show(worth));
 
-            // 无 glue：只扫 prev 判位、**不析构**（隔离"标志位那遍内存"的代价）
+            // No glue: only scan prev to classify, **no drops** (isolating the cost of the bit-flag pass over memory)
             let walk = p_bench_state(|| p_build_usize::<$S>(PN), |l| p_walk_clear(l));
             let scan_nodrop =
                 p_bench_state(|| p_build_usize::<$S>(PN), |l| p_scan_clear(l, false));
             println!(
                 "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
-                "dense：扫描但不析构",
+                "dense: scan without dropping",
                 walk,
                 scan_nodrop,
                 walk / scan_nodrop,
                 1.0
             );
 
-            // 带 Drop glue
+            // With Drop glue
             for &(name, live) in &[("glue dense 1M/1M", PN), ("glue 0.001 1k/1M", 1_000)] {
                 let walk = p_bench_state(|| p_build_glue::<$SG>(live), |l| p_walk_clear(l));
                 let scan = p_bench_state(
@@ -2369,8 +2434,8 @@ mod probe_clear_vs_scan {
                 );
             }
 
-            // `Drop` 的两种实现：现在（只走 live 链就地析构）对 旧（先 clear 再丢）
-            // 二阶效应：两种 clear 之后 free 链顺序不同，重填的局部性
+            // Two `Drop` implementations: current (walk the live chain, drop in place) vs old (clear first, then drop).
+            // Second-order effect: the two clears leave the free chain in different orders, affecting refill locality.
             let refill_walk = p_bench_state(
                 || {
                     let mut l = p_build_usize::<$S>(PN);
@@ -2397,7 +2462,7 @@ mod probe_clear_vs_scan {
             );
             println!(
                 "{:<28} {:>10.3} ms {:>10.3} ms {:>11.2}x {:>9.3}",
-                "重填：walk后/scan后",
+                "refill: after walk/after scan",
                 refill_walk,
                 refill_scan,
                 refill_walk / refill_scan,
@@ -2411,7 +2476,7 @@ mod probe_clear_vs_scan {
     #[test]
     #[ignore]
     fn probe_clear_vs_scan() {
-        // 先自证：扫描版的语义与 `clear` 等价（不变量 + 清空 + 可复用）
+        // Self-check first: the scanning version's semantics match `clear` (invariants + emptied + reusable)
         {
             let mut l: List<usize, Split<usize, u32>> = p_build_usize(1234);
             p_scan_clear(&mut l, true);
@@ -2425,19 +2490,19 @@ mod probe_clear_vs_scan {
                 (0..100).collect::<Vec<_>>()
             );
             assert_invariants(&l);
-            println!("扫描版自证：不变量通过、可复用\n");
+            println!("scan self-check: invariants pass, reusable\n");
         }
 
-        println!("PN = {PN} 槽位，min/{PROUNDS} 轮\n");
-        probe_layout!("Split（u32 索引）", Split<usize, u32>, Split<P64, u32>);
-        probe_layout!("Split（usize 索引 = u64）", Split<usize, usize>, Split<P64, usize>);
-        probe_layout!("PackedLinks（u32 索引）", PackedLinks<usize, u32>, PackedLinks<P64, u32>);
+        println!("PN = {PN} slots, min over {PROUNDS} rounds\n");
+        probe_layout!("Split (u32 index)", Split<usize, u32>, Split<P64, u32>);
+        probe_layout!("Split (usize index = u64)", Split<usize, usize>, Split<P64, usize>);
+        probe_layout!("PackedLinks (u32 index)", PackedLinks<usize, u32>, PackedLinks<P64, u32>);
         probe_layout!(
-            "PackedLinks（usize 索引）",
+            "PackedLinks (usize index)",
             PackedLinks<usize, usize>,
             PackedLinks<P64, usize>
         );
-        probe_layout!("Nodes（u32 索引）", Nodes<usize, u32>, Nodes<P64, u32>);
-        probe_layout!("Nodes（usize 索引）", Nodes<usize, usize>, Nodes<P64, usize>);
+        probe_layout!("Nodes (u32 index)", Nodes<usize, u32>, Nodes<P64, u32>);
+        probe_layout!("Nodes (usize index)", Nodes<usize, usize>, Nodes<P64, usize>);
     }
 }

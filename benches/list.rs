@@ -1,49 +1,57 @@
-//! 三种内存布局（`SplitList` / `PackedLinksList` / `NodesList`）与
-//! std `LinkedList`、`VecDeque`、`Vec`、以及 `fast-list`（slotmap + 世代号句柄）的横向基准。
+//! Cross-implementation benchmarks of three memory layouts (`SplitList` / `PackedLinksList` /
+//! `NodesList`) against std `LinkedList`, `VecDeque`, `Vec`, and `fast-list`
+//! (slotmap + generation handle).
 //!
-//! 三种布局是同一个泛型类型 `List<T, S>` 的不同 `Storage` 参数，所以基准体用宏生成
-//! 三种实例，不手写三份；基线各自手写。
+//! The three layouts are the same generic type `List<T, S>` with different `Storage`
+//! parameters, so the benchmark bodies generate three instances from a macro instead of
+//! three hand-written copies; the baselines are hand-written each.
 //!
-//! 运行：`cargo bench [-- <过滤正则>]`
+//! Run: `cargo bench [-- <filter regex>]`
 //!
-//! **stable 上也能编**：只有对比 std `LinkedList` **游标**的那三行
-//! （`middle_insert_remove` / `random_remove_insert` / `cursor_update` 的 `LinkedList`）
-//! 需要 `#![feature(linked_list_cursors)]`，它们由 `linked-list-cursors` feature 控制
-//! ——**该 feature 不在 `default` 里**，所以 stable 上 `cargo bench` 直接可用，
-//! nightly 上想要那三行就显式开：
+//! **Compiles on stable**: only the three rows comparing std `LinkedList` **cursors**
+//! (`middle_insert_remove` / `random_remove_insert` / `cursor_update` for `LinkedList`) need
+//! `#![feature(linked_list_cursors)]`, and they are gated behind the `linked-list-cursors`
+//! feature — **which is not in `default`** — so `cargo bench` works as-is on stable, while
+//! nightly users who want those three rows opt in explicitly:
 //!
 //! ```text
-//! cargo bench                                                    # 任何通道都能跑
-//! cargo bench --features linked-list-cursors                     # 只有 nightly 能开（要那三行对照）
+//! cargo bench                                                    # runs on any channel
+//! cargo bench --features linked-list-cursors                     # nightly only (for the three cursor rows)
 //! ```
 //!
-//! 用 feature 而不是 `build.rs` 自动探测通道，是因为这是个**库**：`build.rs` 会在每个
-//! 下游用户编译本 crate 时都跑一次，而 feature 是显式的、下游零成本，也和 `mimalloc`
-//! 的做法一致。
-//! 报告：`target/criterion/report/index.html`
+//! A feature instead of `build.rs` channel detection because this is a **library**: a
+//! `build.rs` would run for every downstream user compiling this crate, whereas a feature is
+//! explicit, costs downstream nothing, and matches what `mimalloc` does.
+//! Report: `target/criterion/report/index.html`
 //!
-//! # 读数纪律（先看这段）
+//! # Reading discipline (read this first)
 //!
-//! - **噪声底 ±5%**；`append*` / `blob_*` 这些大分配组 **±10 ~ 20%**。同一份代码在
-//!   不同时刻能漂这么多（实测 `churn` 2.80 ~ 3.01 ms），而外部基线可能纹丝不动 ⇒
-//!   判定回归要两版**交替**跑（A/B/A/B），并同时看基线漂了多少。
-//! - `end_ops` / `churn` / `append*` 量的是**分配器与内核**，不是我们的代码：`append`
-//!   同一份代码能从 2 ms 漂到 16 ms（计时区缺页 0 → 8187）。比较时看**缺页数**。
-//! - 大页只能靠环境变量（本机 THP 是 `madvise` 模式且 `nr_hugepages=0`，库内
-//!   `madvise` 时好时坏）：`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`，或 mimalloc 的
-//!   页复用 / `MIMALLOC_PURGE_DELAY=-1`。
+//! - **Noise floor ±5%**; the big-allocation groups `append*` / `blob_*` **±10 ~ 20%**. The
+//!   same code drifts that much between runs while external baselines may not move at all ⇒
+//!   to judge a regression, run the two versions **alternating** (A/B/A/B) and watch how far
+//!   the baselines drift too.
+//! - `end_ops` / `churn` / `append*` measure the **allocator and kernel**, not our code:
+//!   identical `append` code can drift from 2 ms to 16 ms (timed-region page faults 0 →
+//!   8187). Compare by **page-fault count**.
+//! - Huge pages only via environment variables (THP is in `madvise` mode here with
+//!   `nr_hugepages=0`, and the in-crate `madvise` is hit-or-miss):
+//!   `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, or mimalloc's page reuse /
+//!   `MIMALLOC_PURGE_DELAY=-1`.
 //!
-//! # 各组怎么读、数字与机制
+//! # How to read each group, numbers, mechanisms
 //!
-//! 全部在仓库根目录的 **`PERFORMANCE.md`**：三种布局的内存/地址表（实测核对）、
-//! 全套结果、`append` 两个 API 的字节对账与选型矩阵、内部探针（`clear` / `Drop` / 迭代三层 /
-//! 带宽对账），以及**已试过并否掉的优化**（分块布局、顺行位图、迭代器探路、u32 索引、
-//! `reserve`、`madvise` …），每条都带实测数字与代价。
+//! Everything is in **`PERFORMANCE.md`** at the repo root: the memory/address tables for the
+//! three layouts, the full result set, the byte reconciliation and selection matrix for the
+//! two `append` APIs, the internal probes (`clear` / `Drop` / the three iteration tiers /
+//! bandwidth reconciliation), and the **tried-and-rejected optimizations** (blocked layout,
+//! row-major bitmap, iterator lookahead, u32 index, `reserve`, `madvise` …), each with its
+//! measured numbers and cost.
 
 #![cfg_attr(feature = "linked-list-cursors", feature(linked_list_cursors))]
 
-// 全局分配器。默认是系统 malloc；`cargo bench --features mimalloc` 换成 mimalloc，
-// 便于对比"分配器是否把内存还给内核"对端操作的影响。
+// Global allocator. The system malloc by default; `cargo bench --features mimalloc` switches
+// to mimalloc, to compare the effect of "does the allocator return memory to the kernel" on
+// end operations.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -73,10 +81,11 @@ const CURSOR_UPDATE_OPS: usize = 1_000_000;
 const LARGE_N: usize = 250_000;
 
 // ============================================================
-// 我们三种布局的基准体
+// Benchmark bodies for our three layouts
 //
-// 三种布局共用一份实现（`List<T, S>`），所以基准体也用宏生成三种实例，
-// 而不是手写三份拷贝。布局只体现在 `$ty` 上。
+// The three layouts share one implementation (`List<T, S>`), so the bodies also generate
+// three instances from a macro rather than three hand-written copies. The layout is only
+// visible in `$ty`.
 // ============================================================
 
 macro_rules! bench_end_ops {
@@ -147,13 +156,13 @@ macro_rules! bench_insert_before_remove {
             let mut cursor = list.at(middle).unwrap();
 
             for i in 0..MIDDLE_OPS {
-                // 在当前位置之前插入，游标不动。
+                // Insert before the current position; the cursor does not move.
                 cursor.insert_before(black_box(i));
 
-                // 移到刚插入的节点。
+                // Move to the just-inserted node.
                 cursor.move_prev();
 
-                // 删掉它；游标回到原来的节点。
+                // Remove it; the cursor returns to the original node.
                 let value = cursor.remove_current().unwrap();
 
                 black_box(value);
@@ -164,11 +173,11 @@ macro_rules! bench_insert_before_remove {
     };
 }
 
-/// 随机位置"删一个 + 原地插回"：
-/// - `by_handle`：`cursor_at(handle)` —— **O(1)** 入口；
-/// - `by_pos`   ：`at(pos)`          —— O(N) 走链入口。
+/// Random position "remove one + insert back in place":
+/// - `by_handle`: `cursor_at(handle)` —— **O(1)** entry;
+/// - `by_pos`   : `at(pos)`          —— O(N) entry that walks the chain.
 ///
-/// 两者**做的工作完全一样**，唯一区别是进入方式。
+/// Both do **exactly the same work**; only the entry differs.
 macro_rules! bench_slot_vs_pos {
     ($by_handle:ident, $by_pos:ident, $ty:ty) => {
         fn $by_handle(list: &mut $ty, handles: &[Slot]) {
@@ -219,8 +228,8 @@ macro_rules! bench_random_remove_insert {
 
                 black_box(removed);
 
-                // 游标已指向下一个元素（删的是尾元素时为幽灵位置，
-                // insert_before 会把新元素追加到末尾）。
+                // The cursor now points at the next element (a ghost position when the
+                // removed element was the tail; insert_before then appends to the end).
                 cursor.insert_before(black_box(i));
             }
 
@@ -253,12 +262,13 @@ macro_rules! bench_cursor_update {
     };
 }
 
-/// 整块搬运：`a.append(&mut b)`（输入由 `iter_batched` 在计时区外造好）。
+/// Whole-block transfer: `a.append(&mut b)` (inputs are built outside the timed region by
+/// `iter_batched`).
 ///
-/// **返回值必须把两个链表交回去**：否则它们会在计时区内析构，而"析构一个
-/// 2M 节点的链表"会把这个基准彻底带偏（各基线的析构代价差得也很远：
-/// `LinkedList` 是 2M 次 `Box` 释放，`Vec` 是零）。交给 criterion 之后，
-/// 析构发生在计时之后。
+/// **The return value must hand both lists back**: otherwise they would be dropped inside
+/// the timed region, and dropping a 2M-node list would skew the benchmark completely (the
+/// baselines' drop costs also differ widely: `LinkedList` is 2M `Box` deallocations, `Vec`
+/// is zero). Returned to criterion, the drop happens after timing.
 macro_rules! bench_append {
     ($name:ident, $ty:ty) => {
         fn $name(mut a: $ty, mut b: $ty) -> ($ty, $ty) {
@@ -315,7 +325,7 @@ macro_rules! bench_blob_end_ops {
     };
 }
 
-// ---- 实例化（三种布局 × 12 个基准）----
+// ---- Instantiations (three layouts x 12 benchmarks) ----
 
 bench_end_ops!(
     soalist_push_back_pop_front,
@@ -387,7 +397,7 @@ bench_append!(soalist_append, SplitList<usize>);
 bench_append!(packedlist_append, PackedLinksList<usize>);
 bench_append!(aoslist_append, NodesList<usize>);
 
-// 大载荷（64 B）版本：数据拷贝占主导，布局差异才会显出来。
+// Large-payload (64 B) versions: data copying dominates, so layout differences show up.
 bench_append!(soalist_blob_append, SplitList<Blob64>);
 bench_append!(packedlist_blob_append, PackedLinksList<Blob64>);
 bench_append!(aoslist_blob_append, NodesList<Blob64>);
@@ -405,10 +415,10 @@ bench_blob_end_ops!(packedlist_blob_push_back_pop_front, PackedLinksList<Blob64>
 bench_blob_end_ops!(aoslist_blob_push_back_pop_front, NodesList<Blob64>);
 
 // ============================================================
-// 基线：std VecDeque / std LinkedList / Vec
+// Baselines: std VecDeque / std LinkedList / Vec
 // ============================================================
 
-// ---- 输入生成与游标定位 ----
+// ---- Input generation and cursor positioning ----
 
 fn next_rng(state: &mut u64) -> usize {
     // xorshift64
@@ -463,7 +473,7 @@ fn linkedlist_cursor_at(
     }
 }
 
-// ---- 端操作 ----
+// ---- End operations ----
 
 fn vecdeque_push_back_pop_front() {
     let mut deque = VecDeque::new();
@@ -513,7 +523,7 @@ fn linkedlist_push_front_pop_back() {
     }
 }
 
-// ---- 构造 ----
+// ---- Construction ----
 
 fn make_vecdeque() -> VecDeque<usize> {
     let mut deque = VecDeque::new();
@@ -539,7 +549,7 @@ fn make_vec() -> Vec<usize> {
     (0..N).collect()
 }
 
-// ---- 纯迭代 ----
+// ---- Pure iteration ----
 
 fn vecdeque_iter(deque: &VecDeque<usize>) {
     let mut sum = 0usize;
@@ -571,7 +581,7 @@ fn vec_iter(vec: &[usize]) {
     black_box(sum);
 }
 
-// ---- 中间位置访问 ----
+// ---- Middle access ----
 
 fn vecdeque_index_middle(deque: &VecDeque<usize>) {
     let mut sum = 0usize;
@@ -599,7 +609,7 @@ fn linkedlist_at_middle(list: &LinkedList<usize>) {
     black_box(sum);
 }
 
-// ---- 已知位置的局部插入/删除 ----
+// ---- Local insert/remove at a known position ----
 
 fn vecdeque_insert_remove(deque: &mut VecDeque<usize>) {
     let middle = N / 2;
@@ -630,7 +640,7 @@ fn linkedlist_insert_before_remove(list: &mut LinkedList<usize>) {
     black_box(cursor.index().unwrap());
 }
 
-// ---- 稳态 churn ----
+// ---- Steady-state churn ----
 
 fn vecdeque_churn(deque: &mut VecDeque<usize>) {
     for i in 0..CHURN_OPS {
@@ -652,7 +662,7 @@ fn linkedlist_churn(list: &mut LinkedList<usize>) {
     }
 }
 
-// ---- 随机位置删除 + 插入 ----
+// ---- Random-position remove + insert ----
 
 fn vecdeque_random_remove_insert(deque: &mut VecDeque<usize>, positions: &[usize]) {
     for (i, &pos) in positions.iter().enumerate() {
@@ -681,7 +691,7 @@ fn linkedlist_random_remove_insert(list: &mut LinkedList<usize>, positions: &[us
     black_box(list.len());
 }
 
-// ---- 已知位置读写 ----
+// ---- Read/write at a known position ----
 
 fn vecdeque_index_update(deque: &mut VecDeque<usize>) {
     let middle = N / 2;
@@ -724,7 +734,7 @@ fn linkedlist_cursor_update(list: &mut LinkedList<usize>) {
     black_box(checksum);
 }
 
-// ---- append（整块搬运）----
+// ---- append (whole-block transfer) ----
 
 fn vecdeque_append(
     mut a: VecDeque<usize>,
@@ -737,7 +747,7 @@ fn vecdeque_append(
     (a, b)
 }
 
-/// std 的 `LinkedList::append` 是 O(1) 指针拼接（不搬元素）。
+/// std's `LinkedList::append` is an O(1) pointer splice (it moves no elements).
 fn linkedlist_append(
     mut a: LinkedList<usize>,
     mut b: LinkedList<usize>,
@@ -749,7 +759,8 @@ fn linkedlist_append(
     (a, b)
 }
 
-/// `Vec` 是"整块 memcpy"的天然上限，用来标定"复制 + 修下标"有多贵。
+/// `Vec` is the natural upper bound for a "whole-block memcpy"; it calibrates how expensive
+/// "copy + fix indices" is.
 fn vec_append(mut a: Vec<usize>, mut b: Vec<usize>) -> (Vec<usize>, Vec<usize>) {
     a.append(&mut b);
 
@@ -759,7 +770,7 @@ fn vec_append(mut a: Vec<usize>, mut b: Vec<usize>) -> (Vec<usize>, Vec<usize>) 
 }
 
 // ============================================================
-// 64 字节元素
+// 64-byte elements
 // ============================================================
 
 #[derive(Clone, Copy)]
@@ -777,7 +788,7 @@ impl Blob64 {
     }
 }
 
-// ---- 64B 构造 / 迭代 / 端操作 ----
+// ---- 64B construction / iteration / end operations ----
 
 fn make_vecdeque_blob() -> VecDeque<Blob64> {
     let mut deque = VecDeque::new();
@@ -803,7 +814,7 @@ fn make_vec_blob() -> Vec<Blob64> {
     (0..LARGE_N).map(Blob64::new).collect()
 }
 
-// ---- 64B 的"有空闲槽"构造器：给 append_elementwise 用（LARGE_N 活 + LARGE_N 空闲） ----
+// ---- 64B "roomy" constructors: for append_elementwise (LARGE_N live + LARGE_N free) ----
 
 macro_rules! make_roomy_blob {
     ($name:ident, $ty:ty) => {
@@ -827,7 +838,7 @@ make_roomy_blob!(make_soalist_blob_roomy, SplitList<Blob64>);
 make_roomy_blob!(make_packedlist_blob_roomy, PackedLinksList<Blob64>);
 make_roomy_blob!(make_aoslist_blob_roomy, NodesList<Blob64>);
 
-// ---- 64B append（与 usize 版同形态：两边都由 push/collect 构造 ⇒ 目标要扩容） ----
+// ---- 64B append (same shape as the usize version: both sides built by push/collect => the target must grow) ----
 
 fn vecdeque_blob_append(
     mut a: VecDeque<Blob64>,
@@ -922,15 +933,17 @@ bench_slot_vs_pos!(
 bench_slot_vs_pos!(aoslist_by_handle, aoslist_by_pos, NodesList<usize>);
 
 // ============================================================
-// 对照组：`fast-list`（slotmap 索引 + 世代号）
+// Comparison target: `fast-list` (slotmap index + generation)
 //
-// API 形状不同，基准体单独写、不套宏：
-// - 句柄是 `LinkedListIndex`（slotmap 的 key，带世代号；`contains_key` 即 ABA 校验）；
-// - `get`/`remove`/`insert_before` 都收句柄；`nth(pos)` 是 O(N) 走链；
-// - **没有游标**：删掉一个元素后它给不出"我原来在哪"，这里只能自己从
-//   `LinkedListItem::next_index`/`prev_index` 里挑锚点接回去（我们那边游标留在原位）；
-// - `iter()` 产出 `&LinkedListItem<T>`，值在 `.value`；
-// - 没有 `append` / `move_to_front` / `move_to_back`（功能对照见 PERFORMANCE.md）。
+// The API shape differs, so its bodies are written individually rather than from a macro:
+// - the handle is a `LinkedListIndex` (a slotmap key carrying a generation; `contains_key`
+//   is the ABA check);
+// - `get`/`remove`/`insert_before` all take a handle; `nth(pos)` is an O(N) chain walk;
+// - **no cursor**: after removing an element it cannot say "where I used to be", so here we
+//   pick an anchor ourselves from `LinkedListItem::next_index`/`prev_index` to splice back
+//   (on our side the cursor stays in place);
+// - `iter()` yields `&LinkedListItem<T>`, with the value in `.value`;
+// - no `append` / `move_to_front` / `move_to_back` (functional comparison in PERFORMANCE.md).
 // ============================================================
 
 use fast_list::{LinkedList as FastList, LinkedListIndex};
@@ -1000,10 +1013,12 @@ fn fastlist_churn(list: &mut FastList<usize>) {
     }
 }
 
-/// "删一个 + 原地插回"：删掉之后用它自己给的后继（没有就用前驱）当锚点接回去。
+/// "Remove one + insert back in place": after the removal, use the successor it hands back
+/// (or the predecessor when there is none) as the anchor to splice back in.
 ///
-/// 注意这里**不能** `unwrap`：`fast-list` 的句柄带世代号，一次 `remove` + 重新插入
-/// 之后原句柄就作废了（新元素拿新世代）。基准里由调用方用 `contains_key` 先判。
+/// Note this **must not** `unwrap`: `fast-list` handles carry a generation, so after one
+/// `remove` + re-insert the original handle is invalidated (the new element gets a new
+/// generation). The benchmark caller checks with `contains_key` first.
 fn fastlist_remove_reinsert(list: &mut FastList<usize>, handle: LinkedListIndex, i: usize) {
     let Some(item) = list.remove(black_box(handle)) else {
         return;
@@ -1023,8 +1038,10 @@ fn fastlist_remove_reinsert(list: &mut FastList<usize>, handle: LinkedListIndex,
     }
 }
 
-/// 句柄入口。**每次都要 `contains_key` 校验**：上一轮的"删了又插回"已经让这批
-/// 句柄作废了，失效就得按位置重找一遍。这一步是世代号语义的真实成本，不是我们加的。
+/// Handle entry. **Every call must validate with `contains_key`**: the previous round's
+/// "remove and re-insert" has already invalidated this batch of handles, and stale ones have
+/// to be re-found by position. This step is the real cost of the generation semantics, not
+/// something we added.
 fn fastlist_by_handle(
     list: &mut FastList<usize>,
     handles: &[LinkedListIndex],
@@ -1054,10 +1071,11 @@ fn fastlist_by_pos(list: &mut FastList<usize>, positions: &[usize]) {
 // ============================================================
 
 // ============================================================
-// 索引宽度对照：`SplitList<usize, u32>` vs `SplitList<usize, usize>`
+// Index-width comparison: `SplitList<usize, u32>` vs `SplitList<usize, usize>`
 //
-// 每槽开销 = `T` + 两条链接 ⇒ `T = 8` 时 16 B vs 24 B。谁受益取决于
-// 链接数组的访存占比：走链（`at(pos)`）与迭代最明显，端操作/句柄入口最小。
+// Per-slot cost = `T` + two links => for `T = 8`, 16 B vs 24 B. Who benefits depends on the
+// share of accesses to the link arrays: chain walks (`at(pos)`) and iteration gain most, end
+// operations / handle entry least.
 // ============================================================
 
 bench_construct!(make_soa32, SplitList<usize, u32>);
@@ -1368,7 +1386,7 @@ fn append_blob(c: &mut Criterion) {
             BatchSize::PerIteration,
         )
     });
-    // 逐元素路径：目标预先有 LARGE_N 个空闲槽（它的推荐用法）
+    // Elementwise path: the target has LARGE_N free slots up front (its recommended usage)
     g.bench_function("SplitList::elementwise", |b| {
         b.iter_batched(
             || (make_soalist_blob_roomy(), make_soalist_blob()),
@@ -1448,15 +1466,15 @@ fn blob_iter(c: &mut Criterion) {
     g.finish();
 }
 
-/// 句柄入口（O(1)）vs 逻辑位置入口（O(N)）：**同一个工作**，只有入口不同。
-/// 这一组就是"要不要把 Slot 暴露出来"的量化依据。
+/// Handle entry (O(1)) vs logical-position entry (O(N)): **the same work**, only the entry
+/// differs. This group is the quantitative basis for "should `Slot` be exposed".
 fn slot_entry(c: &mut Criterion) {
     let positions = make_random_positions(N, RANDOM_OPS);
     let mut splitlist = make_soalist();
     let mut packedlinkslist = make_packedlist();
     let mut nodeslist = make_aoslist();
 
-    // 句柄在计时区外先取好（取的时候要站到那个位置，是 O(N)）
+    // Handles are fetched outside the timed region (fetching means walking to that position, O(N))
     let soa_handles: Vec<Slot> = positions
         .iter()
         .map(|&pos| splitlist.at(pos).unwrap().slot().unwrap())
@@ -1518,31 +1536,33 @@ fn blob_end_ops(c: &mut Criterion) {
 }
 
 // ============================================================
-// clear / Drop 探针
+// clear / Drop probes
 //
-// 量两件事（都是用 `iter_batched` 把"造数据/析构"挪出计时区）：
+// Two things are measured (both move construction/destruction out of the timed region with
+// `iter_batched`):
 //
-// 结论（1M 槽位、`u32` 索引）：`clear` 保留追链表。扫描版只在"没有 Drop glue 且八分满以上"
-// 才赢（满表快 7×），交叉点 `live/slots ≈ 0.10`（`Nodes` 0.27）；稀疏时慢 100× 以上
-// （1.1 µs → 0.11 ms；带 64 B glue 的稀疏 `Nodes` 2 µs → 2.7 ms）；带 Drop glue 时
-// 密集只打平。`Drop` 只走 live 链就地析构则全面胜出——无 glue 1.098 ms → 1.9 µs
-// （析构链被消掉），带 glue `Split` 2.498 → 1.889 ms（1.32×）、`Nodes` 3.569 → 2.069 ms。
-// 扫描版在**本文件里跑不了**（要碰 `List` 的私有字段），它的数字与密度曲线来自
-// `src/tests.rs::probe_clear_vs_scan`。明细见 PERFORMANCE.md §4/§5。
+// 1. `clear`: walking the free chain vs. scanning `data` in memory order and testing
+//    `is_free`. The two cost models are unrelated — the chain walk is O(live) **random**
+//    slot accesses, the scan is O(slots) **sequential** accesses. Dense rows show the upper
+//    bound, sparse rows the lower bound.
+// 2. `Drop`: destroying the whole list only needs "walk the live chain, drop in place", but
+//    it currently goes through `clear`, which also threads every slot back onto the free
+//    chain — wasted work for a structure about to be discarded.
 //
-// 注意：`clear` 现在是**混合**的（`2 * len >= slots` 走扫描，否则追链）⇒
-// `dense/*` 那几行量的是扫描、`sparse/*` 量的是追链；两种写法各自的数字看
-// `src/tests.rs::probe_clear_vs_scan`。
+// Conclusion (1M slots, `u32` index): `clear` keeps the chain walk. The scan variant only
+// wins with no Drop glue and over ~7/8 full (7x faster on a full table), crossing over at
+// `live/slots ≈ 0.10`; `Drop` that walks the live chain and drops in place wins across the
+// board. The scan variant cannot run in this file (it needs private `List` fields); its
+// numbers and density curve come from `src/tests.rs::probe_clear_vs_scan`. Details in
+// PERFORMANCE.md §4/§5.
 //
-// 1. `clear`：追链表 vs "按内存顺序扫一遍 data、用 `is_free` 判断"。
-//    两种写法的代价模型完全不同——追链表是 O(live) 次**随机**槽位访问，
-//    扫描是 O(slots) 次**顺序**访问。dense 看上限、sparse 看下限。
-// 2. `Drop`：析构整条链表本来只需要"走 live 链、就地析构"，但现在它经由
-//    `clear`，会顺带把每个槽位挂回 free 链——对一个马上要丢掉的结构是白做。
+// Note: `clear` is now **hybrid** (`2 * len >= slots` scans, otherwise walks the chain) ⇒
+// the `dense/*` rows measure the scan and the `sparse/*` rows the chain walk; see
+// `src/tests.rs::probe_clear_vs_scan` for the numbers of each.
 // ============================================================
 macro_rules! bench_clear_drop {
     ($ty:ty, $maker:ident, $dense:ident, $sparse:ident, $refill:ident, $dropper:ident) => {
-        /// 密集：`slots == len == N`。
+        /// Dense: `slots == len == N`.
         fn $dense(b: &mut Bencher) {
             b.iter_batched(
                 || $maker(),
@@ -1555,7 +1575,7 @@ macro_rules! bench_clear_drop {
             );
         }
 
-        /// 稀疏：1M 个槽位里只剩 1000 个 live（free 链上挂着 999_000 个）。
+        /// Sparse: only 1000 of 1M slots are live (999_000 sit on the free chain).
         fn $sparse(b: &mut Bencher) {
             b.iter_batched(
                 || {
@@ -1576,8 +1596,8 @@ macro_rules! bench_clear_drop {
             );
         }
 
-        /// `clear` 之后重新填满：free 链的**顺序**决定复用时的局部性。
-        /// 全程只在已分配的槽位里搬，不进分配器。
+        /// Refill after `clear`: the **order** of the free chain determines reuse locality.
+        /// Everything moves within already-allocated slots; the allocator is never entered.
         fn $refill(b: &mut Bencher) {
             b.iter_batched(
                 || {
@@ -1598,7 +1618,8 @@ macro_rules! bench_clear_drop {
             );
         }
 
-        /// 析构整条链表：理想代价 = O(live) 次就地析构，不做 free 链维护。
+        /// Destroy the whole list: ideal cost = O(live) in-place drops, no free-chain
+        /// maintenance.
         fn $dropper(b: &mut Bencher) {
             b.iter_batched(|| $maker(), drop, BatchSize::PerIteration);
         }
@@ -1630,11 +1651,10 @@ bench_clear_drop!(
     aoslist_drop
 );
 
-/// 带 Drop glue 的 64 B 载荷。
+/// 64 B payload with Drop glue.
 ///
-/// 用 `usize` 量不出 `Drop`/`clear` 的真实差别：没有 glue 时整条析构链会被
-/// LLVM 直接消掉（实测"析构 1M 个 `usize`"只要 1.86 µs）。这里让 `drop` 里
-/// 真的读一下字段，把析构钉住。
+/// `usize` cannot reveal the real difference in `Drop`/`clear`: without glue the whole drop
+/// chain is elided by LLVM. Here `drop` actually reads a field to pin the destruction down.
 struct Drop64([u64; 8]);
 
 impl Drop64 {
@@ -1757,31 +1777,32 @@ criterion_group! {
 }
 
 fn main() {
-    // 数字必须带着配置走：索引宽度决定每槽字节数（16 vs 24 B）与串行带宽类指标的走势。
+    // Numbers must travel with the configuration: index width determines bytes per slot
+    // (16 vs 24 B) and the trend of the serial-bandwidth metrics.
     println!(
-        "索引宽度：DefaultIx = u{}（{} 字节）；`u32-index` feature {}",
+        "Index width: DefaultIx = u{} ({} bytes); `u32-index` feature {}",
         core::mem::size_of::<slot_list::DefaultIx>() * 8,
         core::mem::size_of::<slot_list::DefaultIx>(),
         if cfg!(feature = "u32-index") {
-            "开"
+            "on"
         } else {
-            "关"
+            "off"
         }
     );
     println!(
-        "全局分配器：{}（`mimalloc` feature {}）",
+        "Global allocator: {} (`mimalloc` feature {})",
         if cfg!(feature = "mimalloc") {
             "mimalloc"
         } else {
-            "系统 malloc"
+            "system malloc"
         },
         if cfg!(feature = "mimalloc") {
-            "开"
+            "on"
         } else {
-            "关"
+            "off"
         }
     );
 
-    // `criterion_group!` 生成的函数自己会建 `Criterion`（含 `configure_from_args`）
+    // The function generated by `criterion_group!` builds its own `Criterion` (with `configure_from_args`)
     benches();
 }

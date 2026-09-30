@@ -1,10 +1,10 @@
 use crate::list::List;
 
-/// "逻辑位置未知"（由 [`Slot`](crate::Slot) 进入的游标）：`pos` 是走链走出来的，
-/// 句柄里没有它。需要时**按需走一趟链**把它算出来（`O(len)`）。
+/// "Logical position unknown" (a cursor entered via [`Slot`](crate::Slot)): `pos`
+/// comes from walking the chain; the handle does not carry it, so it is computed on demand (`O(len)`).
 pub(crate) const POS_UNKNOWN: usize = usize::MAX;
 
-/// 从链头走到 `slot`，数出它的逻辑位置。只给"按槽位进入"的游标兜底用。
+/// Walk from the chain head to `slot` and count out its logical position. Only a fallback for cursors entered "by slot".
 pub(crate) fn pos_of_slot<T, S: Storage<T>>(list: &List<T, S>, slot: usize) -> usize {
     let mut current = list.head;
     let mut pos = 0;
@@ -12,23 +12,23 @@ pub(crate) fn pos_of_slot<T, S: Storage<T>>(list: &List<T, S>, slot: usize) -> u
     while current != slot {
         current = list.storage.next(current);
         pos += 1;
-        debug_assert!(pos < list.len, "槽位不在 live 链上");
+        debug_assert!(pos < list.len, "slot is not on the live chain");
     }
 
     pos
 }
 use crate::storage::{NIL, Storage};
 
-/// 只读游标，对齐 `std::collections::linked_list::Cursor`。
+/// Read-only cursor, mirroring `std::collections::linked_list::Cursor`.
 ///
-/// 游标指向某个元素，或指向“幽灵”位置（`index()` / `current()` 返回
-/// `None`）。空链表上的游标永远在幽灵位置。语义是环形的：从最后一个
-/// 元素 `move_next()` 到幽灵，从幽灵 `move_next()` 到第一个元素。
+/// A cursor points at an element or at the "ghost" position (`index()` /
+/// `current()` return `None`); a cursor on an empty list is always at the ghost.
+/// Semantics are circular: `move_next()` from the last element goes to the ghost, and from the ghost to the first element.
 pub struct Cursor<'a, T, S: Storage<T>> {
     pub(crate) list: &'a List<T, S>,
-    /// 所指节点的下标；`NIL` 表示幽灵位置。
+    /// Index of the pointed-at node; `NIL` means the ghost position.
     pub(crate) slot: usize,
-    /// 逻辑位置，与 std 一样缓存下来，使 `index()` 为 O(1)。
+    /// Logical position, cached like std so that `index()` is O(1).
     pub(crate) pos: usize,
 }
 
@@ -37,10 +37,10 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         Self { list, slot, pos }
     }
 
-    /// 对齐 `Cursor::index`。幽灵位置返回 `None`。
+    /// Mirrors `Cursor::index`. Returns `None` at the ghost position.
     ///
-    /// 若这个游标是**按 [`Slot`](crate::Slot) 进入**的（`pos` 未知），这里会走一趟链
-    /// 把它算出来：`O(len)`（正常按位置进入时是 `O(1)`）。
+    /// If this cursor was **entered via [`Slot`](crate::Slot)** (`pos` unknown),
+    /// this walks the chain to compute it: `O(len)` (`O(1)` when entered normally by position).
     pub fn index(&self) -> Option<usize> {
         if self.slot == NIL {
             None
@@ -51,10 +51,10 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         }
     }
 
-    /// **本库扩展**：当前元素的稳定句柄（幽灵位置返回 `None`）。
+    /// **Library extension**: stable handle of the current element (`None` at the ghost position).
     ///
-    /// 与 [`index`](Self::index) 的区别：`index` 给**逻辑位置**（会随插删变），
-    /// `slot` 给**物理槽位**（元素存活期内不变，可存进别的容器当 key）。
+    /// Differs from [`index`](Self::index): `index` gives the **logical position**
+    /// (changes with insertions/removals); `slot` gives the **physical slot** (constant while the element is alive, usable as a key elsewhere).
     pub fn slot(&self) -> Option<crate::Slot> {
         if self.slot == NIL {
             None
@@ -63,7 +63,7 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         }
     }
 
-    /// 对齐 `Cursor::current`。幽灵位置返回 `None`。
+    /// Mirrors `Cursor::current`. Returns `None` at the ghost position.
     pub fn current(&self) -> Option<&'a T> {
         if self.slot == NIL {
             return None;
@@ -72,9 +72,9 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         Some(unsafe { self.list.storage.data(self.slot).assume_init_ref() })
     }
 
-    /// 对齐 `Cursor::peek_next`，不移动游标。
+    /// Mirrors `Cursor::peek_next`; does not move the cursor.
     pub fn peek_next(&self) -> Option<&'a T> {
-        // 空表没有下一个；已经在链尾也没有（尾的 `next` 是哑元）
+        // No next on an empty list; none at the chain tail either (the tail's `next` is a dummy link)
         if self.list.len == 0 || (self.slot != NIL && self.slot == self.list.tail) {
             return None;
         }
@@ -88,9 +88,9 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         Some(unsafe { self.list.storage.data(next).assume_init_ref() })
     }
 
-    /// 对齐 `Cursor::peek_prev`，不移动游标。
+    /// Mirrors `Cursor::peek_prev`; does not move the cursor.
     pub fn peek_prev(&self) -> Option<&'a T> {
-        // 空表没有上一个；已经在链头也没有（链头的 `prev` 是哑元）
+        // No prev on an empty list; none at the chain head either (the head's `prev` is a dummy link)
         if self.list.len == 0 || (self.slot != NIL && self.slot == self.list.head) {
             return None;
         }
@@ -104,17 +104,17 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         Some(unsafe { self.list.storage.data(prev).assume_init_ref() })
     }
 
-    /// 对齐 `Cursor::move_next`。
+    /// Mirrors `Cursor::move_next`.
     pub fn move_next(&mut self) {
         if self.list.len == 0 {
-            // 空表上永远在幽灵位置
+            // Always at the ghost position on an empty list
             self.slot = NIL;
             self.pos = 0;
         } else if self.slot == NIL {
             self.slot = self.list.head;
             self.pos = 0;
         } else if self.slot == self.list.tail {
-            // 越过链尾：进入幽灵位置
+            // Past the chain tail: enter the ghost position
             self.slot = NIL;
             self.pos = 0;
         } else {
@@ -126,7 +126,7 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         }
     }
 
-    /// 对齐 `Cursor::move_prev`。
+    /// Mirrors `Cursor::move_prev`.
     pub fn move_prev(&mut self) {
         if self.list.len == 0 {
             self.slot = NIL;
@@ -135,7 +135,7 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
             self.slot = self.list.tail;
             self.pos = self.list.len - 1;
         } else if self.slot == self.list.head {
-            // 越过链头：进入幽灵位置
+            // Past the chain head: enter the ghost position
             self.slot = NIL;
             self.pos = 0;
         } else {
@@ -147,24 +147,24 @@ impl<'a, T, S: Storage<T>> Cursor<'a, T, S> {
         }
     }
 
-    /// 对齐 `Cursor::front`。
+    /// Mirrors `Cursor::front`.
     pub fn front(&self) -> Option<&'a T> {
         self.list.front()
     }
 
-    /// 对齐 `Cursor::back`。
+    /// Mirrors `Cursor::back`.
     pub fn back(&self) -> Option<&'a T> {
         self.list.back()
     }
 
-    /// 对齐 `Cursor::as_list`。
+    /// Mirrors `Cursor::as_list`.
     pub fn as_list(&self) -> &'a List<T, S> {
         self.list
     }
 }
 
-/// 可写游标，对齐 `std::collections::linked_list::CursorMut`；
-/// 另有本库扩展 `seek` / `move_steps` / `is_head` / `is_tail`。
+/// Mutable cursor, mirroring `std::collections::linked_list::CursorMut`;
+/// additionally provides the library extensions `seek` / `move_steps` / `is_head` / `is_tail`.
 pub struct CursorMut<'a, T, S: Storage<T>> {
     pub(crate) list: &'a mut List<T, S>,
     pub(crate) slot: usize,
@@ -176,10 +176,10 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Self { list, slot, pos }
     }
 
-    /// 对齐 `CursorMut::index`。幽灵位置返回 `None`。
+    /// Mirrors `CursorMut::index`. Returns `None` at the ghost position.
     ///
-    /// 若游标是**按 [`Slot`](crate::Slot) 进入**的（`pos` 未知），会走一趟链把它算出来
-    /// （`O(len)`）。
+    /// If the cursor was **entered via [`Slot`](crate::Slot)** (`pos` unknown), this
+    /// walks the chain to compute it (`O(len)`).
     pub fn index(&self) -> Option<usize> {
         if self.slot == NIL {
             None
@@ -190,7 +190,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// **本库扩展**：当前元素的稳定句柄（幽灵位置返回 `None`）。见 [`Cursor::slot`]。
+    /// **Library extension**: stable handle of the current element (`None` at the ghost position). See [`Cursor::slot`].
     pub fn slot(&self) -> Option<crate::Slot> {
         if self.slot == NIL {
             None
@@ -199,7 +199,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::current`。幽灵位置返回 `None`。
+    /// Mirrors `CursorMut::current`. Returns `None` at the ghost position.
     pub fn current(&mut self) -> Option<&mut T> {
         if self.slot == NIL {
             return None;
@@ -208,7 +208,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(unsafe { self.list.storage.data_mut(self.slot).assume_init_mut() })
     }
 
-    /// 对齐 `CursorMut::peek_next`，不移动游标。
+    /// Mirrors `CursorMut::peek_next`; does not move the cursor.
     pub fn peek_next(&mut self) -> Option<&mut T> {
         if self.list.len == 0 || (self.slot != NIL && self.slot == self.list.tail) {
             return None;
@@ -223,7 +223,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(unsafe { self.list.storage.data_mut(next).assume_init_mut() })
     }
 
-    /// 对齐 `CursorMut::peek_prev`，不移动游标。
+    /// Mirrors `CursorMut::peek_prev`; does not move the cursor.
     pub fn peek_prev(&mut self) -> Option<&mut T> {
         if self.list.len == 0 || (self.slot != NIL && self.slot == self.list.head) {
             return None;
@@ -238,17 +238,17 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(unsafe { self.list.storage.data_mut(prev).assume_init_mut() })
     }
 
-    /// 对齐 `CursorMut::move_next`。
+    /// Mirrors `CursorMut::move_next`.
     pub fn move_next(&mut self) {
         if self.list.len == 0 {
-            // 空表上永远在幽灵位置
+            // Always at the ghost position on an empty list
             self.slot = NIL;
             self.pos = 0;
         } else if self.slot == NIL {
             self.slot = self.list.head;
             self.pos = 0;
         } else if self.slot == self.list.tail {
-            // 越过链尾：进入幽灵位置
+            // Past the chain tail: enter the ghost position
             self.slot = NIL;
             self.pos = 0;
         } else {
@@ -260,7 +260,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::move_prev`。
+    /// Mirrors `CursorMut::move_prev`.
     pub fn move_prev(&mut self) {
         if self.list.len == 0 {
             self.slot = NIL;
@@ -269,7 +269,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
             self.slot = self.list.tail;
             self.pos = self.list.len - 1;
         } else if self.slot == self.list.head {
-            // 越过链头：进入幽灵位置
+            // Past the chain head: enter the ghost position
             self.slot = NIL;
             self.pos = 0;
         } else {
@@ -281,16 +281,16 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::insert_before`。幽灵位置插入到末尾。游标不动
-    /// （仍指向原节点）。
+    /// Mirrors `CursorMut::insert_before`. At the ghost position, inserts at the
+    /// back. The cursor does not move (it still points at the original node).
     pub fn insert_before(&mut self, item: T) {
         let new = self.list.alloc_slot(item);
 
         if self.slot == NIL {
-            // 幽灵位置：追加到末尾
+            // Ghost position: append at the back
             self.list.insert_back(new);
         } else if self.slot == self.list.head {
-            // 插在链头之前：新节点成为链头（原链头的 `prev` 是哑元，不能用）
+            // Insert before the chain head: the new node becomes the head (the old head's `prev` is a dummy link and cannot be used)
             self.list.insert_front(new);
 
             if self.pos != POS_UNKNOWN {
@@ -307,15 +307,15 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::insert_after`。幽灵位置插入到最前。游标不动。
+    /// Mirrors `CursorMut::insert_after`. At the ghost position, inserts at the front. The cursor does not move.
     pub fn insert_after(&mut self, item: T) {
         let new = self.list.alloc_slot(item);
 
         if self.slot == NIL {
-            // 幽灵位置：插到最前（空表时也是这一支）
+            // Ghost position: insert at the front (this branch also covers an empty list)
             self.list.insert_front(new);
         } else if self.slot == self.list.tail {
-            // 插在链尾之后：新节点成为链尾（原链尾的 `next` 是哑元）
+            // Insert after the chain tail: the new node becomes the tail (the old tail's `next` is a dummy link)
             self.list.insert_back(new);
         } else {
             let next = self.list.storage.next(self.slot);
@@ -324,11 +324,11 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::remove_current_as_list`：把当前元素摘下来、当成一条**单元素链表**返回
-    /// （游标语义与 [`remove_current`](Self::remove_current) 一致）。
+    /// Mirrors `CursorMut::remove_current_as_list`: detaches the current element and
+    /// returns it as a **single-element list** (cursor semantics match [`remove_current`](Self::remove_current)).
     ///
-    /// 与 std 的差别：std 把**节点本身**接过去（`O(1)`、句柄不变），这里是"摘下来再
-    /// `push_back` 到新表" ⇒ 元素拿到**新槽位**，旧句柄作废。
+    /// Differs from std: std splices the **node itself** over (`O(1)`, handle unchanged),
+    /// whereas here the element is detached and `push_back`ed into a new list ⇒ it gets a **new slot** and the old handle is invalidated.
     pub fn remove_current_as_list(&mut self) -> Option<List<T, S>>
     where
         S: Default,
@@ -342,31 +342,31 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(out)
     }
 
-    /// 对齐 `CursorMut::splice_before`：把 `list` 的元素**按原顺序**接到当前元素之前
-    /// （幽灵位置 = 追加到末尾）。
+    /// Mirrors `CursorMut::splice_before`: attaches the elements of `list` **in their
+    /// original order** before the current element (ghost position = append at the back).
     ///
-    /// 与 std 的差别：std 是 `O(1)` 搬链（还要求两条链同分配器），这里是逐个
-    /// `insert_before`，`O(list.len())`，且元素拿到**本表的新槽位**（旧句柄作废）。
+    /// Differs from std: std moves the chain in `O(1)` (and requires a shared allocator),
+    /// whereas here each element is `insert_before`d, `O(list.len())`, and gets a **new slot in this list** (old handles invalidated).
     pub fn splice_before(&mut self, list: List<T, S>) {
         for value in list {
             self.insert_before(value);
         }
     }
 
-    /// 对齐 `CursorMut::splice_after`：接到当前元素之后，**顺序保持**。
+    /// Mirrors `CursorMut::splice_after`: attaches after the current element, **order preserved**.
     ///
-    /// （`insert_after` 每次都紧贴游标插，所以逆序喂进去才等于把 `list` 原样接在后面。）
+    /// (`insert_after` always inserts right next to the cursor, so feeding elements in reverse yields `list` appended as-is.)
     pub fn splice_after(&mut self, list: List<T, S>) {
         for value in list.into_iter().rev() {
             self.insert_after(value);
         }
     }
 
-    /// 对齐 `CursorMut::split_before`：把当前元素**之前**的部分摘成一条新链表；游标留在
-    /// 剩下的表头（原当前元素成为链头）。幽灵位置（尾部）⇒ 整条表都摘走。
+    /// Mirrors `CursorMut::split_before`: detaches the part **before** the current element
+    /// into a new list; the cursor stays on the head of the remainder (the original current element becomes the head). Ghost position (the back) ⇒ the whole list is detached.
     ///
-    /// **复杂度不一样**：std 是 `O(1)`（切指针），我们是 `O(pos)` —— 槽位同处一块存储，
-    /// 摘一半必须搬元素；**搬走的元素拿到新表的槽位，旧句柄作废**。
+    /// **Different complexity**: std is `O(1)` (pointer split), ours is `O(pos)` — slots live in one contiguous storage, so detaching half requires moving
+    /// elements; **moved elements get slots in the new list and old handles are invalidated**.
     pub fn split_before(&mut self) -> List<T, S>
     where
         S: Default,
@@ -376,7 +376,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         let mut out = List::default();
 
         for _ in 0..at {
-            // `at <= len` 由 `index()` 保证
+            // `at <= len` is guaranteed by `index()`
             let value = self.list.pop_front().expect("at <= len");
 
             out.push_back(value);
@@ -385,15 +385,15 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         if self.slot == NIL {
             self.pos = 0;
         } else if self.pos != POS_UNKNOWN {
-            // 当前元素现在是链头
+            // The current element is now the chain head
             self.pos = 0;
         }
 
         out
     }
 
-    /// 对齐 `CursorMut::split_after`：把当前元素**之后**的部分摘成一条新链表
-    /// （游标与剩余部分不动）。复杂度同样是 `O(len - pos)`，不是 std 的 `O(1)`。
+    /// Mirrors `CursorMut::split_after`: detaches the part **after** the current
+    /// element into a new list (the cursor and the remainder stay put). Complexity is likewise `O(len - pos)`, not std's `O(1)`.
     pub fn split_after(&mut self) -> List<T, S>
     where
         S: Default,
@@ -406,8 +406,8 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         self.list.split_off(at)
     }
 
-    /// 对齐 `CursorMut::remove_current`：返回被删元素，游标移到下一个
-    /// （删的是尾元素则移到幽灵位置）。幽灵位置返回 `None`。
+    /// Mirrors `CursorMut::remove_current`: returns the removed element and moves the
+    /// cursor to the next one (to the ghost position if the tail was removed). Returns `None` at the ghost position.
     pub fn remove_current(&mut self) -> Option<T> {
         if self.slot == NIL {
             return None;
@@ -415,7 +415,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
 
         let slot = self.slot;
         let next = self.list.storage.next(slot);
-        // 摘之前判断：摘掉链尾之后 `tail` 就变了
+        // Check before detaching: `tail` changes once the chain tail is removed
         let was_tail = slot == self.list.tail;
 
         let value = self.list.unlink_slot(slot);
@@ -430,7 +430,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(value)
     }
 
-    /// 对齐 `CursorMut::push_front`。游标指向的节点不变。
+    /// Mirrors `CursorMut::push_front`. The node the cursor points at is unchanged.
     pub fn push_front(&mut self, item: T) {
         self.list.push_front(item);
 
@@ -439,12 +439,12 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         }
     }
 
-    /// 对齐 `CursorMut::push_back`。游标指向的节点不变。
+    /// Mirrors `CursorMut::push_back`. The node the cursor points at is unchanged.
     pub fn push_back(&mut self, item: T) {
         self.list.push_back(item);
     }
 
-    /// 对齐 `CursorMut::pop_front`。若游标原本指向队首，则移到新队首。
+    /// Mirrors `CursorMut::pop_front`. If the cursor pointed at the front, it moves to the new front.
     pub fn pop_front(&mut self) -> Option<T> {
         let front = self.list.head;
         let value = self.list.pop_front()?;
@@ -461,7 +461,7 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(value)
     }
 
-    /// 对齐 `CursorMut::pop_back`。若游标原本指向队尾，则移到幽灵位置。
+    /// Mirrors `CursorMut::pop_back`. If the cursor pointed at the back, it moves to the ghost position.
     pub fn pop_back(&mut self) -> Option<T> {
         let back = self.list.tail;
         let value = self.list.pop_back()?;
@@ -474,42 +474,42 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         Some(value)
     }
 
-    /// 对齐 `CursorMut::front`。
+    /// Mirrors `CursorMut::front`.
     pub fn front(&self) -> Option<&T> {
         self.list.front()
     }
 
-    /// 对齐 `CursorMut::front_mut`。
+    /// Mirrors `CursorMut::front_mut`.
     pub fn front_mut(&mut self) -> Option<&mut T> {
         self.list.front_mut()
     }
 
-    /// 对齐 `CursorMut::back`。
+    /// Mirrors `CursorMut::back`.
     pub fn back(&self) -> Option<&T> {
         self.list.back()
     }
 
-    /// 对齐 `CursorMut::back_mut`。
+    /// Mirrors `CursorMut::back_mut`.
     pub fn back_mut(&mut self) -> Option<&mut T> {
         self.list.back_mut()
     }
 
-    /// 对齐 `CursorMut::as_cursor`。
+    /// Mirrors `CursorMut::as_cursor`.
     pub fn as_cursor(&self) -> Cursor<'_, T, S> {
         Cursor::at(self.list, self.slot, self.pos)
     }
 
-    /// 对齐 `CursorMut::as_list`。
+    /// Mirrors `CursorMut::as_list`.
     pub fn as_list(&self) -> &List<T, S> {
         self.list
     }
 
     // --------------------------------------------------------
-    // 本库扩展（std 没有）
+    // Library extensions (absent from std)
     // --------------------------------------------------------
 
-    /// **本库扩展**：移到第 `pos` 个元素，越界返回 `false` 且游标不动。
-    /// O(min(pos, len - 1 - pos))。
+    /// **Library extension**: move to the `pos`-th element; out of bounds returns
+    /// `false` and leaves the cursor unmoved. `O(min(pos, len - 1 - pos))`.
     pub fn seek(&mut self, pos: usize) -> bool {
         if pos >= self.list.len {
             return false;
@@ -521,9 +521,9 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         true
     }
 
-    /// **本库扩展**：相对移动 `offset` 步，越界返回 `false` 且游标不动。
-    /// O(|offset|)；但若游标是**按 [`Slot`](crate::Slot) 进入**的（位置未知），
-    /// 会先走一趟链算出当前位置：`O(len + |offset|)`。
+    /// **Library extension**: move `offset` steps relative; out of bounds returns
+    /// `false` and leaves the cursor unmoved. `O(|offset|)`; but if the cursor was
+    /// **entered via [`Slot`](crate::Slot)** (position unknown), it first walks the chain to find the current position: `O(len + |offset|)`.
     pub fn move_steps(&mut self, offset: isize) -> bool {
         if self.slot == NIL {
             return false;
@@ -544,12 +544,12 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
         true
     }
 
-    /// **本库扩展**：是否指向队首元素。O(1)。
+    /// **Library extension**: whether it points at the front element. `O(1)`.
     pub fn is_head(&self) -> bool {
         self.slot != NIL && self.slot == self.list.head
     }
 
-    /// **本库扩展**：是否指向队尾元素。O(1)。
+    /// **Library extension**: whether it points at the back element. `O(1)`.
     pub fn is_tail(&self) -> bool {
         self.slot != NIL && self.slot == self.list.tail
     }

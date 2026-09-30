@@ -6,66 +6,68 @@ use crate::iter::{IntoIter, Iter, IterMut};
 use crate::slot::Slot;
 use crate::storage::{NIL, Nodes, PackedLinks, Split, Storage};
 
-/// 双向链表：`Vec` 下标 + free-list 的实现，内存布局由 `S` 决定。
+/// Doubly linked list: `Vec` indices + a free list; the memory layout is chosen by `S`.
 ///
-/// 见 crate 文档里的三个别名 [`SplitList`](crate::SplitList) /
-/// [`PackedLinksList`](crate::PackedLinksList) / [`NodesList`](crate::NodesList)。
+/// See the three aliases in the crate docs: [`SplitList`](crate::SplitList) /
+/// [`PackedLinksList`](crate::PackedLinksList) / [`NodesList`](crate::NodesList).
 ///
-/// # 数组里没有哨兵值
+/// # No sentinel values in the arrays
 ///
-/// `prev` / `next` 数组里**每个值都是合法槽位下标**。两条链的两端是"哑元"：
-/// 链头节点的 `prev`、链尾节点的 `next` 没人读，但它们同样是合法下标（新槽位
-/// 初始化为指向自己的自环，之后可能留着一个过期的合法下标）。
-/// [`NIL`] 只作为标量参数/游标 tag 使用，**永远不写进数组**。
+/// Every value in the `prev` / `next` arrays is a **valid slot index**. The ends of both
+/// chains are "dummy" links: the head node's `prev` and the tail node's `next` are never
+/// read, but they are still valid indices (a fresh slot is initialized to a self-loop and
+/// may later keep a stale but valid index). `NIL` is used only as a scalar argument /
+/// cursor tag; it is **never written into an array**.
 ///
-/// 这一点是 [`append`](List::append) 的地基：搬过来的整段下标可以无条件
-/// `+= base`，不需要逐元素判断"这是不是哨兵"。
+/// This is what [`append`](List::append) rests on: a whole relocated run of indices can be
+/// `+= base` unconditionally, with no per-element "is this a sentinel?" test.
 ///
-/// # 字段的空态
+/// # Empty state of the fields
 ///
-/// **四个端点字段在链为空时都归位 [`NIL`]**：`head` / `tail` 由 `len == 0`
-/// 触发，`free_head` / `free_tail` 由"free 链变空"触发。于是"空不空"就是读
-/// 一个字段（1 次 load + 比较），而不是算 `storage.slots() - len`（2 次 load +
-/// 减法）——后者每次 free/alloc 都跑，`churn` 基准上实测慢 3~6%（三个布局
-/// 一致，对照组反向漂移）。归位本身只在"变空"那一次写两个字段，很便宜。
+/// **All four endpoint fields reset to `NIL` when their chain is empty**: `head` / `tail`
+/// when `len == 0`, `free_head` / `free_tail` when the free chain empties. So "is it empty?"
+/// is one field load plus a comparison, instead of `storage.slots() - len` (two loads plus a
+/// subtraction) — the latter runs on every free/alloc and is measurably slower on the `churn`
+/// benchmark. The reset itself is cheap: it writes two fields only on the transition to empty.
 ///
-/// # 链表形状
+/// # Shape of the chains
 ///
-/// 单向游走一条链必须**按个数**，不能"走到 NIL 为止"（两端的哑元不是 NIL）。
-/// [`Iter`] / [`IterMut`] 本来就用 `remaining` 计数；`retain` / `clear` 也按
-/// `len` 收尾。
+/// Walking a chain in one direction must be **count-driven**, not "walk until NIL" (the dummy
+/// links at the ends are not NIL). [`Iter`] / [`IterMut`] already count down `remaining`;
+/// `retain` / `clear` also finish by `len`.
 pub struct List<T, S: Storage<T>> {
-    /// 链头；空表时是 [`NIL`]。
+    /// Head of the live chain; [`NIL`] when empty.
     pub(crate) head: usize,
-    /// 链尾；空表时是 [`NIL`]。
+    /// Tail of the live chain; [`NIL`] when empty.
     pub(crate) tail: usize,
-    /// free 链头；空闲数为 0 时无意义。
+    /// Head of the free chain; meaningless when the free count is 0.
     pub(crate) free_head: usize,
-    /// free 链尾；空闲数为 0 时无意义。只在"空链变非空"时更新。
+    /// Tail of the free chain; meaningless when the free count is 0. Updated only on the empty→non-empty transition.
     pub(crate) free_tail: usize,
-    /// live 元素个数。
+    /// Number of live elements.
     pub(crate) len: usize,
     pub(crate) storage: S,
-    /// 只为"用上 `T`"而存在：`List` 是对**任意** `S: Storage<T>` 定义的，而 `T` 只出现在
-    /// 这条 bound 里——Rust **不把 where 子句里的出现算作"被使用"**，删掉这个字段就是
-    /// `error[E0392]: type parameter `T` is never used`（实测；注意 `SplitList<T> = List<T, Split<T>>`
-    /// 这种**具体别名**里 `T` 会经由 `Split<T>` 进到字段类型，所以别名不受影响，受影响的是
-    /// 泛型定义本身）。
+    /// Exists only to "use" `T`: `List` is defined for **any** `S: Storage<T>`, and `T`
+    /// appears only in that bound — Rust **does not count occurrences in where-clauses as a
+    /// use**, so removing this field gives `error[E0392]: type parameter `T` is never used`.
+    /// (Concrete aliases like `SplitList<T> = List<T, Split<T>>` are unaffected, since there `T`
+    /// reaches a field type through `Split<T>`; what is affected is the generic definition itself.)
     ///
-    /// 选 `PhantomData<T>` 而不是别的 marker，是因为它的含义恰好与真实情况一致：
+    /// `PhantomData<T>` is chosen over any other marker because its meaning happens to match
+    /// reality exactly:
     ///
-    /// - **拥有 `T`**：`List<T, S>` 析构时确实会析构 `T`（[`Drop`](List#impl-Drop) 走 live 链
-    ///   逐个 `assume_init_drop`），dropck 需要知道这一点；
-    /// - **对 `T` 协变**：与三种 `Storage`（`Vec<MaybeUninit<T>>` / `Link<T>` / `Node<T>`）一致
-    ///   ⇒ `SplitList<&'static str>` 能当 `SplitList<&'a str>` 用；
-    /// - **auto traits 跟着 `T`**：`List<T, S>: Send` 当且仅当 `T: Send`（`Sync` 同理）。
+    /// - **Owns `T`**: dropping a `List<T, S>` does drop `T` ([`Drop`](List#impl-Drop) walks the
+    ///   live chain calling `assume_init_drop`), and dropck needs to know that;
+    /// - **Covariant in `T`**: matching the three `Storage` types (`Vec<MaybeUninit<T>>` /
+    ///   `Link<T>` / `Node<T>`) ⇒ `SplitList<&'static str>` can be used as `SplitList<&'a str>`;
+    /// - **auto traits follow `T`**: `List<T, S>: Send` iff `T: Send` (same for `Sync`).
     ///
-    /// 后两条有编译期测试（`tests::auto_traits_and_variance`）。
+    /// The last two are covered by a compile-time test (`tests::auto_traits_and_variance`).
     marker: PhantomData<T>,
 }
 
 impl<T, I: crate::Ix> List<T, Split<T, I>> {
-    /// 空链表（Split 布局；索引宽度由 `Split` 的第二个参数决定）。
+    /// Empty list (Split layout; the index width comes from `Split`'s second parameter).
     pub const fn new() -> Self {
         Self {
             storage: Split::new(),
@@ -80,7 +82,7 @@ impl<T, I: crate::Ix> List<T, Split<T, I>> {
 }
 
 impl<T, I: crate::Ix> List<T, PackedLinks<T, I>> {
-    /// 空链表（PackedLinks 布局；索引宽度由 `PackedLinks` 的第二个参数决定）。
+    /// Empty list (PackedLinks layout; the index width comes from `PackedLinks`'s second parameter).
     pub const fn new() -> Self {
         Self {
             storage: PackedLinks::new(),
@@ -95,7 +97,7 @@ impl<T, I: crate::Ix> List<T, PackedLinks<T, I>> {
 }
 
 impl<T, I: crate::Ix> List<T, Nodes<T, I>> {
-    /// 空链表（Nodes 布局；索引宽度由 `Nodes` 的第二个参数决定）。
+    /// Empty list (Nodes layout; the index width comes from `Nodes`'s second parameter).
     pub const fn new() -> Self {
         Self {
             storage: Nodes::new(),
@@ -110,10 +112,11 @@ impl<T, I: crate::Ix> List<T, Nodes<T, I>> {
 }
 
 impl<T, S: Storage<T> + Default> List<T, S> {
-    /// **本库扩展**：预留 `capacity` 个槽位的容量后创建空链表。
+    /// **Library extension**: create an empty list after reserving capacity for `capacity` slots.
     ///
-    /// 槽位在**连续内存**里，所以预留能避免构造期的反复 realloc
-    /// （对 Split 布局尤其明显：一次预留省掉三个数组的 3×扩容）。
+    /// Slots live in **contiguous memory**, so reserving up front avoids repeated reallocation
+    /// during construction (especially for the Split layout: one reserve replaces three growth
+    /// steps across the three arrays).
     pub fn with_capacity(capacity: usize) -> Self {
         let mut list = Self::default();
 
@@ -125,49 +128,53 @@ impl<T, S: Storage<T> + Default> List<T, S> {
 
 impl<T, S: Storage<T>> List<T, S> {
     // --------------------------------------------------------
-    // 基本查询
+    // Queries
     // --------------------------------------------------------
 
-    /// 元素个数。
+    /// Number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// 已分配的槽位总数（live + free）。`len() <= capacity()`，差值是空闲槽数。
+    /// Total number of allocated slots (live + free). `len() <= capacity()`; the difference is
+    /// the free slot count.
     ///
-    /// 和 `Vec::capacity` 一样是"不会重新分配就能放的槽位数"，但语义是**槽位**而不是元素：
-    /// 槽位会被 free 链复用，所以 `capacity()` 在 `push`/`pop` 之间不会变。
+    /// Like `Vec::capacity`, this is "how many slots fit without reallocating", but the unit is
+    /// **slots**, not elements: slots are reused through the free chain, so `capacity()` does not
+    /// change across `push`/`pop`.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.storage.slots()
     }
 
-    /// 把底层 `Vec` 的**多余容量**还给分配器（`Vec::shrink_to_fit`）。
+    /// Return the **excess capacity** of the underlying `Vec` to the allocator
+    /// (`Vec::shrink_to_fit`).
     ///
-    /// **不是** `Vec::shrink_to_fit` 的语义：那里会缩到 `len()`，而这里**槽位数不变**
-    /// —— 空闲槽是 free 链的一部分，也是 [`Slot`](crate::Slot) 句柄指向的东西，
-    /// 丢掉它们会让句柄失效、把链打断。所以这条只是把"已分配但没用上的容量"还给分配器。
+    /// **Not** the semantics of `Vec::shrink_to_fit`: that shrinks to `len()`, while here the
+    /// **slot count is unchanged** — free slots are part of the free chain and are what
+    /// [`Slot`](crate::Slot) handles point at; discarding them would invalidate handles and
+    /// break the chains. So this only returns capacity that was allocated but never used.
     pub fn shrink_to_fit(&mut self) {
         self.storage.shrink_to_fit();
     }
 
-    /// 是否为空。
+    /// Whether the list is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// **本库扩展**（std 的链表没有容量概念）：预留 `additional` 个槽位的容量。
+    /// **Library extension** (std's linked list has no capacity concept): reserve capacity for `additional` slots.
     pub fn reserve(&mut self, additional: usize) {
         self.storage.reserve(additional);
     }
 
     // --------------------------------------------------------
-    // 内部：节点操作
+    // Internals: node operations
     // --------------------------------------------------------
 
-    /// 夹在 `prev` 与 `next` 之间插入 `pos`（两者都是真实邻居）。
+    /// Insert `pos` between `prev` and `next` (both are real neighbors).
     #[inline]
     pub(crate) fn insert_between(&mut self, pos: usize, prev: usize, next: usize) {
         self.storage.set_next(prev, pos);
@@ -176,11 +183,11 @@ impl<T, S: Storage<T>> List<T, S> {
         self.storage.set_next(pos, next);
     }
 
-    /// 把 `pos` 插成链头。调用前 `pos` 已经算进 `len`（[`alloc_slot`](Self::alloc_slot) 干过）。
+    /// Insert `pos` as the head. The caller has already counted `pos` in `len` ([`alloc_slot`](Self::alloc_slot) did).
     #[inline]
     pub(crate) fn insert_front(&mut self, pos: usize) {
         if self.len == 1 {
-            // 原本是空表：两条链接都是哑元（自环）
+            // Was empty: both links are dummy (self-loops)
             self.storage.set_prev(pos, pos);
             self.storage.set_next(pos, pos);
             self.head = pos;
@@ -190,15 +197,15 @@ impl<T, S: Storage<T>> List<T, S> {
 
             self.storage.set_prev(head, pos);
             self.storage.set_next(pos, head);
-            // 链头的 `prev` 是哑元（没人读它指向谁），但**必须写**：它同时是
-            // "槽位是 live 的"标记位所在位置，留着 free 链上的旧值会让这个
-            // 新链头看起来还是空闲的。
+            // The head's `prev` is a dummy link (nobody reads where it points), but it
+            // **must** be written: it also holds the "slot is live" mark bit, and leaving the
+            // old free-chain value would make this new head look free.
             self.storage.set_prev(pos, pos);
             self.head = pos;
         }
     }
 
-    /// 把 `pos` 插成链尾。
+    /// Insert `pos` as the tail.
     #[inline]
     pub(crate) fn insert_back(&mut self, pos: usize) {
         if self.len == 1 {
@@ -215,14 +222,14 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// 从 free 链头摘一个槽位。调用前 free 链必须非空。
+    /// Detach a slot from the head of the free chain. The free chain must be non-empty on entry.
     #[inline]
     fn pop_free(&mut self) -> usize {
         let slot = self.free_head;
         let next = self.storage.next(slot);
 
         if next == slot {
-            // 只剩它一个（自环终止）⇒ 链空了：归位
+            // Only one left (self-loop terminates) ⇒ the chain is empty: reset
             self.free_head = NIL;
             self.free_tail = NIL;
         } else {
@@ -232,14 +239,14 @@ impl<T, S: Storage<T>> List<T, S> {
         slot
     }
 
-    /// 把槽位挂回 free 链头。
+    /// Push a slot back onto the head of the free chain.
     #[inline]
     pub(crate) fn push_free(&mut self, slot: usize) {
-        // 唯一需要显式改标记位的地方：从这里起它不再是 live 槽位
+        // The one place that must explicitly set the mark bit: from here on it is no longer a live slot
         self.storage.mark_free(slot);
 
         if self.free_head == NIL {
-            // 原本是空链：它同时也是链尾，`next` 写自环（NIL 决不能进数组）
+            // Was an empty chain: it is also the tail, so write a self-loop into `next` (NIL must never enter an array)
             self.free_tail = slot;
             self.storage.set_next(slot, slot);
         } else {
@@ -271,7 +278,7 @@ impl<T, S: Storage<T>> List<T, S> {
         self.push_free(slot);
 
         if self.len == 0 {
-            // 空表：端点归位（读 `head`/`tail` 的地方都能沿用旧形状）
+            // Empty list: reset the endpoints (readers of `head`/`tail` can keep the old shape)
             self.head = NIL;
             self.tail = NIL;
         }
@@ -279,16 +286,16 @@ impl<T, S: Storage<T>> List<T, S> {
         value
     }
 
-    /// 把 live 槽位从链上摘下来（**不改 `len`、不回收**）。两端都可能是链头 / 链尾，
-    /// 所以要判断。给"移动元素"（[`move_to_front`](Self::move_to_front)）与
-    /// `unlink_slot` 共用。
+    /// Detach a live slot from the chain (**does not touch `len` or recycle it**). Either end may
+    /// be the head / tail, so both are checked. Shared by element moves
+    /// ([`move_to_front`](Self::move_to_front)) and `unlink_slot`.
     #[inline]
     fn detach(&mut self, slot: usize) {
         let prev = self.storage.prev(slot);
         let next = self.storage.next(slot);
 
         if slot == self.head {
-            // 空表时会被 `free_slot` 归位成 NIL
+            // Reset to NIL by `free_slot` when the list becomes empty
             self.head = next;
         } else {
             self.storage.set_next(prev, next);
@@ -301,14 +308,14 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// 摘掉一个 live 节点并回收它。
+    /// Detach a live node and recycle it.
     #[inline]
     pub(crate) fn unlink_slot(&mut self, slot: usize) -> T {
         self.detach(slot);
         self.free_slot(slot)
     }
 
-    /// 句柄校验：在范围内**且**不是空闲槽。**不碰 `data`**（空闲槽的 `data` 未初始化）。
+    /// Handle validation: in range **and** not a free slot. **Does not touch `data`** (a free slot's `data` is uninitialized).
     #[inline]
     fn live_slot(&self, slot: Slot) -> Option<usize> {
         let slot = slot.0;
@@ -316,7 +323,7 @@ impl<T, S: Storage<T>> List<T, S> {
         (slot < self.storage.slots() && !self.storage.is_free(slot)).then_some(slot)
     }
 
-    /// 沿链向前走 `steps` 步。调用方保证 `steps < len`。
+    /// Walk `steps` nodes forward along the chain. The caller guarantees `steps < len`.
     #[inline]
     fn move_forward(&self, slot: usize, steps: usize) -> usize {
         let mut current = slot;
@@ -328,7 +335,7 @@ impl<T, S: Storage<T>> List<T, S> {
         current
     }
 
-    /// 沿链向后走 `steps` 步。调用方保证 `steps < len`。
+    /// Walk `steps` nodes backward along the chain. The caller guarantees `steps < len`.
     #[inline]
     fn move_backward(&self, slot: usize, steps: usize) -> usize {
         let mut current = slot;
@@ -340,8 +347,8 @@ impl<T, S: Storage<T>> List<T, S> {
         current
     }
 
-    /// 第 `pos` 个 live 节点的下标；`pos` 必须 `< len`。
-    /// 从**步数更少**的一端出发：forward 走 `pos` 步，backward 走 `len-1-pos` 步。
+    /// Index of the `pos`-th live node; `pos` must be `< len`.
+    /// Starts from the **nearer end**: `pos` steps forward, or `len - 1 - pos` steps backward.
     #[inline]
     pub(crate) fn slot_at(&self, pos: usize) -> usize {
         debug_assert!(pos < self.len);
@@ -354,7 +361,7 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     // --------------------------------------------------------
-    // 端操作
+    // End operations
     // --------------------------------------------------------
 
     #[inline]
@@ -375,19 +382,19 @@ impl<T, S: Storage<T>> List<T, S> {
         slot
     }
 
-    /// 对齐 `LinkedList::push_front`。
+    /// Mirrors `LinkedList::push_front`.
     #[inline]
     pub fn push_front(&mut self, value: T) {
         let _ = self.push_front_slot(value);
     }
 
-    /// 对齐 `LinkedList::push_back`。
+    /// Mirrors `LinkedList::push_back`.
     #[inline]
     pub fn push_back(&mut self, value: T) {
         let _ = self.push_back_slot(value);
     }
 
-    /// 对齐 `LinkedList::push_front_mut`：插入并返回新元素的引用。
+    /// Mirrors `LinkedList::push_front_mut`: insert and return a reference to the new element.
     #[inline]
     pub fn push_front_mut(&mut self, value: T) -> &mut T {
         let slot = self.push_front_slot(value);
@@ -395,7 +402,7 @@ impl<T, S: Storage<T>> List<T, S> {
         unsafe { self.storage.data_mut(slot).assume_init_mut() }
     }
 
-    /// 对齐 `LinkedList::push_back_mut`：插入并返回新元素的引用。
+    /// Mirrors `LinkedList::push_back_mut`: insert and return a reference to the new element.
     #[inline]
     pub fn push_back_mut(&mut self, value: T) -> &mut T {
         let slot = self.push_back_slot(value);
@@ -403,7 +410,7 @@ impl<T, S: Storage<T>> List<T, S> {
         unsafe { self.storage.data_mut(slot).assume_init_mut() }
     }
 
-    /// 对齐 `LinkedList::pop_front`。
+    /// Mirrors `LinkedList::pop_front`.
     #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -412,13 +419,13 @@ impl<T, S: Storage<T>> List<T, S> {
 
         let slot = self.head;
 
-        // 链头节点的 `prev` 是哑元，不用（也没有什么可）更新；摘空了会被归位
+        // The head node's `prev` is a dummy link, so there is nothing to update; an emptied list gets reset
         self.head = self.storage.next(slot);
 
         Some(self.free_slot(slot))
     }
 
-    /// 对齐 `LinkedList::pop_back`。
+    /// Mirrors `LinkedList::pop_back`.
     #[inline]
     pub fn pop_back(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -433,10 +440,10 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     // --------------------------------------------------------
-    // 端点访问
+    // Endpoint access
     // --------------------------------------------------------
 
-    /// 对齐 `LinkedList::front`。
+    /// Mirrors `LinkedList::front`.
     #[inline]
     pub fn front(&self) -> Option<&T> {
         if self.len == 0 {
@@ -446,7 +453,7 @@ impl<T, S: Storage<T>> List<T, S> {
         Some(unsafe { self.storage.data(self.head).assume_init_ref() })
     }
 
-    /// 对齐 `LinkedList::back`。
+    /// Mirrors `LinkedList::back`.
     #[inline]
     pub fn back(&self) -> Option<&T> {
         if self.len == 0 {
@@ -456,7 +463,7 @@ impl<T, S: Storage<T>> List<T, S> {
         Some(unsafe { self.storage.data(self.tail).assume_init_ref() })
     }
 
-    /// 对齐 `LinkedList::front_mut`。
+    /// Mirrors `LinkedList::front_mut`.
     #[inline]
     pub fn front_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
@@ -466,7 +473,7 @@ impl<T, S: Storage<T>> List<T, S> {
         Some(unsafe { self.storage.data_mut(self.head).assume_init_mut() })
     }
 
-    /// 对齐 `LinkedList::back_mut`。
+    /// Mirrors `LinkedList::back_mut`.
     #[inline]
     pub fn back_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
@@ -477,67 +484,70 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     // --------------------------------------------------------
-    // 游标
+    // Cursors
     // --------------------------------------------------------
 
-    /// 对齐 `LinkedList::cursor_front`。
+    /// Mirrors `LinkedList::cursor_front`.
     #[inline]
     pub fn cursor_front(&self) -> Cursor<'_, T, S> {
         Cursor::at(self, self.head, 0)
     }
 
-    /// 对齐 `LinkedList::cursor_front_mut`。
+    /// Mirrors `LinkedList::cursor_front_mut`.
     #[inline]
     pub fn cursor_front_mut(&mut self) -> CursorMut<'_, T, S> {
         CursorMut::at(self, self.head, 0)
     }
 
-    /// 对齐 `LinkedList::cursor_back`。
+    /// Mirrors `LinkedList::cursor_back`.
     #[inline]
     pub fn cursor_back(&self) -> Cursor<'_, T, S> {
         Cursor::at(self, self.tail, self.len.saturating_sub(1))
     }
 
-    /// 对齐 `LinkedList::cursor_back_mut`。
+    /// Mirrors `LinkedList::cursor_back_mut`.
     #[inline]
     pub fn cursor_back_mut(&mut self) -> CursorMut<'_, T, S> {
         CursorMut::at(self, self.tail, self.len.saturating_sub(1))
     }
 
-    /// **本库扩展**：按稳定句柄取游标，**O(1)**。句柄失效（槽位已空闲 / 越界）返回 `None`。
+    /// **Library extension**: get a cursor by stable handle, **O(1)**. Returns `None` for a stale
+    /// handle (slot freed / out of range).
     ///
-    /// 用它进入的游标**不知道自己的逻辑位置**：`index()` / `move_steps` 需要时才会走
-    /// 一趟链算出来（`O(len)`），而按句柄的增删/搬移都是 `O(1)`。
+    /// A cursor entered this way **does not know its logical position**: `index()` / `move_steps`
+    /// walk the chain to compute it on demand (`O(len)`), while every handle-based
+    /// insert/remove/move stays `O(1)`.
     ///
-    /// 不做世代校验：槽位被复用后，旧句柄会指向**新元素**（见 [`Slot`] 的文档）。
+    /// There is no generation check: once a slot is reused, an old handle points at the **new
+    /// element** (see the [`Slot`] docs).
     pub fn cursor_at(&self, slot: Slot) -> Option<Cursor<'_, T, S>> {
         self.live_slot(slot)
             .map(|slot| Cursor::at(self, slot, crate::cursor::POS_UNKNOWN))
     }
 
-    /// **本库扩展**：按稳定句柄取**可变**游标，**O(1)**。语义同 [`cursor_at`](Self::cursor_at)。
+    /// **Library extension**: get a **mutable** cursor by stable handle, **O(1)**. Same semantics as [`cursor_at`](Self::cursor_at).
     pub fn cursor_at_mut(&mut self, slot: Slot) -> Option<CursorMut<'_, T, S>> {
         self.live_slot(slot)
             .map(|slot| CursorMut::at(self, slot, crate::cursor::POS_UNKNOWN))
     }
 
-    /// **本库扩展**：按句柄删除并返回元素，**O(1)**（不需要逻辑位置）。句柄失效返回 `None`。
+    /// **Library extension**: remove and return the element by handle, **O(1)** (no logical position needed). Returns `None` for a stale handle.
     pub fn remove_slot(&mut self, slot: Slot) -> Option<T> {
         self.live_slot(slot).map(|slot| self.unlink_slot(slot))
     }
 
-    /// **本库扩展**：链头元素的句柄，`O(1)`。
+    /// **Library extension**: handle of the head element, `O(1)`.
     pub fn front_slot(&self) -> Option<Slot> {
         (self.head != NIL).then_some(Slot(self.head))
     }
 
-    /// **本库扩展**：链尾元素的句柄，`O(1)`。
+    /// **Library extension**: handle of the tail element, `O(1)`.
     pub fn back_slot(&self) -> Option<Slot> {
         (self.tail != NIL).then_some(Slot(self.tail))
     }
 
-    /// **本库扩展**：把句柄指的元素搬到链头，**O(1)**（LRU 的原语之一）。
-    /// 句柄失效返回 `None`；已经在链头则是空操作。
+    /// **Library extension**: move the element referenced by the handle to the head, **O(1)** (one
+    /// of the LRU primitives). Returns `None` for a stale handle; a no-op if it is already the head.
     pub fn move_to_front(&mut self, slot: Slot) -> Option<()> {
         let slot = self.live_slot(slot)?;
 
@@ -549,7 +559,7 @@ impl<T, S: Storage<T>> List<T, S> {
         Some(())
     }
 
-    /// **本库扩展**：把句柄指的元素搬到链尾，**O(1)**。语义同 [`move_to_front`](Self::move_to_front)。
+    /// **Library extension**: move the element referenced by the handle to the tail, **O(1)**. Same semantics as [`move_to_front`](Self::move_to_front).
     pub fn move_to_back(&mut self, slot: Slot) -> Option<()> {
         let slot = self.live_slot(slot)?;
 
@@ -561,18 +571,20 @@ impl<T, S: Storage<T>> List<T, S> {
         Some(())
     }
 
-    /// **本库扩展**：句柄的逻辑位置，**O(len)**（要数一遍）。句柄失效返回 `None`。
-    /// 只是偶尔想知道"第几个"时够用；常问就用 [`cursor_at`](Self::cursor_at) 拿游标。
+    /// **Library extension**: logical position of a handle, **O(len)** (it must be counted).
+    /// Returns `None` for a stale handle. Fine for the occasional "which index is this?"; if you
+    /// ask often, take a cursor with [`cursor_at`](Self::cursor_at).
     pub fn pos_of(&self, slot: Slot) -> Option<usize> {
         self.live_slot(slot)
             .map(|slot| crate::cursor::pos_of_slot(self, slot))
     }
 
-    /// 遍历 **free 链**（`free_head` → `free_tail`，**LIFO 顺序**：最近被回收的在前面）。
+    /// Walk the **free chain** (`free_head` → `free_tail`, **LIFO order**: most recently recycled
+    /// first).
     ///
-    /// 配合 [`iter_slots`](Self::iter_slots) 就能取到整条链的全部状态（值 + 链接 + 空闲顺序），
-    /// 自己序列化 / 落盘 / 放进共享内存。恢复见 [`into_raw`](Self::into_raw) 与各布局的
-    /// `from_parts`。
+    /// Together with [`iter_slots`](Self::iter_slots) this exposes the entire state of the list
+    /// (values + links + free order) for your own serialization / persistence / shared memory.
+    /// Restore with [`into_raw`](Self::into_raw) and each layout's `from_parts`.
     pub fn free_slots(&self) -> impl Iterator<Item = Slot> + '_ {
         let mut remaining = self.storage.slots() - self.len;
         let mut slot = self.free_head;
@@ -587,18 +599,18 @@ impl<T, S: Storage<T>> List<T, S> {
             let current = slot;
             let next = self.storage.next(slot);
 
-            // 自环 = free 链的链尾（单元素链也是自环）
+            // Self-loop = tail of the free chain (a single-element chain is also a self-loop)
             slot = if next == current { NIL } else { next };
 
             Some(Slot(current))
         })
     }
 
-    /// **本库扩展**：边迭代边给出每个元素的稳定句柄 `(Slot, &T)`。
+    /// **Library extension**: yield each element's stable handle while iterating, `(Slot, &T)`.
     ///
-    /// 想把"链表顺序"和"自己的哈希表"接起来时用它：句柄可以当 key 存起来，
-    /// 之后用 [`cursor_at`](Self::cursor_at) / [`remove_slot`](Self::remove_slot) 回到
-    /// 那个元素（`O(1)`）。
+    /// Use it to join "list order" with "your own hash map": store the handle as a key and later
+    /// go back to that element (`O(1)`) with [`cursor_at`](Self::cursor_at) /
+    /// [`remove_slot`](Self::remove_slot).
     pub fn iter_slots(&self) -> impl Iterator<Item = (Slot, &T)> + '_ {
         let mut slot = self.head;
 
@@ -612,8 +624,8 @@ impl<T, S: Storage<T>> List<T, S> {
         })
     }
 
-    /// **本库扩展**（std 没有随机访问）：定位到第 `pos` 个元素。
-    /// 从较近的一端出发，O(min(pos, len - 1 - pos))。
+    /// **Library extension** (std has no random access): locate the `pos`-th element.
+    /// Starts from the nearer end, O(min(pos, len - 1 - pos)).
     #[inline]
     pub fn at(&mut self, pos: usize) -> Option<CursorMut<'_, T, S>> {
         if pos >= self.len {
@@ -626,26 +638,26 @@ impl<T, S: Storage<T>> List<T, S> {
     }
 
     // --------------------------------------------------------
-    // 迭代
+    // Iteration
     // --------------------------------------------------------
 
-    /// 对齐 `LinkedList::iter`。
+    /// Mirrors `LinkedList::iter`.
     #[inline]
     pub fn iter(&self) -> Iter<'_, T, S> {
         Iter::new(self)
     }
 
-    /// 对齐 `LinkedList::iter_mut`。
+    /// Mirrors `LinkedList::iter_mut`.
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T, S> {
         IterMut::new(self)
     }
 
     // --------------------------------------------------------
-    // 批量操作
+    // Bulk operations
     // --------------------------------------------------------
 
-    /// 对齐 `LinkedList::contains`。O(N)。
+    /// Mirrors `LinkedList::contains`. O(N).
     #[inline]
     pub fn contains(&self, value: &T) -> bool
     where
@@ -654,25 +666,25 @@ impl<T, S: Storage<T>> List<T, S> {
         self.iter().any(|item| item == value)
     }
 
-    /// 对齐 `LinkedList::retain`。O(N)。
+    /// Mirrors `LinkedList::retain`. O(N).
     ///
-    /// 收尾用**固定次数**（进循环前把 `len` 记下来递减），不是"每轮判
-    /// `len > 0` + `index == tail`"——后者每轮多一次比较，实测 1M 元素慢
-    /// 3~13%（三个布局、三种删除比例里 8/9 更慢）。链两端的哑元不是 NIL，
-    /// 所以遍历必须按个数走。
+    /// The loop terminates by **fixed count** (capture `len` before the loop and decrement), not
+    /// by testing `len > 0` + `index == tail` each round — the latter costs an extra comparison
+    /// per round and is measurably slower at 1M elements. The dummy links at the chain ends are
+    /// not NIL, so traversal must be count-driven.
     #[inline]
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut T) -> bool,
     {
         let mut slot = self.head;
-        // 按个数走：两端的哑元不是 NIL，链没有"天然终点"
+        // Count-driven: the dummy links at both ends are not NIL, so the chain has no "natural end"
         let mut remaining = self.len;
 
         while remaining > 0 {
             remaining -= 1;
 
-            // 先取下一个：摘掉 `index` 会改写它自己的链接
+            // Fetch the next slot first: unlinking the current slot rewrites its own links
             let next = self.storage.next(slot);
 
             let keep = f(unsafe { self.storage.data_mut(slot).assume_init_mut() });
@@ -685,15 +697,18 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// 对齐 `LinkedList::append`：把 `other` 的**全部槽位**整块搬到末尾——搬槽位的
-    /// 同时把下标批量加上偏移（索引只写一遍），两条链各接一次。
-    /// 复杂度 O(other 的槽位总数)，与对方的活元素数无关。
+    /// Mirrors `LinkedList::append`: move **all slots** of `other` to the end in one block — the
+    /// slot indices are shifted in bulk as the block moves (indices written once), and each chain
+    /// is spliced once. Complexity O(total slots in `other`), independent of the number of live
+    /// elements there.
     ///
-    /// 语义：**对方的空闲槽也一起搬过来**；`other` 之后是"空表、容量留在它自己
-    /// 那里、槽位已被搬空"。对方槽位数为 0 时直接返回。
+    /// Semantics: **`other`'s free slots move along too**; afterwards `other` is "an empty list
+    /// whose capacity stays with it, with its slots relocated". Returns immediately if `other`
+    /// has zero slots.
     ///
-    /// 想要"逐元素搬到末尾、优先复用自己已有的空闲槽"（按活元素计费），用
-    /// [`append_elementwise`](List::append_elementwise)；两条路的取舍与实测见那里。
+    /// For "move element by element to the end, preferring to reuse your own free slots first"
+    /// (cost proportional to live elements), use [`append_elementwise`](List::append_elementwise);
+    /// the trade-off is documented there.
     pub fn append(&mut self, other: &mut Self) {
         let other_slots = other.storage.slots();
 
@@ -709,10 +724,10 @@ impl<T, S: Storage<T>> List<T, S> {
         let other_free_head = other.free_head;
         let other_free_tail = other.free_tail;
 
-        // 1) 搬槽位：数据整块搬，两条链的下标在搬的同时加好 base
+        // 1) Move the slots: data in one block, rebasing both chains' indices by `base` as they move
         self.storage.append(&mut other.storage);
 
-        // 2) live 链：把对方整条接在自己链尾后面
+        // 2) Live chain: splice all of `other`'s chain behind our tail
         if other_len > 0 {
             if self.len == 0 {
                 self.head = other_head + base;
@@ -726,7 +741,7 @@ impl<T, S: Storage<T>> List<T, S> {
             }
         }
 
-        // 3) free 链：把自己链尾接上对方的链头（自己入口不变，保持 LIFO）
+        // 3) Free chain: link our tail to `other`'s head (our entry point is unchanged, preserving LIFO)
         if other_free_head != NIL {
             let other_free_head = other_free_head + base;
 
@@ -741,7 +756,7 @@ impl<T, S: Storage<T>> List<T, S> {
 
         self.len += other_len;
 
-        // 对方被搬空了：四个端点字段归位（不变量：字段是 NIL ⟺ 对应链为空）
+        // `other` was emptied: reset all four endpoint fields (invariant: a field is NIL ⟺ its chain is empty)
         other.len = 0;
         other.head = NIL;
         other.tail = NIL;
@@ -749,28 +764,23 @@ impl<T, S: Storage<T>> List<T, S> {
         other.free_tail = NIL;
     }
 
-    /// **本库扩展**：逐元素把 `other` 的所有元素搬到自己末尾（`other` 变空表）。
+    /// **Library extension**: move all elements of `other` one by one to the end of `self`
+    /// (`other` becomes empty).
     ///
-    /// 等价于 `while let Some(value) = other.pop_front() { self.push_back(value); }`：
-    /// 优先填自己**已有的空闲槽**（已分配、已触碰，不产生新页），槽位不够才扩容。
-    /// 代价按**活元素数**走，与对方的槽位数无关。
+    /// Equivalent to `while let Some(value) = other.pop_front() { self.push_back(value); }`: it
+    /// prefers filling **existing free slots** (already allocated and touched, no new pages) and
+    /// only grows when they run out. The cost is proportional to the **number of live elements**,
+    /// independent of `other`'s slot count.
     ///
-    /// 与 [`append`](List::append) 的取舍（1M 规模实测，本机当前状态）：
-    ///
-    /// | 形态 | 本方法 | `append` |
-    /// |---|---|---|
-    /// | 自己的空闲槽够装 + 对方密 | **~2.1 ms** | 4.4 ~ 4.9 ms（要扩容并搬旧数据） |
-    /// | 自己的空闲槽够装 + 对方稀疏（1M 槽 / 100 活） | **~0.001 ms** | 3.4 ~ 4.4 ms（按槽位数搬） |
-    /// | 自己装不下 + 对方密 | 4.7 ~ 4.9 ms（边塞边扩容） | **3.5 ms** |
-    ///
-    /// 也就是说：**自己有空闲槽、或对方稀疏时用它；否则用 `append`。**
+    /// Trade-off against [`append`](List::append): use this one when your own free slots suffice
+    /// or when `other` is sparse; otherwise `append` wins.
     pub fn append_elementwise(&mut self, other: &mut Self) {
         while let Some(value) = other.pop_front() {
             self.push_back(value);
         }
     }
 
-    /// 对齐 `LinkedList::split_off`。`at > len` 时 panic。O(N)。
+    /// Mirrors `LinkedList::split_off`. Panics if `at > len`. O(N).
     pub fn split_off(&mut self, at: usize) -> Self
     where
         S: Default,
@@ -789,7 +799,7 @@ impl<T, S: Storage<T>> List<T, S> {
         tail
     }
 
-    /// 对齐 `LinkedList::remove`。`at >= len` 时 panic。O(N)。
+    /// Mirrors `LinkedList::remove`. Panics if `at >= len`. O(N).
     pub fn remove(&mut self, at: usize) -> T {
         assert!(at < self.len, "remove slot out of bounds");
 
@@ -798,26 +808,26 @@ impl<T, S: Storage<T>> List<T, S> {
         self.unlink_slot(slot)
     }
 
-    /// 取出整条链的**可搬运状态**（不析构任何元素）。
+    /// Extract the **relocatable state** of the whole chain (dropping no element).
     ///
-    /// 这是 `PERFORMANCE.md` §8 那条"状态可搬运、无指针"承诺的公开入口：整条链的状态
-    /// 就是槽位数组（[`Split::into_parts`](crate::Split::into_parts) 等）加上五个数字
-    /// （[`RawList`] 的取值器），**没有任何指针**，所以可以直接序列化 / 放进共享内存 /
-    /// `mmap`，**不需要指针修正**。
+    /// This is the public entry point for the "relocatable, pointer-free state" promise of
+    /// `PERFORMANCE.md` §8: the state is the slot array ([`Split::into_parts`](crate::Split::into_parts)
+    /// and friends) plus five numbers ([`RawList`]'s accessors), with **no pointers at all**, so it
+    /// can be serialized / placed in shared memory / `mmap`ped with **no pointer fixup**.
     ///
     /// ```
     /// # use slot_list::SplitList;
     /// let mut list: SplitList<u32> = SplitList::new();
     /// list.extend([1, 2, 3]);
     /// let removed = list.pop_front().unwrap();
-    /// assert_eq!(removed, 1);          // 留一个空闲槽，free 链非空
+    /// assert_eq!(removed, 1);          // leaves one free slot, so the free chain is non-empty
     ///
     /// let raw = list.into_raw();
-    /// // 现在可以：raw.storage().as_parts() 写盘、raw.head_slot()/free_slots 记元数据
+    /// // Now you can: write raw.storage().as_parts() to disk, record raw.head_slot()/free_slots as metadata
     /// assert_eq!(raw.len(), 2);
     /// assert_eq!(raw.capacity(), 3);
     ///
-    /// let list = unsafe { SplitList::from_raw(raw) };   // 原样放回
+    /// let list = unsafe { SplitList::from_raw(raw) };   // put it back as-is
     /// assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![2, 3]);
     /// ```
     pub fn into_raw(self) -> RawList<T, S> {
@@ -826,98 +836,69 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// 把 [`into_raw`](Self::into_raw) 取出的状态放回去。
+    /// Put back the state extracted by [`into_raw`](Self::into_raw).
     ///
     /// # Safety
     ///
-    /// `raw` 必须描述一条**自洽**的链：链接都是合法下标、空闲槽带空闲标记位、
-    /// `len` 等于 live 槽数、`head`/`tail`/`free_head`/`free_tail` 与实际一致
-    /// （要么来自 [`into_raw`](Self::into_raw)，要么按同样规则重建）。
-    /// live 槽的 `data` 必须已初始化。不满足是 UB，不会 panic。
+    /// `raw` must describe a **self-consistent** chain: links are valid indices, free slots carry
+    /// the free mark bit, `len` equals the live slot count, and `head`/`tail`/`free_head`/`free_tail`
+    /// match reality (either coming from [`into_raw`](Self::into_raw) or rebuilt by the same rules).
+    /// A live slot's `data` must be initialized. Violating this is UB, not a panic.
     pub unsafe fn from_raw(raw: RawList<T, S>) -> Self {
-        // `RawList` 有 `Drop`（只放数组），所以先把它冻住再按位取出内部值。
+        // `RawList` has a `Drop` (frees only the array), so freeze it first and then bit-wise take out the inner value
         let raw = core::mem::ManuallyDrop::new(raw);
         let inner = unsafe { core::ptr::read(&raw.inner) };
 
         core::mem::ManuallyDrop::into_inner(inner)
     }
 
-    /// 对齐 `LinkedList::clear`。保留已分配的容量与槽位。
+    /// Mirrors `LinkedList::clear`. Keeps the allocated capacity and slots.
     ///
-    /// 单趟完成：逐个析构 live 元素，并把槽位就地挂回 free 链。循环条件用
-    /// `len`（链尾的哑元不是 NIL，不能"走到 NIL 为止"）。
+    /// Done in a single pass: drop each live element in turn and push its slot back onto the free
+    /// chain in place. The loop condition uses `len` (the tail's dummy link is not NIL, so "walk
+    /// until NIL" does not work).
     ///
-    /// 为什么不用"一直 `pop_front` 到空"：`pop_front` 每个元素都要走
-    /// [`unlink_slot`](List::unlink_slot) / `free_slot`——读 `prev`、修补邻居、
-    /// 判断端点，还要 `assume_init_read()` **把 `T` 搬出槽位**再析构；`clear` 只读
-    /// `next`、**就地** `assume_init_drop`、端点只归位一次。
+    /// Why not "`pop_front` until empty": `pop_front` routes every element through
+    /// `unlink_slot` / `free_slot` — read `prev`, patch the neighbors, check
+    /// endpoints — and `assume_init_read()` **moves `T` out of the slot** before dropping it;
+    /// `clear` only reads `next`, drops **in place**, and resets the endpoints once.
     ///
-    /// 实测（min/9 轮，`clear` 相对 pop 到空）：8 B 载荷 1.2×、64 B **2.9×**、
-    /// 512 B **24.5×**——收益随 `T` 变大而增长（省掉的是每元素一次搬值）；带 Drop
-    /// glue 时 drop 调用本身占大头，64 B 只剩 1.6×。
+    /// # Hybrid: density ≥ 0.5 scans slots sequentially, otherwise walks the chain
     ///
-    /// # 混合：密度 ≥ 0.5 走"顺序扫槽位"，否则追链
+    /// The two paths have completely different cost models: **walking the live chain is O(live)
+    /// random slot accesses** (each a dependent load plus a random read-modify-write), while
+    /// **scanning is O(slots) sequential accesses** (streaming over just the few mark bytes). The
+    /// break-even density moves with **index width** and **layout**: a full table favors scanning
+    /// by up to ~7× with a `u32` Split index, while a sparse table favors the walk by orders of
+    /// magnitude (at density 0.001 the walk is ~100× faster). The threshold is therefore **0.5**:
+    /// scan when `2 * len >= slots`. Across the six layout/index combinations this keeps the
+    /// result between 0.99× and 1.43× (worst case a tie, no combination measurably slower).
     ///
-    /// 两条路的代价模型完全不同：**追链是 O(live) 次随机槽位访问**（实测 ≈1.07 ns/live：
-    /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**（≈0.11 ns/槽）。
-    /// 数据来自 `src/tests.rs` 的 `probe_clear_vs_scan`：
-    /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`。
-    /// 1M 槽位、显式 `u32` 索引、min/9 轮、`Split`）：
+    /// Data comes from `probe_clear_vs_scan` in `src/tests.rs`:
+    /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`.
     ///
-    /// | `live/slots` | 追链表 | 扫槽位 | |
-    /// |---|---|---|---|
-    /// | 1（满） | 1.08 ms | 0.15 ms | 扫描快 **7×** |
-    /// | 0.5 | 0.54 ms | 0.12 ms | 扫描快 4.5× |
-    /// | 0.25 | 0.27 ms | 0.11 ms | 扫描快 2.4× |
-    /// | 0.10 | 0.107 ms | 0.111 ms | 打平 |
-    /// | 0.01 | 0.011 ms | 0.11 ms | 追链快 10× |
-    /// | 0.001 | 1.1 µs | 0.11 ms | 追链快 **100×** |
-    /// | 满 + 64 B Drop glue | 2.45 ms | 2.57 ms | 平手 |
-    /// | 0.001 + 64 B Drop glue（`Nodes`） | 2 µs | 2.7 ms | 追链快 **1300×** |
+    /// **Reading note**: the scan branch is purely bandwidth-bound and can swing 3~4× with other
+    /// load on the machine, whereas the walk is latency-bound and stable ⇒ the ratio must be
+    /// taken **within a single run** (and ideally on an idle machine). `probe_clear_vs_scan`
+    /// already produces both columns in the same run, so do not divide numbers from different
+    /// moments.
     ///
-    /// 两条代价模型完全不同：**追链是 O(live) 次随机槽位访问**（实测 ≈1.07 ns/live：
-    /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**
-    /// （≈0.11 ns/槽：只流式读 `prev` 那几字节标志；`PackedLinks` 0.16~0.23 ms、
-    /// `Nodes` 0.38 ms——`Nodes` 的标记位和整节点共处一条缓存行，要按节点大小付带宽）。
+    /// Known boundary cost: a full-table scan with Drop glue merely ties, because the drops
+    /// themselves consume the bandwidth; deliberately not testing `needs_drop` separately keeps
+    /// the decision to a single predicate (measured worst case ~5%, within noise).
     ///
-    /// **打平点**（扫描不亏的最低密度）与**值得切换的阈值**（扫描快 ≥1.5×）——
-    /// 两者都随**索引宽度**和**布局**一起动：
-    ///
-    /// | 布局 / 索引 | 满表加速 | 打平点 | ≥1.5× |
-    /// |---|---|---|---|
-    /// | `Split` / `u32` | 7.1× | 0.25 | 0.25 |
-    /// | `Split` / `usize`（u64） | 1.9× | 0.50 | 0.75 |
-    /// | `PackedLinks` / `u32` | 4.7× | 0.25 | 0.25 |
-    /// | `PackedLinks` / `usize` | 2.3× | 0.50 | 0.75 |
-    /// | `Nodes` / `u32` | 3.4× | 0.50 | 0.50 |
-    /// | `Nodes` / `usize` | 2.0× | 0.50 | 0.75 |
-    ///
-    /// 阈值取 **0.5**：`2 * len >= slots` 时走扫描。这一档六种组合实测 **0.99×~1.43×**
-    /// （最坏是打平，没有组合会明显变慢），代价是打平点更低的组合丢掉了 0.5 以下那
-    /// 一段的收益。
-    ///
-    /// **读数注意**：扫描支是纯带宽受限的——机器上有别的负载时同一台机器能摆动 3~4×
-    /// （实测满表扫描 0.13 ms ↔ 0.65 ms），而追链是延迟受限、稳定在 ~1.08 ms ⇒ 比值
-    /// 必须在**同一次运行内**取，且尽量空机（`probe_clear_vs_scan` 已经把两列做成同一次
-    /// 运行内的对照，别拿不同时刻的数字相除）。
-    ///
-    /// 已知边界代价：带 Drop glue 的满表扫描只是打平（0.95~1.11×）——析构本身把带宽
-    /// 吃完，扫描多读的那遍标志位净亏；不额外判 `needs_drop` 是为了让判据只剩一个
-    /// （实测最差 5%，在噪声量级）。
-    ///
-    /// 复杂度：扫描是 O(slots)，但只在 `len ≥ slots/2` 时才会被选中 ⇒ 最坏 O(2·live)；
-    /// "刚排空的 deque"仍然走追链那条微秒级路径。free 链顺序换成升序也没换来复用
-    /// 收益（重填 1.01×）。
+    /// Complexity: the scan is O(slots) but is only chosen when `len >= slots/2`, so the worst
+    /// case is O(2·live); a just-emptied deque still takes the walk's microsecond path.
     #[inline]
     pub fn clear(&mut self) {
         let slots = self.storage.slots();
 
-        // 密度 ≥ 0.5 ⇒ 顺序扫槽位（六种组合在这一档都实测 ≥1.0）。`slots == 0` 也落在
-        // 这里，等价于空操作。
+        // Density ≥ 0.5 ⇒ scan slots sequentially. `slots == 0` also lands here and is a no-op.
         if self.len * 2 >= slots {
             for slot in 0..slots {
-                // 已经在 free 链上的槽位**不能**再挂一次：`push_free` 会把它的 `next`
-                // 指向链头，而链上原位置还指着它 ⇒ 成环，free 链再也走不空。
+                // A slot already on the free chain must **not** be pushed again: `push_free` would
+                // point its `next` at the chain head while its old position still points at it
+                // ⇒ a cycle, and the free chain could never be drained.
                 if self.storage.is_free(slot) {
                     continue;
                 }
@@ -934,11 +915,11 @@ impl<T, S: Storage<T>> List<T, S> {
             return;
         }
 
-        // 稀疏：沿 live 链走，只碰 live 槽位
+        // Sparse: walk the live chain, touching only live slots
         while self.len > 0 {
             let slot = self.head;
 
-            // 先取下一个：`push_free` 会改写 `index` 自己的 `next`
+            // Fetch the next slot first: `push_free` rewrites the current slot's `next`
             self.head = self.storage.next(slot);
 
             unsafe { self.storage.data_mut(slot).assume_init_drop() };
@@ -953,84 +934,87 @@ impl<T, S: Storage<T>> List<T, S> {
 }
 
 // ============================================================
-// std 风格 trait 实现
+// std-style trait implementations
 // ============================================================
 
-/// 整条链的**可搬运状态**：槽位数组 + 五个数字（`head`/`tail`/`free_head`/`free_tail`/`len`）。
+/// The **relocatable state** of the whole chain: the slot array plus five numbers
+/// (`head`/`tail`/`free_head`/`free_tail`/`len`).
 ///
-/// 由 [`List::into_raw`] 取出、[`List::from_raw`] 放回。它**不是**值的所有者：
-/// 丢掉 `RawList` 只释放槽位数组，**不会析构 `T`**（和 `Vec::into_raw_parts` 一样，
-/// 元素在 `MaybeUninit` 里，本来就不由存储析构）。要拿回元素就先放回 `List`。
+/// Extracted by [`List::into_raw`] and restored by [`List::from_raw`]. It does **not** own the
+/// values: dropping a `RawList` frees only the slot array and **never drops `T`** (as with
+/// `Vec::into_raw_parts`, the elements live in `MaybeUninit` and are not dropped by the storage).
+/// To get the elements back, restore them into a `List` first.
 ///
-/// 取值器给全了序列化需要的全部信息：数组从 `storage()` 拿
-/// （[`Split::as_parts`](crate::Split::as_parts) / [`PackedLinks::as_parts`](crate::PackedLinks::as_parts) /
-/// [`Nodes::as_parts`](crate::Nodes::as_parts)），五个数字从这里拿。
+/// The accessors expose everything serialization needs: the array from `storage()`
+/// ([`Split::as_parts`](crate::Split::as_parts) / [`PackedLinks::as_parts`](crate::PackedLinks::as_parts) /
+/// [`Nodes::as_parts`](crate::Nodes::as_parts)), and the five numbers from here.
 pub struct RawList<T, S: Storage<T>> {
     inner: core::mem::ManuallyDrop<List<T, S>>,
 }
 
 impl<T, S: Storage<T>> RawList<T, S> {
-    /// live 元素个数（与取出时的 `List::len()` 相同）。
+    /// Number of live elements (same as `List::len()` at extraction time).
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.len
     }
 
-    /// 是否没有 live 元素。
+    /// Whether there are no live elements.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 槽位总数（live + free）。
+    /// Total number of slots (live + free).
     #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.storage.slots()
     }
 
-    /// 槽位数组（`Vec` 的所有权仍在 `RawList` 里）。
+    /// The slot array (ownership of the `Vec` stays with `RawList`).
     #[inline]
     pub fn storage(&self) -> &S {
         &self.inner.storage
     }
 
-    /// 槽位数组（可写）——想就地改写（比如序列化前压缩）时用。
+    /// The slot array (writable) — use it to modify in place (e.g. compact before serializing).
     ///
-    /// **改坏不变量 = 之后放回 `List` 时 UB**（链接必须是合法下标、空闲槽要带标记位）。
+    /// **Breaking an invariant means UB when the `RawList` is later put back into a `List`**
+    /// (links must be valid indices, free slots must carry the mark bit).
     #[inline]
     pub fn storage_mut(&mut self) -> &mut S {
         &mut self.inner.storage
     }
 
-    /// 链头槽位；空表是 `None`。
+    /// Head slot; `None` when empty.
     #[inline]
     pub fn head_slot(&self) -> Option<Slot> {
         (self.inner.head != NIL).then_some(Slot(self.inner.head))
     }
 
-    /// 链尾槽位；空表是 `None`。
+    /// Tail slot; `None` when empty.
     #[inline]
     pub fn tail_slot(&self) -> Option<Slot> {
         (self.inner.tail != NIL).then_some(Slot(self.inner.tail))
     }
 
-    /// free 链链头（最近被回收的槽位）。
+    /// Head of the free chain (the most recently recycled slot).
     #[inline]
     pub fn free_head_slot(&self) -> Option<Slot> {
         (self.inner.free_head != NIL).then_some(Slot(self.inner.free_head))
     }
 
-    /// free 链链尾（最早被回收、还没被复用的槽位）。
+    /// Tail of the free chain (the earliest recycled slot not yet reused).
     #[inline]
     pub fn free_tail_slot(&self) -> Option<Slot> {
         (self.inner.free_tail != NIL).then_some(Slot(self.inner.free_tail))
     }
 
-    /// 按五个字面量重建（反序列化用）。
+    /// Rebuild from the five literals (for deserialization).
     ///
     /// # Safety
     ///
-    /// 同 [`List::from_raw`]：链接、标记位、`len` 与 `head`/`tail` 必须自洽。
+    /// Same as [`List::from_raw`]: links, mark bits, `len` and `head`/`tail` must be self-consistent.
     pub unsafe fn from_fields(
         storage: S,
         head: Option<Slot>,
@@ -1055,8 +1039,8 @@ impl<T, S: Storage<T>> RawList<T, S> {
 
 impl<T, S: Storage<T>> Drop for RawList<T, S> {
     fn drop(&mut self) {
-        // 只放掉槽位数组。元素是 `MaybeUninit<T>`，`S` 自己从不析构它们
-        // ⇒ 这里既不会丢元素的值语义，也不会漏掉数组那块内存。
+        // Frees only the slot array. The elements are `MaybeUninit<T>`, and `S` never drops them
+        // ⇒ this neither loses the elements' value semantics nor leaks the array's memory.
         let storage = unsafe { core::ptr::read(&self.inner.storage) };
 
         drop(storage);
@@ -1148,27 +1132,18 @@ impl<'a, T, S: Storage<T>> IntoIterator for &'a mut List<T, S> {
     }
 }
 
-/// 析构：只走 live 链、**就地**析构，不碰 free 链。
+/// Drop: walks only the live chain and drops **in place**, never touching the free chain.
 ///
-/// 不走 [`clear`](List::clear) 的原因：`clear` 还要把每个槽位挂回 free 链
-/// （`mark_free` + `set_next` + 端点归位），而这里整个存储马上要跟着释放，
-/// 那份维护是纯亏。实测（1M 元素、`clear_drop` 组，`cargo bench -- 'clear_drop'`）：
+/// Why not [`clear`](List::clear): `clear` also has to push every slot back onto the free chain
+/// (`mark_free` + `set_next` + endpoint reset), while here the whole storage is about to be freed
+/// anyway, so that maintenance is pure loss. The win grows with `T` (it removes a per-element
+/// value move) and reaches several-fold for small payloads; the numbers are in `PERFORMANCE.md`.
 ///
-/// | 载荷 | 经 `clear` | 只析构 | |
-/// |---|---|---|---|
-/// | `usize`（无 glue） | 1.098 ms | **1.9 µs** | 整条析构链被 LLVM 消掉，只剩释放存储 |
-/// | `Drop64`（有 glue，`Split`） | 2.498 ms | **1.889 ms** | 快 1.32× |
-/// | `Drop64`（有 glue，`PackedLinks`） | 2.888 ms | 2.062 ms | 快 1.40× |
-/// | `Drop64`（有 glue，`Nodes`） | 3.569 ms | 2.069 ms | 快 1.72× |
+/// This also covers dropping an `into_iter()` halfway ([`IntoIter`] is a thin wrapper over
+/// `pop_front`, and the remainder is finished off here).
 ///
-/// 表里"只析构"那列**还含**释放整个槽位数组（"经 `clear`"那列不含）⇒ 1.3~1.7× 是
-/// 下界：省掉的正是每槽一次随机 read-modify-write 加一次随机 `next` 写。稀疏表上差别
-/// 更极端——walk 本身只有微秒级（见 [`clear`](List::clear) 的密度表）。
-///
-/// 这一条对 `into_iter()` 半途丢弃同样有效（[`IntoIter`] 是 `pop_front` 的
-/// 薄包装，剩余元素最终由这里收尾）。
-///
-/// 按 `len` 计数而不是"走到 NIL"：链尾的 `next` 是哑元（自环，或空闲期的残留）。
+/// Counts by `len` rather than "walk until NIL": the tail's `next` is a dummy link (a self-loop,
+/// or leftover from its free period).
 impl<T, S: Storage<T>> Drop for List<T, S> {
     fn drop(&mut self) {
         let mut slot = self.head;

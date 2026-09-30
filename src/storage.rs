@@ -1,34 +1,36 @@
-//! 内存布局策略：`data` / `prev` / `next` 如何落到内存里。
+//! In-memory layout strategies: how `data` / `prev` / `next` land in memory.
 //!
-//! 三种策略的**算法完全相同**，只有存储方式不同：
+//! The three strategies are **algorithmically identical**; only the storage differs:
 //!
-//! - [`Split`]：三个独立 `Vec`（array of structs 的反面，structure of arrays）
-//! - [`PackedLinks`]：`data` 一个 `Vec`，`prev`/`next` 打包成 [`Link`] 交错存放
-//! - [`Nodes`]：三者放进一个 `Node`（array of structs）
+//! - [`Split`]: three separate `Vec`s (the opposite of array of structs, i.e. structure of arrays)
+//! - [`PackedLinks`]: one `Vec` for `data`, `prev`/`next` packed into an interleaved [`Link`]
+//! - [`Nodes`]: all three in a single `Node` (array of structs)
 
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, offset_of, size_of};
 
-/// 「这一侧没有邻居」。
+/// "There is no neighbor on this side."
 ///
-/// **只作为标量使用**：函数参数（`List::insert_link` 的 `prev` / `next`）和
-/// 游标的幽灵位置 tag。它**绝不会出现在 `prev` / `next`
-/// 数组里**——数组里每个值都是合法槽位下标（链表两端的"哑元"字段是"没人读
-/// 的合法下标"，不是 NIL）。这是 [`Storage::append`] 能把整段下标直接加偏移
-/// 的前提。
+/// **Scalar-only**: it appears as a function argument (`prev` / `next` of
+/// `List::insert_link`) and as a cursor's phantom-position tag. It **never appears in the
+/// `prev` / `next` arrays** — every value there is a valid slot index (the "dummy" link
+/// fields at either end of a list are "valid indices nobody reads", not NIL). This is the
+/// premise that lets [`Storage::append`] add an offset to a whole run of indices.
 pub(crate) const NIL: usize = usize::MAX;
 
-/// 链接数组里用多宽的整数存槽位下标。
+/// How wide an integer stores slot indices in the link arrays.
 ///
-/// 三种布局的每槽开销 = `T` + 两条链接，所以链接宽度直接决定内存与访存带宽：
-/// `usize` 换 `u32` 时 `T = 8` 的每槽从 24 B 降到 **16 B**（`PERFORMANCE.md` §2/§4）。
+/// Per-slot cost = `T` + two links, so the link width directly determines memory and
+/// bandwidth: switching `usize` to `u32` takes the per-slot size for `T = 8` from 24 B
+/// down to **16 B** (`PERFORMANCE.md` §2/§4).
 ///
-/// **上限**：空闲标记位占最高位（见 [`Ix::FREE_BIT`]），而 `append` 的整段 `+= base`
-/// 靠"不向这一位进位"来免特例，所以可用槽位数是 `1 << (BITS - 1)`：
-/// `u32` ⇒ 2.1G、`u16` ⇒ 32768、`u8` ⇒ 128（默认宽度见 [`DefaultIx`]）。超过就在 `grow` / `reserve`
-/// 处 panic，不会静默截断。
+/// **Limit**: the free mark bit occupies the top bit (see [`Ix::FREE_BIT`]), and `append`'s
+/// wholesale `+= base` avoids the special case by never carrying into that bit, so the
+/// usable slot count is `1 << (BITS - 1)`: `u32` => 2.1G, `u16` => 32768, `u8` => 128
+/// (default width see [`DefaultIx`]). Exceeding it panics in `grow` / `reserve`, never
+/// truncates silently.
 ///
-/// 这个 trait 是**封闭**的（`u8` ~ `u64` / `usize`），出现在类型参数的位置上。
+/// This trait is **sealed** (`u8` .. `u64` / `usize`) and appears in type-parameter position.
 pub trait Ix:
     Copy
     + Eq
@@ -38,95 +40,74 @@ pub trait Ix:
     + sealed::Sealed
     + 'static
 {
-    /// 宽度（位）。
+    /// Width (in bits).
     const BITS: u32 = size_of::<Self>() as u32 * 8;
 
-    /// 可用的槽位数上限（= 空闲标记位本身 ⇒ 索引加 `base` 不会进位到标记位）。
+    /// Upper bound on usable slots (= the free mark bit itself, so adding `base` to an
+    /// index never carries into the mark bit).
     const MAX_SLOTS: usize = 1 << (Self::BITS - 1);
 
-    /// 「这个槽位当前空闲」的标记位，存在 `prev` 的**最高位**（下面以 `usize` 为例，
-    /// 窄索引同理，位宽换成 `Ix::BITS - 1`）。
+    /// The "this slot is currently free" mark bit, stored in the **top bit** of `prev`
+    /// (`usize` below; narrower indices work the same way with a width of `Ix::BITS - 1`).
     ///
-    /// 为什么要它：句柄（[`Slot`](crate::Slot)）是指向槽位的裸标识，槽位会被 free-list
-    /// 复用 ⇒ 必须能 O(1) 判断"这个槽位现在活没活"，**否则就要对空闲槽的
-    /// `MaybeUninit` 做 `assume_init_*`（UB）**。
+    /// Why it exists: a handle ([`Slot`](crate::Slot)) is a raw identifier pointing at a
+    /// slot, and slots are recycled through the free list => "is this slot alive?" must be
+    /// O(1), **otherwise we would have to `assume_init_*` the `MaybeUninit` of a free slot
+    /// (UB)**.
     ///
-    /// 为什么放在 `prev` 的最高位：
+    /// Why the top bit of `prev`:
     ///
-    /// - **写入最省**：live 槽位的 `prev` 由链接写入覆盖（那些值天然没有这一位），空闲槽位
-    ///   只被 free 链用到 `next` ⇒ 这一位**只在"变空闲"那一次**写，链接写入路径上没有任何
-    ///   额外操作（实测：把这次写改成**直接赋值** `prev = FREE_BIT` 想省下一次 load，
-    ///   反而让 `churn` 稳定慢 7~8%——两轮交替 A/B、对照 `VecDeque` 持平——所以保留读-改-写）；
-    /// - **`append` 的整段 `+= base` 自己会带着它走**：`2^63 | v` 加 `base` 仍是
-    ///   `2^63 | (v + base)`，只要不溢出 `u64` 就不需要特例（`v + base < 2^63`，而
-    ///   槽位数远小于此 ⇒ 实际永远成立，`debug_assert` 兜底）；
-    /// - **读 `prev` 只在 live 槽位上**（这是契约，不是建议）：因为空闲槽的 `prev` 就是
-    ///   这个标记位本身（`append` 后是 `FREE_BIT | base`），掩码反而要每个读取点多付一条
-    ///   and、还拖长"取地址"的依赖链。所以 [`Storage::prev`] **直接返回原值**，并在
-    ///   debug 构建里用 `debug_assert` 钉住"调用它的槽位必须是 live"（release 零成本）。
+    /// - **Cheapest to write**: a live slot's `prev` is overwritten by link writes (those
+    ///   values never have this bit set), and a free slot only uses `next` in the free
+    ///   chain => this bit is written **only on the transition to free**, so the link-write
+    ///   path carries no extra work (a direct assignment `prev = FREE_BIT` to save a load
+    ///   measured consistently slower on `churn` — see `PERFORMANCE.md` — so the
+    ///   read-modify-write stays);
+    /// - **`append`'s wholesale `+= base` carries it along by itself**: `2^63 | v` plus
+    ///   `base` is still `2^63 | (v + base)`; as long as `u64` does not overflow no special
+    ///   case is needed (`v + base < 2^63` and the slot count is far below that => always
+    ///   true in practice, with a `debug_assert` as backstop);
+    /// - **`prev` is read only on live slots** (a contract, not advice): a free slot's
+    ///   `prev` *is* this mark bit (`FREE_BIT | base` after `append`), so masking would add
+    ///   an `and` at every read site and lengthen the address dependency chain.
+    ///   [`Storage::prev`] therefore **returns the raw value** and pins "the slot must be
+    ///   live" with a `debug_assert` in debug builds (zero cost in release).
     ///
-    /// # 标记空闲怎么写：三种写法都量过
+    /// Marking free is written **only on the transition to free**, so its form sits
+    /// directly on `churn`'s hot path. Direct assignment and a single-byte write both
+    /// measured slower than the current `prev |= FREE_BIT` (see `PERFORMANCE.md`); the
+    /// gaps come from whole-function codegen rearrangement, not one instruction.
     ///
-    /// 这个位**只在"变空闲"那一次**写，所以它的写法直接落在 `churn` 的热路径上。
+    /// Used as a **boolean** (`raw & FREE_BIT != 0`) it has no such problem: LLVM lowers it
+    /// to `mov %rdi,%rax; shr $63,%rax` (two instructions, no immediate).
     ///
-    /// | 写法 | `churn`（Split / PackedLinks，两轮交替 A/B） | 结论 |
-    /// |---|---|---|
-    /// | `prev |= FREE_BIT`（当前） | **2.79 / 2.76 ms** | 保留 |
-    /// | `prev = FREE_BIT` | 2.99~3.04 / 2.96~2.98（**+7%**） | 否 |
-    /// | 只写标志位那个字节 | 2.95~3.00 / 2.96（**+5.5~7.5%**） | 否 |
-    ///
-    /// 三种都查了汇编，但**片段级的汇编不可外推**——真实热循环里 LLVM 的选择完全不同：
-    ///
-    /// ```text
-    /// 片段里的 |=        orb    $-128, 7(%rdi,%rsi,8)      1 条 / 5 字节（含 load）
-    /// 片段里的 =         movabsq $-9223372036854775808, %rax
-    ///                    movq   %rax, (%rdi,%rsi,8)        2 条 / 14 字节
-    /// 片段里的字节写      movb   $-128, 7(%rdi,%rsi,8)      1 条 / 5 字节（无 load）
-    ///
-    /// crate 里真实的 |=  movabs $0x8000000000000000,%r9     ← 序言里，**提出循环**
-    ///                    or     %r9,(%rsi,%r10,8)          ← 循环内，**寄存器形式** RMW
-    /// crate 里真实的字节写 movb  $0x80,0x7(%rsi,%r9,8)      ← 循环内，且**没有 movabs**
-    /// ```
-    ///
-    /// 把整个 `churn` 函数逐条 diff（去掉地址与分支目标）还能看到：换写法**远不止那一条指令**——
-    /// 寄存器分配整体重排（常量不再占一个寄存器）、栈帧从 `push %rbp` 变 `sub $0x10,%rsp`、
-    /// 指令数 133 → 126、**连循环的对齐填充都变了**（`cs nopw` → `data16` 前缀的 nop；热块入口
-    /// 从 `mod 64 = 0` 挪到 `mod 64 = 60`）。所以那 5.5~7.5% **不能归给标志位那一条指令**。
-    ///
-    /// 布局扰动实验（插一个永不调用、只用来挪热函数位置的 `pub #[inline(never)]` 函数）量到的
-    /// 噪声底是 **±2%**；上面那几个 7% 里至少有相当一部分来自"换写法顺带把热循环摆到别处"。
-    ///
-    /// 结论仍保留 `|=`（本机实测最快也最稳），但**换 ISA 应当重测**：IR 层面只写一个字节确实
-    /// 少一次 load（`--emit llvm-ir` 实测：`store i8 -128` 对 `load i64` + `or` + `store`），
-    /// RISC 后端会从 `ldrb`/`orr`/`strb` 三条降到一条。
-    ///
-    /// 复现方法：写一个 20 行的 `#[inline(never)]` churn 探针（`pop_front` + `push_back` 循环）
-    /// 编成 example，两种写法各 build 一次，`objdump -d` 去掉地址后 `diff`。
-    ///
-    /// 反过来，把它当**布尔**用（`raw & FREE_BIT != 0`）没有这个问题：LLVM 会化成
-    /// `mov %rdi,%rax; shr $63,%rax`（2 条指令、无立即数）。
-    ///
-    /// 代价：每个"变成空闲"的槽位一次 read-modify-write（`pop`/`remove`/`clear` 等
-    /// 每条回收路径一次）。
+    /// Cost: one read-modify-write per slot that becomes free (once on every reclamation
+    /// path: `pop`/`remove`/`clear`, etc.).
     const FREE_BIT: Self;
 
-    /// 零（用来测标记位，避免依赖 `PartialEq<{integer}>`）。
+    /// Zero (used to test the mark bit without relying on `PartialEq<{integer}>`).
     const ZERO: Self;
 
+    /// Widen the index to `usize`.
     fn to_usize(self) -> usize;
 
+    /// Narrow a `usize` slot index to this width.
+    ///
+    /// Debug builds assert that `value` fits, i.e. stays below `1 << (BITS - 1)`
+    /// (see [`Ix::MAX_SLOTS`]).
     fn from_usize(value: usize) -> Self;
 }
 
-/// 触顶的冷路径。
+/// Cold path for hitting the limit.
 ///
-/// **故意** `#[cold] #[inline(never)]` + 消息不带格式参数：`grow` 是热路径的一部分
-/// （`alloc_slot` 要内联进来）。带上 `{}` 参数就会把格式化机器拖进 `grow`，内联器随即
-/// 放弃内联 `alloc_slot`——实测 `churn` 因此慢 47%（循环里出现 `call`）。
+/// **Deliberately** `#[cold] #[inline(never)]` and a message with no format arguments:
+/// `grow` is part of the hot path (`alloc_slot` must inline into it). A `{}` argument
+/// would drag the formatting machinery into `grow`, after which the inliner gives up on
+/// inlining `alloc_slot` — measured ~47% slower `churn` (a `call` appears in the loop).
 #[cold]
 #[inline(never)]
 fn ix_overflow() -> ! {
-    panic!("槽位数超出索引宽度上限（见 Ix::MAX_SLOTS）")
+    panic!("slot count exceeds the index width limit (see Ix::MAX_SLOTS)")
 }
 
 macro_rules! impl_ix {
@@ -146,7 +127,7 @@ macro_rules! impl_ix {
             fn from_usize(value: usize) -> Self {
                 debug_assert!(
                     value < Self::MAX_SLOTS,
-                    "槽位下标超出所选索引宽度：{value} >= {}",
+                    "slot index exceeds the selected index width: {value} >= {}",
                     Self::MAX_SLOTS
                 );
 
@@ -158,41 +139,42 @@ macro_rules! impl_ix {
 
 impl_ix!(u8, u16, u32, u64, usize);
 
-/// [`Iter`](crate::Iter) / [`IterMut`](crate::IterMut) 需要的裸地址布局。
+/// The raw-address layout that [`Iter`](crate::Iter) / [`IterMut`](crate::IterMut) need.
 ///
-/// 三种 `Storage` 把同样的三个逻辑字段放在完全不同的位置，迭代器又必须用裸地址
-/// 走链（这样 `next()` 才能交出 `&'a mut T` 而不与自身状态打架），所以这里用
-/// 「**基址 + 步长 + 偏移**」把三者统一描述成同一个公式（下标是槽位下标）：
+/// The three `Storage`s place the same three logical fields in completely different spots,
+/// and the iterators must walk the chain through raw addresses (so `next()` can hand out
+/// `&'a mut T` without fighting its own state). This unifies all three under a single
+/// "**base + stride + offset**" formula (all indices are slot indices):
 ///
 /// ```text
-/// 元素 i 的 data 地址 = data.cast::<u8>() + i * data_stride + data_offset
-/// 元素 i 的 prev 值   = *(prev.cast::<u8>() + i * prev_stride)
-/// 元素 i 的 next 值   = *(next.cast::<u8>() + i * next_stride)
+/// data address of element i = data.cast::<u8>() + i * data_stride + data_offset
+/// prev value of element i   = *(prev.cast::<u8>() + i * prev_stride)
+/// next value of element i   = *(next.cast::<u8>() + i * next_stride)
 /// ```
 ///
-/// 字段（基址一律是**字节指针** `u8`，所以每次取址只需**一次** cast：`u8` → 目标
-/// 类型。若把基址标成 `*mut MaybeUninit<T>`，反而要先 `cast::<u8>()` 做字节算术、
-/// 再 cast 回来——两次）：
-/// - `data`：元素 0 的 `data` 槽**基址**（槽位可能未初始化，读之前要
-///   `assume_init_*`）；
-/// - `data_stride`：相邻元素的 `data` 相隔多少字节（= 一个"元素"有多大）；
-/// - `data_offset`：从 `data` 基址挪到元素 0 的 `data` 字段还要加多少字节
-///   （只有把字段塞进节点里的布局才非 0，而且用 `offset_of!` 说出来，
-///   不依赖"`data` 恰好在开头"这个假设）；
-/// - `prev` / `next`：元素 0 的链接字段基址（三种布局的链接**都是 `usize`**，
-///   所以类型固定，变的只有步长）；
-/// - `prev_stride` / `next_stride`：相邻元素的链接字段相隔多少字节——PackedLinks 里
-///   两个链接打包成 `Link`，Nodes 里它们和 `data` 同处一个 `Node<T>`，所以这里的
-///   步长是"元素"大小而不是 8。
+/// Fields (all bases are **byte pointers** `u8`, so each access needs only **one** cast:
+/// `u8` -> target type. Marking a base as `*mut MaybeUninit<T>` would instead require a
+/// `cast::<u8>()` for byte arithmetic and a cast back — two):
+/// - `data`: the **base** of element 0's `data` slot (a slot may be uninitialized; call
+///   `assume_init_*` before reading);
+/// - `data_stride`: bytes between the `data` of adjacent elements (= the size of one "element");
+/// - `data_offset`: bytes to add to the `data` base to reach element 0's `data` field
+///   (non-zero only for layouts that tuck the field inside a node, and computed with
+///   `offset_of!`, so it does not rely on the assumption that `data` sits at the start);
+/// - `prev` / `next`: the base of element 0's link fields (links are **always `usize`** in
+///   all three layouts, so the type is fixed and only the stride varies);
+/// - `prev_stride` / `next_stride`: bytes between the link fields of adjacent elements —
+///   in PackedLinks the two links are packed into a `Link`, and in Nodes they share a
+///   `Node<T>` with `data`, so the stride here is the "element" size rather than 8.
 ///
-/// 三个布局具体怎么落到这些字段上（`T = usize`、索引 `u32`；括号里是
-/// `T = [u64; 8]`，实测值）：
+/// How each layout maps onto these fields (`T = usize`, index `u32`; parenthesized values
+/// are for `T = [u64; 8]`, measured):
 ///
-/// | 布局 | `data` 基址 / `data_stride` / `data_offset` | `prev`·`next` 基址 / 步长 |
+/// | layout | `data` base / `data_stride` / `data_offset` | `prev`·`next` base / stride |
 /// |---|---|---|
-/// | `Split<T, I>` | 数据数组首址 / `size_of::<T>()` 8（64）/ 0 | 各自数组首址 / `size_of::<I>()` 4 |
-/// | `PackedLinks<T, I>` | 数据数组首址 / 8（64）/ 0 | `links + offset_of!(Link<I>, …)` 0·4 / 8 |
-/// | `Nodes<T, I>` | 节点数组首址 / `size_of::<Node<T, I>>()` 16（72）/ `offset_of!(Node<T, I>, data)` 0 | `nodes + offset_of!(Node<T, I>, …)` 8·12 / 16（72） |
+/// | `Split<T, I>` | data array start / `size_of::<T>()` 8 (64) / 0 | each array start / `size_of::<I>()` 4 |
+/// | `PackedLinks<T, I>` | data array start / 8 (64) / 0 | `links + offset_of!(Link<I>, …)` 0·4 / 8 |
+/// | `Nodes<T, I>` | node array start / `size_of::<Node<T, I>>()` 16 (72) / `offset_of!(Node<T, I>, data)` 0 | `nodes + offset_of!(Node<T, I>, …)` 8·12 / 16 (72) |
 ///
 /// ```text
 /// Split      data  [d0][d1][d2]…      prev [p0][p1]…      next [n0][n1]…
@@ -203,14 +185,17 @@ impl_ix!(u8, u16, u32, u64, usize);
 ///                  ↑ data=nodes+0, prev=nodes+8, next=nodes+12, stride 16
 /// ```
 ///
-///「两个索引域」：`data` 域按 `Layout` 的步长走（宽度由布局决定），**链接域一律是
-/// `Ix` 宽度**（默认 8 字节，见 [`DefaultIx`]）——[`IterMut`](crate::IterMut) 靠 `ix_width` 决定怎么读。
+/// "Two index domains": the `data` domain follows `Layout`'s stride (width set by the
+/// layout), while the **link domain is always `Ix` width** (8 bytes by default, see
+/// [`DefaultIx`]) — [`IterMut`](crate::IterMut) uses `ix_width` to decide how to read.
 ///
-/// 地址能这么算，靠的是三条不变量：① 指针来自同一个容器自己的 `Vec`，而 `Layout`
-/// 只在迭代器持有 `&'a mut List` 的那段独占期里用（中途不会 realloc / 搬家）；
-/// ② 下标只落在已分配的槽位内；③ 数组里每个 `prev`/`next` 都是**合法下标**
-/// （两端是"指向自己的哑元"，见 crate 文档），所以可以无条件读、也可以无条件
-/// `+= base`——这正是 [`Storage::append`] 整块搬运的前提。
+/// Computing addresses this way rests on three invariants: (1) the pointers come from the
+/// container's own `Vec`, and `Layout` is only used during the exclusive period when an
+/// iterator holds `&'a mut List` (no realloc / relocation in between); (2) indices stay
+/// within allocated slots; (3) every `prev`/`next` in the arrays is a **valid index** (the
+/// two ends are "self-referential dummy" links, see the crate docs), so they can be read
+/// unconditionally and `+= base` applied unconditionally — which is exactly the premise for
+/// [`Storage::append`]'s wholesale relocation.
 #[doc(hidden)]
 pub struct Layout {
     pub(crate) data: *mut u8,
@@ -220,111 +205,114 @@ pub struct Layout {
     pub(crate) prev_stride: usize,
     pub(crate) next: *const u8,
     pub(crate) next_stride: usize,
-    /// 链接元素的字节宽度（1/2/4/8）：迭代器按裸地址读链接时要按它来读 + 加宽。
+    /// Byte width of a link element (1/2/4/8): the iterator uses it to read and step
+    /// through links at raw addresses.
     pub(crate) ix_width: usize,
 }
 
 #[doc(hidden)]
 pub mod sealed {
-    /// 封闭 [`super::Storage`]，外部无法实现。
+    /// Seals [`super::Storage`] so external types cannot implement it.
     pub trait Sealed {}
 }
 
-/// 存储策略。
+/// Storage strategy.
 ///
-/// 这个 trait 是**封闭**的：只由本 crate 的三种布局实现。它是
-/// [`List`](crate::List) 的实现细节，出现在类型参数位置上。
+/// This trait is **sealed**: only the three layouts of this crate implement it. It is an
+/// implementation detail of [`List`](crate::List) and appears in type-parameter position.
 pub trait Storage<T>: sealed::Sealed {
-    /// 已分配的槽位总数（live + free）。
+    /// Total number of allocated slots (live + free).
     fn slots(&self) -> usize;
 
-    /// 是否没有任何槽位。
+    /// Whether there are no slots at all.
     fn is_empty(&self) -> bool {
         self.slots() == 0
     }
 
-    /// 预留至少 `additional` 个槽位的容量（`len + additional`）。
+    /// Reserve capacity for at least `additional` more slots (`len + additional`).
     fn reserve(&mut self, additional: usize);
 
-    /// 把底层 `Vec` 的**多余容量**还给分配器。**槽位数不变**（空闲槽是 free 链的一部分，
-    /// 也是句柄指向的东西，不能丢）⇒ 不变量、`Slot` 句柄、链结构全都不动。
+    /// Return the backing `Vec`'s **excess capacity** to the allocator. The **slot count
+    /// does not change** (free slots are part of the free chain and are what handles point
+    /// at, so they cannot be dropped) => invariants, `Slot` handles and chain structure are
+    /// all untouched.
     fn shrink_to_fit(&mut self) {
-        // 默认：无操作（自定义布局可以不支持）
+        // Default: no-op (a custom layout may not support it)
     }
 
-    /// 追加一个新槽位并返回其下标。
+    /// Append a new slot and return its index.
     ///
-    /// 两条链接先初始化成指向自己的自环：调用方随后就会重写需要的那几条，
-    /// 但**两端那两条"哑元"字段可能一直留着这个值**，所以它必须是合法下标
-    /// （见 [`append`](Storage::append)：整段下标都要无条件加偏移）。
+    /// Both links are initialized to self-loops first: the caller rewrites the ones it needs
+    /// right after, but **the two "dummy" link fields at the ends may keep this value
+    /// forever**, so it must be a valid index (see [`append`](Storage::append): every index
+    /// in the run is offset unconditionally).
     fn grow(&mut self) -> usize;
 
-    /// 把 `other` 的全部槽位接到 `self` 后面，并把搬过来的**每个下标都加上
-    /// 偏移**（偏移量 = 搬运前 `self.slots()`，由实现自己取）。搬完 `other` 变空
-    /// （容量留在它自己那里）。
+    /// Append all of `other`'s slots after `self` and add an **offset to every index moved
+    /// over** (offset = `self.slots()` before the move, taken by the implementation itself).
+    /// Afterwards `other` is empty (its capacity stays with it).
     ///
-    /// 关键是"一边复制一边把**已经更新过**的索引写进自己的 `Vec`"：索引只写
-    /// 一遍（实测比"先整块 memcpy、再原地读改写修一遍"快 ~0.7ms/24MB，甚至
-    /// 比纯 memcpy 三个数组还快——因为省掉了 16MB 读 + 16MB 写）。
+    /// The key is "copy and write the **already-updated** index into one's own `Vec` at the
+    /// same time": each index is written once, which measured faster than a bulk memcpy
+    /// followed by an in-place read-modify-write pass (~0.7 ms/24 MB), and even faster than
+    /// a plain three-array memcpy, because it saves a 16 MB read + 16 MB write.
     ///
-    /// # 代价结构（实测，1M ⊕ 1M，24 MB 载荷）
+    /// The measured cost is dominated by allocator behavior, not the copy: with mimalloc (the
+    /// crate's benchmark default) a 1M ⊕ 1M append of 24 MB of payload runs in ~3.8-4.3 ms
+    /// with zero page faults, whereas the system malloc pays 4095-8187 page faults and
+    /// 7.9-16 ms. A control experiment that `mmap`s 24 MB and writes one byte per page with
+    /// no copying at all takes 8.2 ms / 5860 pages under both allocators, so this path is
+    /// billed **per page**: faulting, not copying, is the dominant cost (glibc switches to
+    /// mmap/munmap above 128 KB; mimalloc reuses segments and purges lazily), which also
+    /// explains how one and the same append can drift from 2 ms to 16 ms — compare page-fault
+    /// counts alongside timings. Only touching the target memory beforehand avoids it — fill
+    /// the elements into existing free slots, i.e. [`crate::List::append_elementwise`]
+    /// (measured ~2.1 ms). `madvise(MADV_HUGEPAGE)` would in theory erase the cost (5860 pages
+    /// -> 239 in the best case), but this machine runs THP in `madvise` mode with
+    /// `nr_hugepages=0`, so the re-measurement is unstable and it is not something to count on.
     ///
-    /// | 组成 | 时间 |
-    /// |---|---|
-    /// | 拷贝 + 下标改写（目标内存**已触碰**） | 1.6 ~ 2.3 ms（~25 GB/s） |
-    /// | 再叠加 `realloc`（把旧数据 24 MB 搬进新块） | +1.9 ~ 3.1 ms |
-    /// | 分配器若把大块还给内核：**每页 ~1.4 µs** 的物化费 | 4095 ~ 8187 页 ⇒ +5.7 ~ 11.5 ms |
+    /// Three negative results (all measured; do not retry):
     ///
-    /// 前两项是算法成本（mimalloc 下实测真实 append 3.8 ~ 4.3 ms、0 缺页）；第三
-    /// 项是"不及预期"的来源，而它只取决于分配器：
-    ///
-    /// | 分配器 | 真实 append | 缺页 |
-    /// |---|---|---|
-    /// | mimalloc（本仓库基准默认） | 3.8 ~ 4.3 ms | 0 |
-    /// | 系统 malloc | 7.9 ~ 16 ms | 4095 ~ 8187 |
-    ///
-    /// 对照实验（决定性）：`mmap` 24 MB、**每页只写 1 字节、不做任何拷贝**，就要
-    /// 8.2 ms / 5860 页——两种分配器下完全一致。也就是说这条路按**页**计费，缺页
-    /// 才是大头，拷贝不是。分配器是否把大块还给内核（glibc 超过 128 KB 走
-    /// mmap/munmap；mimalloc 靠段复用与延迟 purge）决定付不付这笔钱，也解释了同
-    /// 一个 append 在不同时刻能从 2 ms 漂到 16 ms——比较时请同时看缺页数。
-    ///
-    /// 只有"目标内存已经触碰过"能真正省掉它——所以想要零新页就把元素填进自己已有的
-    /// 空闲槽，即 [`crate::List::append_elementwise`]（复用已触碰的槽，实测 ~2.1 ms）。
-    /// `madvise(MADV_HUGEPAGE)` 理论上
-    /// 能抹掉这笔钱（最好一次 5860 页 → 239 页），但本机 THP 是 `madvise` 模式且
-    /// `nr_hugepages=0`，复测就不稳定（4838 页），不能指望。
-    ///
-    /// 三条否定结论（都实测过，别重复试）：
-    ///
-    /// - `map(|i| i + base)` 与 `extend_from_slice` 同速 ⇒ 索引改写没有优化空间；
-    /// - u32 索引只减字节、不减这条路的时间（按页计费，缺页数不变）；
-    /// - **先 `reserve` 再 append 没有可测收益**——std 的 `Vec::append`/`extend`
-    ///   内部本来就是"先 reserve 再拷"，显式写出来（两种分配器各 3 次）时间与缺页
-    ///   数完全一致；反过来 `reserve_exact` 会削掉摊还余量，让紧随的第一次 `push`
-    ///   再付一次全量搬运（实测 3.9→7.5 ms、15.5→34.0 ms，**翻倍**）
+    /// - `map(|i| i + base)` matches `extend_from_slice` => the index rewrite has no room for
+    ///   improvement;
+    /// - a `u32` index only saves bytes, not time on this path (it is billed per page, and the
+    ///   fault count is unchanged);
+    /// - **`reserve` before append has no measurable benefit** — std's `Vec::append`/`extend`
+    ///   already reserves then copies, and spelling it out (3 runs per allocator) gives
+    ///   identical time and fault counts; conversely `reserve_exact` shaves off the
+    ///   amortization headroom and makes the immediate next `push` pay a full relocation again
+    ///   (measured 3.9->7.5 ms, 15.5->34.0 ms, i.e. **doubled**).
     fn append(&mut self, other: &mut Self);
 
+    /// The slot's element storage, as `MaybeUninit`: a slot may be uninitialized,
+    /// and reading it before `assume_init_*` is UB.
     fn data(&self, slot: usize) -> &MaybeUninit<T>;
+    /// Mutable access to the slot's element storage (same caveat as [`Storage::data`]).
     fn data_mut(&mut self, slot: usize) -> &mut MaybeUninit<T>;
-    /// 槽位当前是否空闲。**只看 `prev` 的最高位**，不读 `data`（空闲槽的 `data`
-    /// 是未初始化的，碰它就是 UB）。
+    /// Whether the slot is currently free. **Reads only the top bit of `prev`**, never
+    /// `data` (a free slot's `data` is uninitialized, and touching it is UB).
     fn is_free(&self, slot: usize) -> bool;
 
-    /// 把槽位标记成空闲（挂回 free 链时调用）。重复标记是幂等的。
+    /// Mark the slot free (called when pushing it back onto the free chain). Repeated
+    /// marking is idempotent.
     ///
-    /// 实现里就地把 `prev` 的最高位（[`Ix::FREE_BIT`]）置上，不做读-改-写之外的任何事——
-    /// `append` 的整段 `+= base` 会把它变成 `FREE_BIT | base`，标记位仍在。
+    /// The implementation sets the top bit ([`Ix::FREE_BIT`]) of `prev` in place and does
+    /// nothing beyond that read-modify-write — `append`'s wholesale `+= base` turns it into
+    /// `FREE_BIT | base`, and the mark bit remains.
     fn mark_free(&mut self, slot: usize);
 
-    /// 槽位的前驱下标。
+    /// Predecessor index of the slot.
     ///
-    /// **契约：只在 `!is_free(slot)` 的槽位上调用**（空闲槽的 `prev` 就是空闲标记位本身，
-    /// 没有意义）。因此这里**不做掩码**——掩码会让每个读取点多一条 and、并拖长取地址的
-    /// 依赖链；越界误用由 debug 构建的 `debug_assert` 抓住。
+    /// **Contract: only call this on a slot with `!is_free(slot)`** (a free slot's `prev` is
+    /// the free mark bit itself and is meaningless). Hence there is **no masking** here:
+    /// masking would add an `and` at every read site and lengthen the address dependency
+    /// chain; out-of-range misuse is caught by a `debug_assert` in debug builds.
     fn prev(&self, slot: usize) -> usize;
+    /// Successor index of the slot.
     fn next(&self, slot: usize) -> usize;
+    /// Set the predecessor index of the slot.
     fn set_prev(&mut self, slot: usize, value: usize);
+    /// Set the successor index of the slot.
     fn set_next(&mut self, slot: usize, value: usize);
 
     #[doc(hidden)]
@@ -332,29 +320,32 @@ pub trait Storage<T>: sealed::Sealed {
 }
 
 // ============================================================
-// 默认索引宽度
+// Default index width
 // ============================================================
 
-/// 索引宽度默认值：**`usize`**。
+/// Default index width: **`usize`**.
 ///
-/// 开 `u32-index` feature 换成 `u32`（每槽省 1/3、`append` 快 37%，上限见
-/// [`Ix::MAX_SLOTS`]）——那是"在窄索引下跑全套测试/基准"的开关，**默认关闭**。
+/// The `u32-index` feature switches it to `u32` (one third fewer bytes per slot, 37% faster
+/// `append`, limit see [`Ix::MAX_SLOTS`]) — a switch for "run the full test suite /
+/// benchmarks under a narrow index", **off by default**.
 #[cfg(feature = "u32-index")]
 pub type DefaultIx = u32;
+/// [`DefaultIx`] without the `u32-index` feature (the default configuration).
 #[cfg(not(feature = "u32-index"))]
 pub type DefaultIx = usize;
 
 // ============================================================
-// Split：数据、前驱、后继三条流各自成数组
+// Split: data, prev and next each in their own array
 // ============================================================
 
-/// **三条流完全分开**：`data` / `prev` / `next` 各一个 `Vec`。
+/// **Three completely separate streams**: one `Vec` each for `data` / `prev` / `next`.
 ///
-/// 走链只碰索引数组（`u32` 时 4 B/槽），带宽最省；代价是每个槽位三个基址，
-/// 元素与链接永远不在同一条 cache line。
+/// Walking the chain touches only the index arrays (4 B/slot at `u32`), the most
+/// bandwidth-efficient option; the cost is three base addresses per slot, so an element and
+/// its links never share a cache line.
 ///
-/// 索引宽度可调（`prev`/`next` 一起窄）：`Split<T, u16>` / `Split<T, u32>` /
-/// `Split<T, usize>`，默认见 [`DefaultIx`]。
+/// The index width is adjustable (`prev`/`next` narrow together): `Split<T, u16>` /
+/// `Split<T, u32>` / `Split<T, usize>`, default see [`DefaultIx`].
 pub struct Split<T, I = DefaultIx> {
     data: Vec<MaybeUninit<T>>,
     prev: Vec<I>,
@@ -362,6 +353,7 @@ pub struct Split<T, I = DefaultIx> {
 }
 
 impl<T, I: Ix> Split<T, I> {
+    /// Creates an empty layout with no allocated slots.
     pub const fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -372,30 +364,41 @@ impl<T, I: Ix> Split<T, I> {
 }
 
 impl<T, I: Ix> Split<T, I> {
-    /// 裸部件（只读）：`(data, prev, next)`，三者长度相等 = 槽位数。
+    /// Raw parts (read-only): `(data, prev, next)`, all three the same length = slot count.
     ///
-    /// **这是"状态可搬运"的入口**：整条链的全部状态 = 这些数组 + 那五个数字
-    /// （[`List::into_raw`](crate::List::into_raw)），序列化 / 落盘 / 共享内存都从这里取。
+    /// **This is the entry point for movable state**: the whole state of a chain = these
+    /// arrays + those five numbers ([`List::into_raw`](crate::List::into_raw));
+    /// serialization, persistence and shared memory all take it from here.
     pub fn as_parts(&self) -> (&[MaybeUninit<T>], &[I], &[I]) {
         (&self.data, &self.prev, &self.next)
     }
 
-    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    /// Raw parts (taking ownership), to be paired with [`Self::from_parts`].
     pub fn into_parts(self) -> (Vec<MaybeUninit<T>>, Vec<I>, Vec<I>) {
         (self.data, self.prev, self.next)
     }
 
-    /// 从裸部件装回去。
+    /// Rebuild from raw parts.
     ///
     /// # Safety
     ///
-    /// 调用者保证：三个数组长度相等；每个 `prev`/`next` 都是**合法槽位下标**
-    /// （不变量：`NIL` 从不写进数组，两端哑元是自环）；**空闲槽的 `prev` 最高位是
-    /// 空闲标记**（[`Ix::FREE_BIT`]），否则 `is_free` 判错、`assume_init_drop` 会踩
-    /// 未初始化数据；live 槽的 `data` 必须已初始化。不满足是 UB，不会 panic。
+    /// The caller guarantees: the three arrays have equal length; every `prev`/`next` is a
+    /// **valid slot index** (invariant: `NIL` is never written into the arrays, the two end
+    /// dummies are self-loops); **the top bit of a free slot's `prev` is the free mark**
+    /// ([`Ix::FREE_BIT`]), otherwise `is_free` decides wrongly and `assume_init_drop` steps
+    /// on uninitialized data; a live slot's `data` must be initialized. Violating this is
+    /// UB, not a panic.
     pub unsafe fn from_parts(data: Vec<MaybeUninit<T>>, prev: Vec<I>, next: Vec<I>) -> Self {
-        debug_assert_eq!(data.len(), prev.len(), "from_parts: data/prev 长度不等");
-        debug_assert_eq!(data.len(), next.len(), "from_parts: data/next 长度不等");
+        debug_assert_eq!(
+            data.len(),
+            prev.len(),
+            "from_parts: data/prev lengths differ"
+        );
+        debug_assert_eq!(
+            data.len(),
+            next.len(),
+            "from_parts: data/next lengths differ"
+        );
 
         Self { data, prev, next }
     }
@@ -442,7 +445,7 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
         }
 
         self.data.push(MaybeUninit::uninit());
-        // 哑元：指向自己的自环（合法下标，见 trait 里的说明）
+        // dummy: a self-loop (a valid index, see the trait docs)
         self.prev.push(I::from_usize(slot));
         self.next.push(I::from_usize(slot));
 
@@ -452,19 +455,21 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
     fn append(&mut self, other: &mut Self) {
         let base = self.slots();
 
-        // 先一次性确认整体不越界（这样下面的逐元素加基址就不会向标记位进位）
+        // Confirm up front that the whole thing is in range (so the per-element base
+        // addition below never carries into the mark bit)
         if base + other.slots() > I::MAX_SLOTS {
             ix_overflow();
         }
 
         let base = I::from_usize(base);
 
-        // data 没有下标要修 ⇒ 直接整块搬（会搬空 other.data）
+        // data has no indices to fix => move it wholesale (empties other.data)
         self.data.append(&mut other.data);
-        // 两个索引数组一边复制一边加：只写一遍。
-        // **在窄整数域里加**，不能过 `from_usize`：空闲槽的 `prev` 还带着空闲标记位
-        // （`FREE_BIT | v`），加上基址之后仍是 `FREE_BIT | (v + base)` —— 这正是
-        // `prev` 不需要单独修标记位的原因（见 `FREE_BIT` 的文档）。
+        // The two index arrays are copied and incrementally offset: written once.
+        // The addition happens **in the narrow integer domain**, not through `from_usize`:
+        // a free slot's `prev` still carries the free mark (`FREE_BIT | v`), and adding the
+        // base yields `FREE_BIT | (v + base)` — which is exactly why `prev` needs no
+        // separate mark-bit fixup (see the `FREE_BIT` docs).
         self.prev.extend(other.prev.iter().map(|&ix| ix + base));
         self.next.extend(other.next.iter().map(|&ix| ix + base));
 
@@ -484,8 +489,8 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
 
     #[inline]
     fn is_free(&self, slot: usize) -> bool {
-        // 当**布尔**用时不必担心立即数：LLVM 会把"与最高位"化成一次移位
-        // （实测 2 条指令、没有 `movabs`，见 FREE_BIT 的文档）。
+        // As a **boolean** the immediate is not a concern: LLVM lowers "and the top bit"
+        // to a single shift (see the FREE_BIT docs).
         unsafe { (*self.prev.get_unchecked(slot) & I::FREE_BIT) != I::ZERO }
     }
 
@@ -496,7 +501,7 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
 
     #[inline]
     fn prev(&self, slot: usize) -> usize {
-        debug_assert!(!self.is_free(slot), "只能在 live 槽位上读 prev");
+        debug_assert!(!self.is_free(slot), "prev may only be read on a live slot");
         unsafe { self.prev.get_unchecked(slot).to_usize() }
     }
 
@@ -530,33 +535,38 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
 }
 
 // ============================================================
-// PackedLinks：data 一个 Vec，prev/next 打包成 Link
+// PackedLinks: one Vec for data, prev/next packed into a Link
 // ============================================================
 
-/// `PackedLinks` 布局里一条槽位的两条链接。
+/// The two links of one slot in the `PackedLinks` layout.
 ///
-/// 公开是因为**裸部件 API**（`PackedLinks::as_parts` / `from_parts`）要把它交出去 ——
-/// 想自己序列化 / 从共享内存恢复整条链，就需要能读写这个类型。
+/// Public because the **raw-parts API** (`PackedLinks::as_parts` / `from_parts`) hands it
+/// out — serializing a chain yourself or restoring it from shared memory requires reading
+/// and writing this type.
 #[derive(Clone, Copy, Debug)]
 pub struct Link<I> {
-    /// 前驱槽位下标（空闲槽的最高位是空闲标记，见 [`Ix::FREE_BIT`]）。
+    /// Predecessor slot index (a free slot's top bit is the free mark, see [`Ix::FREE_BIT`]).
     pub prev: I,
-    /// 后继槽位下标。
+    /// Successor slot index.
     pub next: I,
 }
 
-/// **只有索引成对交错**：`data` 一个 `Vec`，`prev`/`next` 打包进同一个 `Link` 数组。
+/// **Only the indices are interleaved in pairs**: one `Vec` for `data`, `prev`/`next`
+/// packed into a single `Link` array.
 ///
-/// 走链时两条链接同处一条 cache line（一次 miss 拿到前驱和后继），`data` 仍独立
-/// ⇒ 判空闲标记只碰索引、不碰元素。
+/// Walking the chain keeps both links on one cache line (a single miss fetches predecessor
+/// and successor), while `data` stays separate => checking the free mark touches only the
+/// indices, never the elements.
 ///
-/// 索引宽度可调（两个字段在同一个 `Link` 里，只能一起窄）。默认见 [`DefaultIx`]。
+/// The index width is adjustable (the two fields share one `Link`, so they narrow together).
+/// Default see [`DefaultIx`].
 pub struct PackedLinks<T, I = DefaultIx> {
     data: Vec<MaybeUninit<T>>,
     links: Vec<Link<I>>,
 }
 
 impl<T, I: Ix> PackedLinks<T, I> {
+    /// Creates an empty layout with no allocated slots.
     pub const fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -566,24 +576,29 @@ impl<T, I: Ix> PackedLinks<T, I> {
 }
 
 impl<T, I: Ix> PackedLinks<T, I> {
-    /// 裸部件（只读）：`(data, links)`，两个数组长度相等 = 槽位数。
+    /// Raw parts (read-only): `(data, links)`, both arrays the same length = slot count.
     pub fn as_parts(&self) -> (&[MaybeUninit<T>], &[Link<I>]) {
         (&self.data, &self.links)
     }
 
-    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    /// Raw parts (taking ownership), to be paired with [`Self::from_parts`].
     pub fn into_parts(self) -> (Vec<MaybeUninit<T>>, Vec<Link<I>>) {
         (self.data, self.links)
     }
 
-    /// 从裸部件装回去。
+    /// Rebuild from raw parts.
     ///
     /// # Safety
     ///
-    /// 要求与 [`Split::from_parts`] 相同：两个数组长度相等；每个 `prev`/`next` 都是合法槽位
-    /// 下标；空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
+    /// Same requirements as [`Split::from_parts`]: the two arrays have equal length; every
+    /// `prev`/`next` is a valid slot index; the top bit of a free slot's `prev` is the free
+    /// mark ([`Ix::FREE_BIT`]); a live slot's `data` is initialized.
     pub unsafe fn from_parts(data: Vec<MaybeUninit<T>>, links: Vec<Link<I>>) -> Self {
-        debug_assert_eq!(data.len(), links.len(), "from_parts: data/links 长度不等");
+        debug_assert_eq!(
+            data.len(),
+            links.len(),
+            "from_parts: data/links lengths differ"
+        );
 
         Self { data, links }
     }
@@ -646,8 +661,9 @@ impl<T, I: Ix> Storage<T> for PackedLinks<T, I> {
         let base = I::from_usize(base);
 
         self.data.append(&mut other.data);
-        // 两条链接打包在同一个数组里，也只需要写一遍（加法在窄整数域里做，
-        // 空闲槽的 `prev` 带着标记位，见 FREE_BIT 文档）
+        // Both links are packed into one array, so they too are written only once (the
+        // addition happens in the narrow integer domain; a free slot's `prev` carries the
+        // mark bit, see the FREE_BIT docs)
         self.links.extend(other.links.iter().map(|link| Link {
             prev: link.prev + base,
             next: link.next + base,
@@ -678,7 +694,7 @@ impl<T, I: Ix> Storage<T> for PackedLinks<T, I> {
 
     #[inline]
     fn prev(&self, slot: usize) -> usize {
-        debug_assert!(!self.is_free(slot), "只能在 live 槽位上读 prev");
+        debug_assert!(!self.is_free(slot), "prev may only be read on a live slot");
         unsafe { self.links.get_unchecked(slot).prev.to_usize() }
     }
 
@@ -714,62 +730,66 @@ impl<T, I: Ix> Storage<T> for PackedLinks<T, I> {
 }
 
 // ============================================================
-// Nodes：全部字段放进一个 Node
+// Nodes: all fields in a single Node
 // ============================================================
 
-/// `Nodes` 布局里的一个槽位：元素与两条链接同处一条 cache line。
+/// One slot in the `Nodes` layout: element and both links share a cache line.
 ///
-/// 公开的理由同 [`Link`]（裸部件 API）。
+/// Public for the same reason as [`Link`] (raw-parts API).
 pub struct Node<T, I> {
-    /// 元素；空闲槽这里是未初始化的（**不要** `assume_init`）。
+    /// The element; uninitialized on a free slot (**do not** `assume_init`).
     pub data: MaybeUninit<T>,
-    /// 前驱槽位下标（空闲槽的最高位是空闲标记，见 [`Ix::FREE_BIT`]）。
+    /// Predecessor slot index (a free slot's top bit is the free mark, see [`Ix::FREE_BIT`]).
     pub prev: I,
-    /// 后继槽位下标。
+    /// Successor slot index.
     pub next: I,
 }
 
 impl<T, I> Node<T, I> {
-    /// 组装一个槽位。
+    /// Assemble one slot.
     pub fn new(data: MaybeUninit<T>, prev: I, next: I) -> Self {
         Self { data, prev, next }
     }
 }
 
-/// **数据与索引整节点交错**：每槽一个 `Node`（`data` + `prev` + `next`），一个 `Vec` 装完。
+/// **Data and indices interleaved per node**: one `Node` per slot (`data` + `prev` + `next`)
+/// in a single `Vec`.
 ///
-/// `next` 与 `data` 同处一条 cache line（拿到下标顺带有元素）⇒ 短暂访问元素最省；
-/// 代价是**只判空闲标记也要按整节点付带宽**（见 [`List::clear`](crate::List::clear) 的密度表：它的扫描
-/// 阈值最高）。
+/// `next` shares a cache line with `data` (getting the index brings the element along) =>
+/// cheapest for briefly visiting elements; the cost is that **even checking the free mark
+/// pays the bandwidth of a whole node** (see the density table of
+/// [`List::clear`](crate::List::clear): its scan threshold is the highest).
 ///
-/// 索引宽度默认见 [`DefaultIx`]。
+/// Default index width see [`DefaultIx`].
 pub struct Nodes<T, I = DefaultIx> {
     nodes: Vec<Node<T, I>>,
 }
 
 impl<T, I: Ix> Nodes<T, I> {
+    /// Creates an empty layout with no allocated slots.
     pub const fn new() -> Self {
         Self { nodes: Vec::new() }
     }
 }
 
 impl<T, I: Ix> Nodes<T, I> {
-    /// 裸部件（只读）：`nodes`（每个节点自带元素与两条链接）。
+    /// Raw parts (read-only): `nodes` (each node carries its element and both links).
     pub fn as_parts(&self) -> &[Node<T, I>] {
         &self.nodes
     }
 
-    /// 裸部件（拿走所有权），配合 [`Self::from_parts`]。
+    /// Raw parts (taking ownership), to be paired with [`Self::from_parts`].
     pub fn into_parts(self) -> Vec<Node<T, I>> {
         self.nodes
     }
 
-    /// 从裸部件装回去。
+    /// Rebuild from raw parts.
     ///
     /// # Safety
     ///
-    /// 要求与 [`Split::from_parts`] 相同：每个节点里的 `prev`/`next` 都是合法槽位下标；
-    /// 空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
+    /// Same requirements as [`Split::from_parts`]: every node's `prev`/`next` is a valid slot
+    /// index; the top bit of a free slot's `prev` is the free mark ([`Ix::FREE_BIT`]); a live
+    /// slot's `data` is initialized.
     pub unsafe fn from_parts(nodes: Vec<Node<T, I>>) -> Self {
         Self { nodes }
     }
@@ -829,8 +849,9 @@ impl<T, I: Ix> Storage<T> for Nodes<T, I> {
 
         let base = I::from_usize(base);
 
-        // data 和两条链接在同一个数组里，"一遍过"就意味着 data 也要逐元素搬
-        // （丢掉了 memcpy）；这里按最省事的方式写，让编译器 best-effort。
+        // data and both links live in the same array, so "one pass" means data has to be
+        // moved element by element too (no memcpy); written in the least-effort way and
+        // left to the compiler's best effort.
         self.nodes.extend(other.nodes.drain(..).map(|node| Node {
             data: node.data,
             prev: node.prev + base,
@@ -882,7 +903,7 @@ impl<T, I: Ix> Storage<T> for Nodes<T, I> {
         let nodes = self.nodes.as_ptr() as *const u8;
 
         Layout {
-            // 基址是节点数组本身，`data_offset` 再把地址挪到 `data` 字段
+            // The base is the node array itself; `data_offset` moves the address to the `data` field
             data: self.nodes.as_mut_ptr() as *mut u8,
             data_stride: size_of::<Node<T, I>>(),
             data_offset: offset_of!(Node<T, I>, data),
