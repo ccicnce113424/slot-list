@@ -38,6 +38,15 @@ jobs:
       # The `clear` density curve / break-even check behind PERFORMANCE.md §5.
       - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
 
+      # `Swatinem/rust-cache` caches `target`, and its post-job cleanup deletes every file
+      # under `target` directories that do not look like a cargo profile (`build`,
+      # `.fingerprint`, `deps`, `tests`), keeping only the directory skeleton. So a restored
+      # `target/criterion` is all directories and no data. criterion checks existence, not
+      # contents (`base_dir_exists`), so with `--save-baseline r1` it reads
+      # `.../<bench>/r1/sample.json`, fails with "No such file or directory" once per
+      # benchmark, and drops the comparison. The skeleton holds no data, so drop it first.
+      - run: rm -rf target/criterion
+
       # Same-machine A/B is the method behind PERFORMANCE.md; a shared runner is a
       # different machine class, so read ratios inside one run and never compare
       # absolute values across runs. Measured over two x86 runner instances: the
@@ -90,6 +99,10 @@ jobs:
       - run: cargo bench --no-run --features linked-list-cursors
       - run: cargo bench --no-run --features mimalloc,linked-list-cursors
       - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
+
+      # See the x86_64 job: the cache restores `target/criterion` as a file-less skeleton,
+      # which criterion mistakes for a baseline and reports as "No such file or directory".
+      - run: rm -rf target/criterion
 
       # `churn` is the pure-code group where the free-marking write shows up, and
       # `clear_drop` covers the reclaim paths. The filter matches whole benchmark ids, so
