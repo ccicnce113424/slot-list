@@ -49,8 +49,10 @@ jobs:
 
       # Same-machine A/B is the method behind PERFORMANCE.md; a shared runner is a
       # different machine class, so read ratios inside one run and never compare
-      # absolute values across runs. Measured over two x86 runner instances: the
-      # code-bound groups agree within ~0.5%, the allocator-bound groups swing 8-40%.
+      # absolute values across runs. Measured over three x86 dispatches: a pair on one
+      # model agreed per group within a median factor of 1.00-1.15, a pair on different
+      # models (EPYC 7763 vs Xeon 6973P-C) moved whole groups by 1.11-1.50 (worst single
+      # benchmark 2.35x), code-bound groups included; `machine.txt` names the model.
       # `repeat > 1` measures the same commit N times in N processes and keeps one
       # criterion baseline per pass, which is the run-to-run spread on one instance.
       # The spread between two dispatches adds the instance draw on top.

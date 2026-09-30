@@ -50,11 +50,14 @@ noted. See §1.2 for the element types and §3 for the full tables.
 | Harness | criterion 0.8, `sample_size(10)`, warm-up 500 ms, measurement 1 s, **median**, single-threaded single process |
 
 Every number in this document is a same-machine A/B on the machine above. CI runs the same benches
-on GitHub-hosted runners (`x86_64`: a shared 2-core EPYC vCPU; `arm64`: Neoverse-N2) and uploads
-`target/criterion` plus a `machine.txt` with `lscpu`/`rustc -Vv`; that is a different machine class,
-so do not mix those artifacts with this table. Measured across two x86 runner instances, the
-code-bound groups agree within about 0.5% while the allocator-bound groups swing 8-40%; the arm64
-runner varies 1-19% even on `churn`, so it only supports structural conclusions.
+on GitHub-hosted runners and uploads `target/criterion` plus a `machine.txt` with `lscpu`/`rustc -Vv`;
+that is a different machine class, so do not mix those artifacts with this table. The runner is not
+one machine either: x86 dispatches have landed on 4-vCPU AMD EPYC 7763 and 4-vCPU Intel Xeon 6973P-C
+instances. Across three dispatches, a pair on one model agreed per group within a median factor of
+1.00-1.15 (worst single benchmark 1.57x, allocator-bound), while a pair on different models moved
+whole groups by a median factor of 1.11-1.50 (worst 2.35x), code-bound groups included. Two arm64
+instances (Neoverse-N2) agreed within 1.19x. A CI artifact therefore supports structural conclusions
+and A/B inside one run on one model, never a comparison against this table or another dispatch.
 
 ### 1.2 Element types used below
 
