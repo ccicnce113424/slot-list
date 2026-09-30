@@ -267,7 +267,7 @@ pub trait Storage<T>: sealed::Sealed {
     /// explains how one and the same append can drift from 2 ms to 16 ms — compare page-fault
     /// counts alongside timings. Only touching the target memory beforehand avoids it — fill
     /// the elements into existing free slots, i.e. [`crate::List::append_elementwise`]
-    /// (measured ~2.1 ms). `madvise(MADV_HUGEPAGE)` would in theory erase the cost (5860 pages
+    /// (measured ~1.8 ms). `madvise(MADV_HUGEPAGE)` would in theory erase the cost (5860 pages
     /// -> 239 in the best case), but this machine runs THP in `madvise` mode with
     /// `nr_hugepages=0`, so the re-measurement is unstable and it is not something to count on.
     ///
@@ -275,8 +275,8 @@ pub trait Storage<T>: sealed::Sealed {
     ///
     /// - `map(|i| i + base)` matches `extend_from_slice` => the index rewrite has no room for
     ///   improvement;
-    /// - a `u32` index only saves bytes, not time on this path (it is billed per page, and the
-    ///   fault count is unchanged);
+    /// - a `u32` index cuts this path by ~32% (3.67 → 2.48 ms for a 1M ⊕ 1M `SplitList` append
+    ///   in the benchmarks' `index_width` group) — fewer bytes per slot is real here;
     /// - **`reserve` before append has no measurable benefit** — std's `Vec::append`/`extend`
     ///   already reserves then copies, and spelling it out (3 runs per allocator) gives
     ///   identical time and fault counts; conversely `reserve_exact` shaves off the
@@ -325,7 +325,7 @@ pub trait Storage<T>: sealed::Sealed {
 
 /// Default index width: **`usize`**.
 ///
-/// The `u32-index` feature switches it to `u32` (one third fewer bytes per slot, 37% faster
+/// The `u32-index` feature switches it to `u32` (one third fewer bytes per slot, ~32% faster
 /// `append`, limit see [`Ix::MAX_SLOTS`]) — a switch for "run the full test suite /
 /// benchmarks under a narrow index", **off by default**.
 #[cfg(feature = "u32-index")]

@@ -47,9 +47,8 @@
 //!
 //! The alias's second parameter is the **index width** ([`Ix`]), defaulting to
 //! [`DefaultIx`] = `usize`; enabling the `u32-index` feature switches it to `u32`: a
-//! third less per slot and `append` 37% faster, at the cost of a 2.1G slot limit
-//! (see [`Ix::MAX_SLOTS`]). **Most numbers in `PERFORMANCE.md` were measured in the
-//! `u32`-index era.**
+//! third less per slot and `append` ~32% faster, at the cost of a 2.1G slot limit
+//! (see [`Ix::MAX_SLOTS`]). **`PERFORMANCE.md` is measured with this default.**
 //!
 //! All three are aliases of [`List<T, S>`]: the logic is written once, and the layout
 //! differences come from the [`Storage`] strategy.

@@ -869,10 +869,11 @@ impl<T, S: Storage<T>> List<T, S> {
     /// random slot accesses** (each a dependent load plus a random read-modify-write), while
     /// **scanning is O(slots) sequential accesses** (streaming over just the few mark bytes). The
     /// break-even density moves with **index width** and **layout**: a full table favors scanning
-    /// by up to ~7× with a `u32` Split index, while a sparse table favors the walk by orders of
-    /// magnitude (at density 0.001 the walk is ~100× faster). The threshold is therefore **0.5**:
-    /// scan when `2 * len >= slots`. Across the six layout/index combinations this keeps the
-    /// result between 0.99× and 1.43× (worst case a tie, no combination measurably slower).
+    /// by 1.5–2.2× with the default `usize` index (up to ~3× with a `u32` index), while a sparse
+    /// table favors the walk by orders of magnitude (at density 0.001 the walk is ~200–400×
+    /// faster). The threshold is therefore **0.5**: scan when `2 * len >= slots`. Across the six
+    /// layout/index combinations this keeps the result between 0.99× and 1.81× (worst case a tie,
+    /// no combination measurably slower).
     ///
     /// Data comes from `probe_clear_vs_scan` in `src/tests.rs`:
     /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`.

@@ -77,9 +77,9 @@ decision matrix, and the optimizations that were tried and rejected all live in
 [`PERFORMANCE.md`](PERFORMANCE.md). Headline numbers (1M elements, `usize` index
 — see the document for the reading discipline):
 
-- steady-state `churn` is ~2.2x faster than `LinkedList`, and iteration is on par
-  with it while being 1.74x faster at a 64-byte payload;
-- a handle-based lookup is ~40000x faster than a position-based one on the same
+- steady-state `churn` is ~2.0x faster than `LinkedList`, and iteration is on par
+  with it while being 1.57x faster at a 64-byte payload;
+- a handle-based lookup is ~39000x faster than a position-based one on the same
   workload, because it skips the chain walk entirely.
 
 Benchmarks reproduce with `cargo bench` (system allocator) or
