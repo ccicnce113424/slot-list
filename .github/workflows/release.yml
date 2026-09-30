@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  # Trusted Publishing: exchange this OIDC token for a short-lived crates.io token.
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check that the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          test "v${version}" = "${GITHUB_REF_NAME}" || {
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
+            exit 1
+          }
+
+      - run: cargo test
+      - run: cargo publish --dry-run --locked
+
+      # Requires crates.io Trusted Publishing configured for this repository
+      # (crates.io -> the crate -> Settings -> Trusted Publishing).
+      # Without it, drop this step and set a `CARGO_REGISTRY_TOKEN` secret instead,
+      # passing it to `cargo publish` below.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

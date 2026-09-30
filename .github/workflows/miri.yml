@@ -1,0 +1,30 @@
+name: Miri
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  miri:
+    name: cargo miri test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # The core is unchecked reads/writes plus a raw-address iterator; Miri is what
+      # proves the provenance and aliasing are sound (strict provenance is the
+      # default in current Miri).
+      - run: cargo miri test
+      - run: cargo miri test --features u32-index

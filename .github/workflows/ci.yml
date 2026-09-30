@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default features are `std`; the benches/tests need it.
+      - run: cargo test
+      # The full suite under a narrow index width.
+      - run: cargo test --features u32-index
+
+  lint:
+    name: format, clippy, docs, packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # `mimalloc` is a bench-only feature and compiles on stable, so it can be
+      # covered here; `linked-list-cursors` needs nightly (see the job below).
+      - run: cargo clippy --all-targets --features mimalloc -- --deny warnings
+      # `no_std` + `alloc` paths.
+      - run: cargo check --no-default-features
+      - run: cargo check --no-default-features --features u32-index
+      # `missing_docs` / `unsafe_op_in_unsafe_fn` are `warn` in the crate; deny them here,
+      # together with broken intra-doc links.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      # Builds the crate from the packaged tarball.
+      - run: cargo package
+
+  nightly:
+    name: benches compile, all features (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- --deny warnings
+      - run: cargo bench --no-run --features mimalloc,linked-list-cursors

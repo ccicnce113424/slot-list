@@ -1,0 +1,71 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly: keep the bench targets and the density probe compiling.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: benches-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x86_64:
+    name: build benches, run the clear probe (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Both allocator configurations must keep compiling; `linked-list-cursors`
+      # adds the std-`LinkedList`-cursor comparison rows (nightly only).
+      - run: cargo bench --no-run --features linked-list-cursors
+      - run: cargo bench --no-run --features mimalloc,linked-list-cursors
+      # The `clear` density curve / break-even check behind PERFORMANCE.md §5.
+      - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
+
+      # Numbers from a shared CI runner are only indicative: the machines are noisy
+      # and the allocator-sensitive groups swing by several-fold. Full run on demand.
+      - if: github.event_name == 'workflow_dispatch'
+        run: cargo bench --features mimalloc,linked-list-cursors
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-x86_64
+          path: target/criterion
+          if-no-files-found: ignore
+          retention-days: 14
+
+  arm64:
+    name: build benches, targeted run (arm64)
+    # GitHub-hosted arm64 Linux runners are free for public repositories; a private
+    # repository needs a plan that includes them (otherwise drop this job).
+    # Purpose: the free-marking path (read-modify-write vs a byte-wide store,
+    # PERFORMANCE.md §4 row 10 and the `FREE_BIT` docs) is the part that is expected
+    # to differ per ISA, so this runner exists to re-measure `churn` on AArch64.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --no-run --features linked-list-cursors
+      - run: cargo bench --no-run --features mimalloc,linked-list-cursors
+      - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
+
+      # `churn` is the pure-code, allocation-free group that the free-marking write
+      # shows up in; `clear_drop` covers the reclaim paths.
+      - if: github.event_name == 'workflow_dispatch'
+        run: cargo bench --features mimalloc,linked-list-cursors -- 'churn|clear_drop'
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-arm64
+          path: target/criterion
+          if-no-files-found: ignore
+          retention-days: 14

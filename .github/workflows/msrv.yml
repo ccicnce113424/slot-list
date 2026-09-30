@@ -1,0 +1,27 @@
+name: MSRV
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: msrv-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: 1.85 (library)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # `rust-version = "1.85"` (edition 2024) applies to the library. Only `--lib`
+      # is checked: the dev-dependencies (criterion, mimalloc) may need a newer Rust.
+      - run: cargo check --lib
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --lib --features u32-index

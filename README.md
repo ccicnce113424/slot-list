@@ -1,5 +1,9 @@
 # slot-list
 
+[![CI](https://github.com/ccicnce113424/slot-list/actions/workflows/ci.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/ci.yml)
+[![Miri](https://github.com/ccicnce113424/slot-list/actions/workflows/miri.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/miri.yml)
+[![MSRV](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml)
+
 A doubly linked list whose nodes all live in a single, preallocated, contiguous
 slot array. The **slot index is the element's identity**: it stays stable for as
 long as the element is alive, and freed slots are recycled through a LIFO free

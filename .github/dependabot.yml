@@ -1,0 +1,41 @@
+version: 2
+updates:
+  # GitHub Actions used by the workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Cargo: the dev-dependencies (criterion, mimalloc, fast-list) and the lockfile.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # flake.nix / flake.lock (nixpkgs, crane, flake-parts, fenix).
+  - package-ecosystem: nix
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+    groups:
+      nix:
+        patterns: ["*"]

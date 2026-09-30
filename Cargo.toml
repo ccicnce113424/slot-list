@@ -9,8 +9,8 @@ readme = "README.md"
 keywords = ["linked-list", "no-std", "arena", "data-structures", "slots"]
 categories = ["data-structures", "no-std", "memory-management"]
 authors = ["ccicnce113424 <ccicnce113424@gmail.com>"]
+repository = "https://github.com/ccicnce113424/slot-list"
 documentation = "https://docs.rs/slot-list"
-# The repository URL is intentionally left out until the project has a remote.
 exclude = [
     "/.direnv",
     "/.envrc",
