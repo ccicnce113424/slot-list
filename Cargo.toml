@@ -17,6 +17,9 @@ mimalloc = []
 # ⇒ 只有 nightly 能开，stable 上开它会是明确报错而不是静默少几行：
 #   cargo bench --features linked-list-cursors
 linked-list-cursors = []
+# 把默认索引宽度（`DefaultIx`）从 `usize` 切成 `u32`：每槽省 1/3、`append` 快 37%，
+# 代价是槽位上限降到 `2^31-1`。**默认不启用**；测试用它在窄索引下跑全套。
+u32-index = []
 
 [dev-dependencies]
 criterion = "0.8"

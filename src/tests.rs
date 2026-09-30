@@ -8,9 +8,9 @@ use std::rc::Rc;
 /// 对三种布局各跑一遍 `$check`（`i32` 元素）。
 macro_rules! each_layout {
     ($check:ident) => {
-        $check::<Soa<i32>>();
-        $check::<Packed<i32>>();
-        $check::<Aos<i32>>();
+        $check::<Split<i32>>();
+        $check::<PackedLinks<i32>>();
+        $check::<Nodes<i32>>();
     };
 }
 
@@ -1258,9 +1258,9 @@ fn check_iter_mut_scrambled_chain<S: Storage<i32> + Default>() {
 
 #[test]
 fn const_new() {
-    const SOA: SoaList<i32> = SoaList::new();
-    const PACKED: PackedList<i32> = PackedList::new();
-    const AOS: AosList<i32> = AosList::new();
+    const SOA: SplitList<i32> = SplitList::new();
+    const PACKED: PackedLinksList<i32> = PackedLinksList::new();
+    const AOS: NodesList<i32> = NodesList::new();
 
     assert!(SOA.is_empty());
     assert!(PACKED.is_empty());
@@ -1270,7 +1270,7 @@ fn const_new() {
 #[test]
 #[should_panic]
 fn split_off_out_of_bounds_panics() {
-    let mut list: SoaList<i32> = (0..3).collect();
+    let mut list: SplitList<i32> = (0..3).collect();
 
     list.split_off(4);
 }
@@ -1278,7 +1278,7 @@ fn split_off_out_of_bounds_panics() {
 #[test]
 #[should_panic]
 fn remove_out_of_bounds_panics() {
-    let mut list: SoaList<i32> = (0..3).collect();
+    let mut list: SplitList<i32> = (0..3).collect();
 
     list.remove(3);
 }
@@ -1339,12 +1339,12 @@ fn append_elementwise() {
 
 #[test]
 fn append_drop_semantics() {
-    check_append_drop::<Soa<Tracked>>();
-    check_append_drop::<Packed<Tracked>>();
-    check_append_drop::<Aos<Tracked>>();
-    check_append_elementwise_drop::<Soa<Tracked>>();
-    check_append_elementwise_drop::<Packed<Tracked>>();
-    check_append_elementwise_drop::<Aos<Tracked>>();
+    check_append_drop::<Split<Tracked>>();
+    check_append_drop::<PackedLinks<Tracked>>();
+    check_append_drop::<Nodes<Tracked>>();
+    check_append_elementwise_drop::<Split<Tracked>>();
+    check_append_elementwise_drop::<PackedLinks<Tracked>>();
+    check_append_elementwise_drop::<Nodes<Tracked>>();
 }
 
 #[test]
@@ -1434,24 +1434,24 @@ fn check_index_width<S: Storage<i32> + Default>(count: usize) {
 #[test]
 fn index_widths_all_behave() {
     // 上限：u8 ⇒ 128、u16 ⇒ 32768 ⇒ 这里分别用 127 / 1000 个元素
-    check_index_width::<Soa<i32, u8>>(127);
-    check_index_width::<Soa<i32, u16>>(1000);
-    check_index_width::<Soa<i32, u32>>(1000);
-    check_index_width::<Soa<i32, u64>>(1000);
-    check_index_width::<Soa<i32, usize>>(1000);
+    check_index_width::<Split<i32, u8>>(127);
+    check_index_width::<Split<i32, u16>>(1000);
+    check_index_width::<Split<i32, u32>>(1000);
+    check_index_width::<Split<i32, u64>>(1000);
+    check_index_width::<Split<i32, usize>>(1000);
 
-    check_index_width::<Packed<i32, u8>>(127);
-    check_index_width::<Packed<i32, u32>>(1000);
-    check_index_width::<Aos<i32, u8>>(127);
-    check_index_width::<Aos<i32, u16>>(1000);
-    check_index_width::<Aos<i32, u32>>(1000);
+    check_index_width::<PackedLinks<i32, u8>>(127);
+    check_index_width::<PackedLinks<i32, u32>>(1000);
+    check_index_width::<Nodes<i32, u8>>(127);
+    check_index_width::<Nodes<i32, u16>>(1000);
+    check_index_width::<Nodes<i32, u32>>(1000);
 }
 
 /// 每槽字节数只由 `T` 与索引宽度决定。
 #[test]
 fn per_slot_bytes_by_index_width() {
     fn per_slot<T, I: Ix>() -> usize {
-        let mut storage: Soa<T, I> = Soa::new();
+        let mut storage: Split<T, I> = Split::new();
 
         storage.grow();
 
@@ -1467,47 +1467,53 @@ fn per_slot_bytes_by_index_width() {
     assert_eq!(per_slot::<usize, u8>(), 10);
     assert_eq!(per_slot::<[u64; 8], u32>(), 64 + 4 + 4);
 
-    // 默认宽度就是 u32 ⇒ 三种布局在 T=8 上都是 16 B/槽
-    let mut soa: Soa<usize> = Soa::new();
-    let mut packed: Packed<usize> = Packed::new();
-    let mut aos: Aos<usize> = Aos::new();
+    // 默认宽度是 `DefaultIx`（默认 `usize`；`u32-index` feature 下是 `u32`）⇒
+    // T=8 上每槽 = 8 + 2 * size_of::<DefaultIx>()
+    let per_slot_default = 8 + 2 * core::mem::size_of::<DefaultIx>();
 
-    soa.grow();
-    packed.grow();
-    aos.grow();
+    let mut split: Split<usize> = Split::new();
+    let mut links: PackedLinks<usize> = PackedLinks::new();
+    let mut nodes: Nodes<usize> = Nodes::new();
+
+    split.grow();
+    links.grow();
+    nodes.grow();
 
     for (name, bytes) in [
         (
-            "Soa",
-            soa.layout().data_stride + soa.layout().prev_stride + soa.layout().next_stride,
+            "Split",
+            split.layout().data_stride + split.layout().prev_stride + split.layout().next_stride,
         ),
         (
-            "Packed",
-            packed.layout().data_stride + packed.layout().prev_stride,
+            "PackedLinks",
+            links.layout().data_stride + links.layout().prev_stride,
         ),
-        // Aos 的 data 就在 Node 里 ⇒ 每槽就是 Node 的大小（strides 都是它，别重复算）
-        ("Aos", aos.layout().data_stride),
+        // Nodes 的 data 就在 Node 里 ⇒ 每槽就是 Node 的大小（strides 都是它，别重复算）
+        ("Nodes", nodes.layout().data_stride),
     ] {
-        assert_eq!(bytes, 16, "{name} 的默认每槽字节数（T=8, Ix=u32）");
+        assert_eq!(
+            bytes, per_slot_default,
+            "{name} 的默认每槽字节数（T=8, Ix=DefaultIx）"
+        );
     }
 }
 
-/// `Packed` 触顶同样要 panic。
+/// `PackedLinks` 触顶同样要 panic。
 #[test]
 #[should_panic(expected = "槽位数超出索引宽度上限")]
-fn packed_index_caps_out() {
-    let mut list = PackedList::<u8, u8>::new();
+fn packed_links_index_caps_out() {
+    let mut list = PackedLinksList::<u8, u8>::new();
 
     for i in 0..=128u8 {
         list.push_back(i);
     }
 }
 
-/// `Aos` 触顶同样要 panic。
+/// `Nodes` 触顶同样要 panic。
 #[test]
 #[should_panic(expected = "槽位数超出索引宽度上限")]
-fn aos_index_caps_out() {
-    let mut list = AosList::<u8, u8>::new();
+fn nodes_index_caps_out() {
+    let mut list = NodesList::<u8, u8>::new();
 
     for i in 0..=128u8 {
         list.push_back(i);
@@ -1518,7 +1524,7 @@ fn aos_index_caps_out() {
 #[test]
 #[should_panic(expected = "槽位数超出索引宽度上限")]
 fn narrow_index_caps_out() {
-    let mut list = SoaList::<u8, u8>::new();
+    let mut list = SplitList::<u8, u8>::new();
 
     for i in 0..=128u8 {
         list.push_back(i);
@@ -1589,7 +1595,7 @@ fn into_raw_does_not_drop_elements() {
     let count = Rc::new(Cell::new(0));
 
     {
-        let mut list: SoaList<Tracked> = SoaList::new();
+        let mut list: SplitList<Tracked> = SplitList::new();
 
         for _ in 0..5 {
             list.push_back(Tracked(Rc::clone(&count)));
@@ -1609,19 +1615,19 @@ fn into_raw_does_not_drop_elements() {
 #[test]
 fn raw_parts_roundtrip() {
     // 1) 取状态
-    let mut soa: SoaList<i32, u32> = SoaList::with_capacity(8);
+    let mut split: SplitList<i32, u32> = SplitList::with_capacity(8);
 
     for value in [1, 2, 3, 4, 5, 6] {
-        soa.push_back(value);
+        split.push_back(value);
     }
 
-    assert_eq!(soa.remove(2), 3);
+    assert_eq!(split.remove(2), 3);
 
-    let expected: Vec<i32> = soa.iter().copied().collect();
-    let expected_slots: Vec<usize> = soa.iter_slots().map(|(s, _)| s.to_usize()).collect();
-    let expected_free: Vec<usize> = soa.free_slots().map(|s| s.to_usize()).collect();
+    let expected: Vec<i32> = split.iter().copied().collect();
+    let expected_slots: Vec<usize> = split.iter_slots().map(|(s, _)| s.to_usize()).collect();
+    let expected_free: Vec<usize> = split.free_slots().map(|s| s.to_usize()).collect();
 
-    let raw = soa.into_raw();
+    let raw = split.into_raw();
 
     // 2) 序列化：数组逐字节拷出去 + 记住五个数字
     let (data, prev, next) = raw.storage().as_parts();
@@ -1636,10 +1642,10 @@ fn raw_parts_roundtrip() {
     drop(raw);
 
     // 3) 反序列化：装回存储、再拼回 List
-    let storage = unsafe { Soa::<i32, u32>::from_parts(data, prev, next) };
+    let storage = unsafe { Split::<i32, u32>::from_parts(data, prev, next) };
     let (head, tail, free_head, free_tail, len) = fields;
     let list = unsafe {
-        List::<i32, Soa<i32, u32>>::from_raw(RawList::from_fields(
+        List::<i32, Split<i32, u32>>::from_raw(RawList::from_fields(
             storage, head, tail, free_head, free_tail, len,
         ))
     };
@@ -1690,23 +1696,23 @@ fn check_capacity<S: Storage<i32> + Default>() {
 
 #[test]
 fn capacity_and_shrink() {
-    check_capacity::<Soa<i32>>();
-    check_capacity::<Packed<i32>>();
-    check_capacity::<Aos<i32>>();
+    check_capacity::<Split<i32>>();
+    check_capacity::<PackedLinks<i32>>();
+    check_capacity::<Nodes<i32>>();
 }
 
 #[test]
 fn raw_state_roundtrips() {
-    check_raw_roundtrip::<Soa<i32>>();
-    check_raw_roundtrip::<Packed<i32>>();
-    check_raw_roundtrip::<Aos<i32>>();
+    check_raw_roundtrip::<Split<i32>>();
+    check_raw_roundtrip::<PackedLinks<i32>>();
+    check_raw_roundtrip::<Nodes<i32>>();
 }
 
 /// 游标的 std 对齐四件套，对着 `Vec` 模型比。
 #[test]
 fn cursor_std_parity() {
-    let mut list: SoaList<i32> = (1..=3).collect();
-    let other: SoaList<i32> = (10..=12).collect();
+    let mut list: SplitList<i32> = (1..=3).collect();
+    let other: SplitList<i32> = (10..=12).collect();
 
     // 游标在作用域里持有 `list` 的可变借用；出了这个块才能再直接读 `list`
     {
@@ -1722,7 +1728,7 @@ fn cursor_std_parity() {
         );
 
         // splice_after：接在 2 之后，顺序保持
-        let other: SoaList<i32> = (20..=21).collect();
+        let other: SplitList<i32> = (20..=21).collect();
 
         cursor.splice_after(other);
 
@@ -1777,15 +1783,15 @@ fn cursor_std_parity() {
 fn auto_traits_and_variance() {
     fn assert_send_sync<X: Send + Sync>() {}
 
-    assert_send_sync::<SoaList<usize>>();
-    assert_send_sync::<PackedList<usize>>();
-    assert_send_sync::<AosList<usize>>();
+    assert_send_sync::<SplitList<usize>>();
+    assert_send_sync::<PackedLinksList<usize>>();
+    assert_send_sync::<NodesList<usize>>();
 
-    fn covariant<'a>(list: SoaList<&'static str>) -> SoaList<&'a str> {
+    fn covariant<'a>(list: SplitList<&'static str>) -> SplitList<&'a str> {
         list
     }
 
-    let list: SoaList<&'static str> = SoaList::new();
+    let list: SplitList<&'static str> = SplitList::new();
 
     assert!(covariant(list).is_empty());
 }
@@ -1794,38 +1800,38 @@ fn auto_traits_and_variance() {
 #[cfg_attr(miri, ignore)]
 #[test]
 fn drop_panic_leaks_rest() {
-    check_drop_panic::<Soa<PanicOnDrop>>();
-    check_drop_panic::<Packed<PanicOnDrop>>();
-    check_drop_panic::<Aos<PanicOnDrop>>();
+    check_drop_panic::<Split<PanicOnDrop>>();
+    check_drop_panic::<PackedLinks<PanicOnDrop>>();
+    check_drop_panic::<Nodes<PanicOnDrop>>();
 }
 
 #[test]
 fn drop_semantics() {
-    check_drop::<Soa<Tracked>>();
-    check_drop::<Packed<Tracked>>();
-    check_drop::<Aos<Tracked>>();
+    check_drop::<Split<Tracked>>();
+    check_drop::<PackedLinks<Tracked>>();
+    check_drop::<Nodes<Tracked>>();
 
-    check_clear::<Soa<Tracked>>();
-    check_clear::<Packed<Tracked>>();
-    check_clear::<Aos<Tracked>>();
+    check_clear::<Split<Tracked>>();
+    check_clear::<PackedLinks<Tracked>>();
+    check_clear::<Nodes<Tracked>>();
 }
 
 #[test]
 fn iter_mut_offsets() {
-    check_iter_mut_narrow::<Soa<u8>>();
-    check_iter_mut_narrow::<Packed<u8>>();
-    check_iter_mut_narrow::<Aos<u8>>();
+    check_iter_mut_narrow::<Split<u8>>();
+    check_iter_mut_narrow::<PackedLinks<u8>>();
+    check_iter_mut_narrow::<Nodes<u8>>();
 
-    check_iter_mut_wide::<Soa<[u64; 3]>>();
-    check_iter_mut_wide::<Packed<[u64; 3]>>();
-    check_iter_mut_wide::<Aos<[u64; 3]>>();
+    check_iter_mut_wide::<Split<[u64; 3]>>();
+    check_iter_mut_wide::<PackedLinks<[u64; 3]>>();
+    check_iter_mut_wide::<Nodes<[u64; 3]>>();
 }
 
 #[test]
 fn iter_mut_scrambled_chain() {
-    check_iter_mut_scrambled_chain::<Soa<i32>>();
-    check_iter_mut_scrambled_chain::<Packed<i32>>();
-    check_iter_mut_scrambled_chain::<Aos<i32>>();
+    check_iter_mut_scrambled_chain::<Split<i32>>();
+    check_iter_mut_scrambled_chain::<PackedLinks<i32>>();
+    check_iter_mut_scrambled_chain::<Nodes<i32>>();
 }
 
 // ============================================================
@@ -1898,9 +1904,9 @@ fn check_churn_does_not_allocate<S: Storage<usize> + Default>() {
 
 #[test]
 fn churn_does_not_allocate() {
-    check_churn_does_not_allocate::<Soa<usize>>();
-    check_churn_does_not_allocate::<Packed<usize>>();
-    check_churn_does_not_allocate::<Aos<usize>>();
+    check_churn_does_not_allocate::<Split<usize>>();
+    check_churn_does_not_allocate::<PackedLinks<usize>>();
+    check_churn_does_not_allocate::<Nodes<usize>>();
 
     // 分配计数器本身的体检：std 的链表每个元素一次分配
     let n = churn_scale();
@@ -1996,9 +2002,9 @@ fn check_state_is_relocatable<S: Storage<i32> + Default>() {
 
 #[test]
 fn state_is_relocatable() {
-    check_state_is_relocatable::<Soa<i32>>();
-    check_state_is_relocatable::<Packed<i32>>();
-    check_state_is_relocatable::<Aos<i32>>();
+    check_state_is_relocatable::<Split<i32>>();
+    check_state_is_relocatable::<PackedLinks<i32>>();
+    check_state_is_relocatable::<Nodes<i32>>();
 }
 
 // ============================================================
@@ -2072,9 +2078,9 @@ fn check_slots<S: Storage<i32> + Default>() {
 
 #[test]
 fn slots() {
-    check_slots::<Soa<i32>>();
-    check_slots::<Packed<i32>>();
-    check_slots::<Aos<i32>>();
+    check_slots::<Split<i32>>();
+    check_slots::<PackedLinks<i32>>();
+    check_slots::<Nodes<i32>>();
 }
 
 /// 句柄当别的容器的 key（LRU / `LinkedHashMap` 用法的最小验证）。
@@ -2109,9 +2115,9 @@ fn check_slot_as_key<S: Storage<i32> + Default>() {
 
 #[test]
 fn slot_as_key() {
-    check_slot_as_key::<Soa<i32>>();
-    check_slot_as_key::<Packed<i32>>();
-    check_slot_as_key::<Aos<i32>>();
+    check_slot_as_key::<Split<i32>>();
+    check_slot_as_key::<PackedLinks<i32>>();
+    check_slot_as_key::<Nodes<i32>>();
 }
 
 /// 混合 `clear` 的两条路径（`2 * len >= slots` 走扫描，否则追链）都必须：只析构
@@ -2154,9 +2160,9 @@ fn check_clear_paths<S: Storage<Tracked> + Default>() {
 
 #[test]
 fn clear_paths() {
-    check_clear_paths::<Soa<Tracked>>();
-    check_clear_paths::<Packed<Tracked>>();
-    check_clear_paths::<Aos<Tracked>>();
+    check_clear_paths::<Split<Tracked>>();
+    check_clear_paths::<PackedLinks<Tracked>>();
+    check_clear_paths::<Nodes<Tracked>>();
 }
 
 // ============================================================
@@ -2407,7 +2413,7 @@ mod probe_clear_vs_scan {
     fn probe_clear_vs_scan() {
         // 先自证：扫描版的语义与 `clear` 等价（不变量 + 清空 + 可复用）
         {
-            let mut l: List<usize, Soa<usize, u32>> = p_build_usize(1234);
+            let mut l: List<usize, Split<usize, u32>> = p_build_usize(1234);
             p_scan_clear(&mut l, true);
             assert_eq!(l.len(), 0);
             assert_invariants(&l);
@@ -2423,15 +2429,15 @@ mod probe_clear_vs_scan {
         }
 
         println!("PN = {PN} 槽位，min/{PROUNDS} 轮\n");
-        probe_layout!("Soa（u32 索引）", Soa<usize, u32>, Soa<P64, u32>);
-        probe_layout!("Soa（usize 索引 = u64）", Soa<usize, usize>, Soa<P64, usize>);
-        probe_layout!("Packed（u32 索引）", Packed<usize, u32>, Packed<P64, u32>);
+        probe_layout!("Split（u32 索引）", Split<usize, u32>, Split<P64, u32>);
+        probe_layout!("Split（usize 索引 = u64）", Split<usize, usize>, Split<P64, usize>);
+        probe_layout!("PackedLinks（u32 索引）", PackedLinks<usize, u32>, PackedLinks<P64, u32>);
         probe_layout!(
-            "Packed（usize 索引）",
-            Packed<usize, usize>,
-            Packed<P64, usize>
+            "PackedLinks（usize 索引）",
+            PackedLinks<usize, usize>,
+            PackedLinks<P64, usize>
         );
-        probe_layout!("Aos（u32 索引）", Aos<usize, u32>, Aos<P64, u32>);
-        probe_layout!("Aos（usize 索引）", Aos<usize, usize>, Aos<P64, usize>);
+        probe_layout!("Nodes（u32 索引）", Nodes<usize, u32>, Nodes<P64, u32>);
+        probe_layout!("Nodes（usize 索引）", Nodes<usize, usize>, Nodes<P64, usize>);
     }
 }

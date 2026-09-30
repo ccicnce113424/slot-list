@@ -1,4 +1,4 @@
-//! 三种内存布局（`SoaList` / `PackedList` / `AosList`）与
+//! 三种内存布局（`SplitList` / `PackedLinksList` / `NodesList`）与
 //! std `LinkedList`、`VecDeque`、`Vec`、以及 `fast-list`（slotmap + 世代号句柄）的横向基准。
 //!
 //! 三种布局是同一个泛型类型 `List<T, S>` 的不同 `Storage` 参数，所以基准体用宏生成
@@ -48,9 +48,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use slot_list::{AosList, PackedList, Slot, SoaList};
+use slot_list::{NodesList, PackedLinksList, Slot, SplitList};
 
-use criterion::{BatchSize, Bencher, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Bencher, Criterion, criterion_group};
 
 use std::{
     collections::{LinkedList, VecDeque},
@@ -319,90 +319,90 @@ macro_rules! bench_blob_end_ops {
 
 bench_end_ops!(
     soalist_push_back_pop_front,
-    SoaList<usize>,
+    SplitList<usize>,
     push_back,
     pop_front
 );
 bench_end_ops!(
     packedlist_push_back_pop_front,
-    PackedList<usize>,
+    PackedLinksList<usize>,
     push_back,
     pop_front
 );
 bench_end_ops!(
     aoslist_push_back_pop_front,
-    AosList<usize>,
+    NodesList<usize>,
     push_back,
     pop_front
 );
 
 bench_end_ops!(
     soalist_push_front_pop_back,
-    SoaList<usize>,
+    SplitList<usize>,
     push_front,
     pop_back
 );
 bench_end_ops!(
     packedlist_push_front_pop_back,
-    PackedList<usize>,
+    PackedLinksList<usize>,
     push_front,
     pop_back
 );
 bench_end_ops!(
     aoslist_push_front_pop_back,
-    AosList<usize>,
+    NodesList<usize>,
     push_front,
     pop_back
 );
 
-bench_construct!(make_soalist, SoaList<usize>);
-bench_construct!(make_packedlist, PackedList<usize>);
-bench_construct!(make_aoslist, AosList<usize>);
+bench_construct!(make_soalist, SplitList<usize>);
+bench_construct!(make_packedlist, PackedLinksList<usize>);
+bench_construct!(make_aoslist, NodesList<usize>);
 
-bench_iter!(soalist_iter, SoaList<usize>);
-bench_iter!(packedlist_iter, PackedList<usize>);
-bench_iter!(aoslist_iter, AosList<usize>);
+bench_iter!(soalist_iter, SplitList<usize>);
+bench_iter!(packedlist_iter, PackedLinksList<usize>);
+bench_iter!(aoslist_iter, NodesList<usize>);
 
-bench_at_middle!(soalist_at_middle, SoaList<usize>);
-bench_at_middle!(packedlist_at_middle, PackedList<usize>);
-bench_at_middle!(aoslist_at_middle, AosList<usize>);
+bench_at_middle!(soalist_at_middle, SplitList<usize>);
+bench_at_middle!(packedlist_at_middle, PackedLinksList<usize>);
+bench_at_middle!(aoslist_at_middle, NodesList<usize>);
 
-bench_insert_before_remove!(soalist_insert_before_remove, SoaList<usize>);
-bench_insert_before_remove!(packedlist_insert_before_remove, PackedList<usize>);
-bench_insert_before_remove!(aoslist_insert_before_remove, AosList<usize>);
+bench_insert_before_remove!(soalist_insert_before_remove, SplitList<usize>);
+bench_insert_before_remove!(packedlist_insert_before_remove, PackedLinksList<usize>);
+bench_insert_before_remove!(aoslist_insert_before_remove, NodesList<usize>);
 
-bench_churn!(soalist_churn, SoaList<usize>);
-bench_churn!(packedlist_churn, PackedList<usize>);
-bench_churn!(aoslist_churn, AosList<usize>);
+bench_churn!(soalist_churn, SplitList<usize>);
+bench_churn!(packedlist_churn, PackedLinksList<usize>);
+bench_churn!(aoslist_churn, NodesList<usize>);
 
-bench_random_remove_insert!(soalist_random_remove_insert, SoaList<usize>);
-bench_random_remove_insert!(packedlist_random_remove_insert, PackedList<usize>);
-bench_random_remove_insert!(aoslist_random_remove_insert, AosList<usize>);
+bench_random_remove_insert!(soalist_random_remove_insert, SplitList<usize>);
+bench_random_remove_insert!(packedlist_random_remove_insert, PackedLinksList<usize>);
+bench_random_remove_insert!(aoslist_random_remove_insert, NodesList<usize>);
 
-bench_cursor_update!(soalist_cursor_update, SoaList<usize>);
-bench_cursor_update!(packedlist_cursor_update, PackedList<usize>);
-bench_cursor_update!(aoslist_cursor_update, AosList<usize>);
+bench_cursor_update!(soalist_cursor_update, SplitList<usize>);
+bench_cursor_update!(packedlist_cursor_update, PackedLinksList<usize>);
+bench_cursor_update!(aoslist_cursor_update, NodesList<usize>);
 
-bench_append!(soalist_append, SoaList<usize>);
-bench_append!(packedlist_append, PackedList<usize>);
-bench_append!(aoslist_append, AosList<usize>);
+bench_append!(soalist_append, SplitList<usize>);
+bench_append!(packedlist_append, PackedLinksList<usize>);
+bench_append!(aoslist_append, NodesList<usize>);
 
 // 大载荷（64 B）版本：数据拷贝占主导，布局差异才会显出来。
-bench_append!(soalist_blob_append, SoaList<Blob64>);
-bench_append!(packedlist_blob_append, PackedList<Blob64>);
-bench_append!(aoslist_blob_append, AosList<Blob64>);
+bench_append!(soalist_blob_append, SplitList<Blob64>);
+bench_append!(packedlist_blob_append, PackedLinksList<Blob64>);
+bench_append!(aoslist_blob_append, NodesList<Blob64>);
 
-bench_construct_blob!(make_soalist_blob, SoaList<Blob64>);
-bench_construct_blob!(make_packedlist_blob, PackedList<Blob64>);
-bench_construct_blob!(make_aoslist_blob, AosList<Blob64>);
+bench_construct_blob!(make_soalist_blob, SplitList<Blob64>);
+bench_construct_blob!(make_packedlist_blob, PackedLinksList<Blob64>);
+bench_construct_blob!(make_aoslist_blob, NodesList<Blob64>);
 
-bench_blob_iter!(soalist_blob_iter, SoaList<Blob64>);
-bench_blob_iter!(packedlist_blob_iter, PackedList<Blob64>);
-bench_blob_iter!(aoslist_blob_iter, AosList<Blob64>);
+bench_blob_iter!(soalist_blob_iter, SplitList<Blob64>);
+bench_blob_iter!(packedlist_blob_iter, PackedLinksList<Blob64>);
+bench_blob_iter!(aoslist_blob_iter, NodesList<Blob64>);
 
-bench_blob_end_ops!(soalist_blob_push_back_pop_front, SoaList<Blob64>);
-bench_blob_end_ops!(packedlist_blob_push_back_pop_front, PackedList<Blob64>);
-bench_blob_end_ops!(aoslist_blob_push_back_pop_front, AosList<Blob64>);
+bench_blob_end_ops!(soalist_blob_push_back_pop_front, SplitList<Blob64>);
+bench_blob_end_ops!(packedlist_blob_push_back_pop_front, PackedLinksList<Blob64>);
+bench_blob_end_ops!(aoslist_blob_push_back_pop_front, NodesList<Blob64>);
 
 // ============================================================
 // 基线：std VecDeque / std LinkedList / Vec
@@ -823,9 +823,9 @@ macro_rules! make_roomy_blob {
     };
 }
 
-make_roomy_blob!(make_soalist_blob_roomy, SoaList<Blob64>);
-make_roomy_blob!(make_packedlist_blob_roomy, PackedList<Blob64>);
-make_roomy_blob!(make_aoslist_blob_roomy, AosList<Blob64>);
+make_roomy_blob!(make_soalist_blob_roomy, SplitList<Blob64>);
+make_roomy_blob!(make_packedlist_blob_roomy, PackedLinksList<Blob64>);
+make_roomy_blob!(make_aoslist_blob_roomy, NodesList<Blob64>);
 
 // ---- 64B append（与 usize 版同形态：两边都由 push/collect 构造 ⇒ 目标要扩容） ----
 
@@ -913,9 +913,13 @@ fn linkedlist_blob_push_back_pop_front() {
     }
 }
 
-bench_slot_vs_pos!(soalist_by_handle, soalist_by_pos, SoaList<usize>);
-bench_slot_vs_pos!(packedlist_by_handle, packedlist_by_pos, PackedList<usize>);
-bench_slot_vs_pos!(aoslist_by_handle, aoslist_by_pos, AosList<usize>);
+bench_slot_vs_pos!(soalist_by_handle, soalist_by_pos, SplitList<usize>);
+bench_slot_vs_pos!(
+    packedlist_by_handle,
+    packedlist_by_pos,
+    PackedLinksList<usize>
+);
+bench_slot_vs_pos!(aoslist_by_handle, aoslist_by_pos, NodesList<usize>);
 
 // ============================================================
 // 对照组：`fast-list`（slotmap 索引 + 世代号）
@@ -1050,22 +1054,22 @@ fn fastlist_by_pos(list: &mut FastList<usize>, positions: &[usize]) {
 // ============================================================
 
 // ============================================================
-// 索引宽度对照：`SoaList<usize, u32>` vs `SoaList<usize, usize>`
+// 索引宽度对照：`SplitList<usize, u32>` vs `SplitList<usize, usize>`
 //
 // 每槽开销 = `T` + 两条链接 ⇒ `T = 8` 时 16 B vs 24 B。谁受益取决于
 // 链接数组的访存占比：走链（`at(pos)`）与迭代最明显，端操作/句柄入口最小。
 // ============================================================
 
-bench_construct!(make_soa32, SoaList<usize, u32>);
-bench_construct!(make_soa64, SoaList<usize, usize>);
-bench_churn!(soa32_churn, SoaList<usize, u32>);
-bench_churn!(soa64_churn, SoaList<usize, usize>);
-bench_iter!(soa32_iter, SoaList<usize, u32>);
-bench_iter!(soa64_iter, SoaList<usize, usize>);
-bench_at_middle!(soa32_at_middle, SoaList<usize, u32>);
-bench_at_middle!(soa64_at_middle, SoaList<usize, usize>);
-bench_append!(soa32_append, SoaList<usize, u32>);
-bench_append!(soa64_append, SoaList<usize, usize>);
+bench_construct!(make_soa32, SplitList<usize, u32>);
+bench_construct!(make_soa64, SplitList<usize, usize>);
+bench_churn!(soa32_churn, SplitList<usize, u32>);
+bench_churn!(soa64_churn, SplitList<usize, usize>);
+bench_iter!(soa32_iter, SplitList<usize, u32>);
+bench_iter!(soa64_iter, SplitList<usize, usize>);
+bench_at_middle!(soa32_at_middle, SplitList<usize, u32>);
+bench_at_middle!(soa64_at_middle, SplitList<usize, usize>);
+bench_append!(soa32_append, SplitList<usize, u32>);
+bench_append!(soa64_append, SplitList<usize, usize>);
 
 fn index_width(c: &mut Criterion) {
     let mut soa32 = make_soa32();
@@ -1101,36 +1105,42 @@ fn index_width(c: &mut Criterion) {
 
 fn end_ops(c: &mut Criterion) {
     let mut g = c.benchmark_group("end_ops/push_back_pop_front");
-    g.bench_function("SoaList", |b| b.iter(soalist_push_back_pop_front));
-    g.bench_function("PackedList", |b| b.iter(packedlist_push_back_pop_front));
-    g.bench_function("AosList", |b| b.iter(aoslist_push_back_pop_front));
+    g.bench_function("SplitList", |b| b.iter(soalist_push_back_pop_front));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(packedlist_push_back_pop_front)
+    });
+    g.bench_function("NodesList", |b| b.iter(aoslist_push_back_pop_front));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_push_back_pop_front));
     g.bench_function("LinkedList", |b| b.iter(linkedlist_push_back_pop_front));
     g.bench_function("FastList", |b| b.iter(fastlist_push_back_pop_front));
     g.finish();
 
     let mut g = c.benchmark_group("end_ops/push_front_pop_back");
-    g.bench_function("SoaList", |b| b.iter(soalist_push_front_pop_back));
-    g.bench_function("PackedList", |b| b.iter(packedlist_push_front_pop_back));
-    g.bench_function("AosList", |b| b.iter(aoslist_push_front_pop_back));
+    g.bench_function("SplitList", |b| b.iter(soalist_push_front_pop_back));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(packedlist_push_front_pop_back)
+    });
+    g.bench_function("NodesList", |b| b.iter(aoslist_push_front_pop_back));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_push_front_pop_back));
     g.bench_function("LinkedList", |b| b.iter(linkedlist_push_front_pop_back));
     g.finish();
 }
 
 fn iteration(c: &mut Criterion) {
-    let soalist = make_soalist();
-    let packedlist = make_packedlist();
-    let aoslist = make_aoslist();
+    let splitlist = make_soalist();
+    let packedlinkslist = make_packedlist();
+    let nodeslist = make_aoslist();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
     let vec = make_vec();
     let fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("iteration");
-    g.bench_function("SoaList", |b| b.iter(|| soalist_iter(&soalist)));
-    g.bench_function("PackedList", |b| b.iter(|| packedlist_iter(&packedlist)));
-    g.bench_function("AosList", |b| b.iter(|| aoslist_iter(&aoslist)));
+    g.bench_function("SplitList", |b| b.iter(|| soalist_iter(&splitlist)));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_iter(&packedlinkslist))
+    });
+    g.bench_function("NodesList", |b| b.iter(|| aoslist_iter(&nodeslist)));
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_iter(&vecdeque)));
     g.bench_function("LinkedList", |b| b.iter(|| linkedlist_iter(&linkedlist)));
     g.bench_function("Vec", |b| b.iter(|| vec_iter(&vec)));
@@ -1139,19 +1149,23 @@ fn iteration(c: &mut Criterion) {
 }
 
 fn middle_access(c: &mut Criterion) {
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
     let vecdeque = make_vecdeque();
     let linkedlist = make_linkedlist();
     let fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_access");
-    g.bench_function("SoaList", |b| b.iter(|| soalist_at_middle(&mut soalist)));
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_at_middle(&mut packedlist))
+    g.bench_function("SplitList", |b| {
+        b.iter(|| soalist_at_middle(&mut splitlist))
     });
-    g.bench_function("AosList", |b| b.iter(|| aoslist_at_middle(&mut aoslist)));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_at_middle(&mut packedlinkslist))
+    });
+    g.bench_function("NodesList", |b| {
+        b.iter(|| aoslist_at_middle(&mut nodeslist))
+    });
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_index_middle(&vecdeque)));
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_at_middle(&linkedlist))
@@ -1161,23 +1175,23 @@ fn middle_access(c: &mut Criterion) {
 }
 
 fn middle_insert_remove(c: &mut Criterion) {
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
     let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("middle_insert_remove");
-    g.bench_function("SoaList", |b| {
-        b.iter(|| soalist_insert_before_remove(&mut soalist))
+    g.bench_function("SplitList", |b| {
+        b.iter(|| soalist_insert_before_remove(&mut splitlist))
     });
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_insert_before_remove(&mut packedlist))
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_insert_before_remove(&mut packedlinkslist))
     });
-    g.bench_function("AosList", |b| {
-        b.iter(|| aoslist_insert_before_remove(&mut aoslist))
+    g.bench_function("NodesList", |b| {
+        b.iter(|| aoslist_insert_before_remove(&mut nodeslist))
     });
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_insert_remove(&mut vecdeque))
@@ -1193,19 +1207,19 @@ fn middle_insert_remove(c: &mut Criterion) {
 }
 
 fn churn(c: &mut Criterion) {
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     let mut linkedlist = make_linkedlist();
     let mut fastlist = make_fastlist();
 
     let mut g = c.benchmark_group("churn");
-    g.bench_function("SoaList", |b| b.iter(|| soalist_churn(&mut soalist)));
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_churn(&mut packedlist))
+    g.bench_function("SplitList", |b| b.iter(|| soalist_churn(&mut splitlist)));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_churn(&mut packedlinkslist))
     });
-    g.bench_function("AosList", |b| b.iter(|| aoslist_churn(&mut aoslist)));
+    g.bench_function("NodesList", |b| b.iter(|| aoslist_churn(&mut nodeslist)));
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_churn(&mut vecdeque)));
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_churn(&mut linkedlist))
@@ -1216,9 +1230,9 @@ fn churn(c: &mut Criterion) {
 
 fn random_remove_insert(c: &mut Criterion) {
     let positions = make_random_positions(N, RANDOM_OPS);
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
@@ -1229,14 +1243,14 @@ fn random_remove_insert(c: &mut Criterion) {
         .collect();
 
     let mut g = c.benchmark_group("random_remove_insert");
-    g.bench_function("SoaList", |b| {
-        b.iter(|| soalist_random_remove_insert(&mut soalist, &positions))
+    g.bench_function("SplitList", |b| {
+        b.iter(|| soalist_random_remove_insert(&mut splitlist, &positions))
     });
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_random_remove_insert(&mut packedlist, &positions))
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_random_remove_insert(&mut packedlinkslist, &positions))
     });
-    g.bench_function("AosList", |b| {
-        b.iter(|| aoslist_random_remove_insert(&mut aoslist, &positions))
+    g.bench_function("NodesList", |b| {
+        b.iter(|| aoslist_random_remove_insert(&mut nodeslist, &positions))
     });
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_random_remove_insert(&mut vecdeque, &positions))
@@ -1255,22 +1269,22 @@ fn random_remove_insert(c: &mut Criterion) {
 }
 
 fn cursor_update(c: &mut Criterion) {
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
     let mut vecdeque = make_vecdeque();
     #[cfg(feature = "linked-list-cursors")]
     let mut linkedlist = make_linkedlist();
 
     let mut g = c.benchmark_group("cursor_update");
-    g.bench_function("SoaList", |b| {
-        b.iter(|| soalist_cursor_update(&mut soalist))
+    g.bench_function("SplitList", |b| {
+        b.iter(|| soalist_cursor_update(&mut splitlist))
     });
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_cursor_update(&mut packedlist))
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_cursor_update(&mut packedlinkslist))
     });
-    g.bench_function("AosList", |b| {
-        b.iter(|| aoslist_cursor_update(&mut aoslist))
+    g.bench_function("NodesList", |b| {
+        b.iter(|| aoslist_cursor_update(&mut nodeslist))
     });
     g.bench_function("VecDeque", |b| {
         b.iter(|| vecdeque_index_update(&mut vecdeque))
@@ -1285,21 +1299,21 @@ fn cursor_update(c: &mut Criterion) {
 fn append(c: &mut Criterion) {
     let mut g = c.benchmark_group("append");
 
-    g.bench_function("SoaList", |b| {
+    g.bench_function("SplitList", |b| {
         b.iter_batched(
             || (make_soalist(), make_soalist()),
             |(a, b)| soalist_append(a, b),
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("PackedList", |b| {
+    g.bench_function("PackedLinksList", |b| {
         b.iter_batched(
             || (make_packedlist(), make_packedlist()),
             |(a, b)| packedlist_append(a, b),
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("AosList", |b| {
+    g.bench_function("NodesList", |b| {
         b.iter_batched(
             || (make_aoslist(), make_aoslist()),
             |(a, b)| aoslist_append(a, b),
@@ -1333,21 +1347,21 @@ fn append(c: &mut Criterion) {
 fn append_blob(c: &mut Criterion) {
     let mut g = c.benchmark_group("append_blob");
 
-    g.bench_function("SoaList", |b| {
+    g.bench_function("SplitList", |b| {
         b.iter_batched(
             || (make_soalist_blob(), make_soalist_blob()),
             |(a, b)| soalist_blob_append(a, b),
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("PackedList", |b| {
+    g.bench_function("PackedLinksList", |b| {
         b.iter_batched(
             || (make_packedlist_blob(), make_packedlist_blob()),
             |(a, b)| packedlist_blob_append(a, b),
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("AosList", |b| {
+    g.bench_function("NodesList", |b| {
         b.iter_batched(
             || (make_aoslist_blob(), make_aoslist_blob()),
             |(a, b)| aoslist_blob_append(a, b),
@@ -1355,7 +1369,7 @@ fn append_blob(c: &mut Criterion) {
         )
     });
     // 逐元素路径：目标预先有 LARGE_N 个空闲槽（它的推荐用法）
-    g.bench_function("SoaList::elementwise", |b| {
+    g.bench_function("SplitList::elementwise", |b| {
         b.iter_batched(
             || (make_soalist_blob_roomy(), make_soalist_blob()),
             |(mut a, mut b)| {
@@ -1366,7 +1380,7 @@ fn append_blob(c: &mut Criterion) {
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("PackedList::elementwise", |b| {
+    g.bench_function("PackedLinksList::elementwise", |b| {
         b.iter_batched(
             || (make_packedlist_blob_roomy(), make_packedlist_blob()),
             |(mut a, mut b)| {
@@ -1377,7 +1391,7 @@ fn append_blob(c: &mut Criterion) {
             BatchSize::PerIteration,
         )
     });
-    g.bench_function("AosList::elementwise", |b| {
+    g.bench_function("NodesList::elementwise", |b| {
         b.iter_batched(
             || (make_aoslist_blob_roomy(), make_aoslist_blob()),
             |(mut a, mut b)| {
@@ -1413,19 +1427,19 @@ fn append_blob(c: &mut Criterion) {
 }
 
 fn blob_iter(c: &mut Criterion) {
-    let soalist = make_soalist_blob();
-    let packedlist = make_packedlist_blob();
-    let aoslist = make_aoslist_blob();
+    let splitlist = make_soalist_blob();
+    let packedlinkslist = make_packedlist_blob();
+    let nodeslist = make_aoslist_blob();
     let vecdeque = make_vecdeque_blob();
     let linkedlist = make_linkedlist_blob();
     let vec = make_vec_blob();
 
     let mut g = c.benchmark_group("blob_iter");
-    g.bench_function("SoaList", |b| b.iter(|| soalist_blob_iter(&soalist)));
-    g.bench_function("PackedList", |b| {
-        b.iter(|| packedlist_blob_iter(&packedlist))
+    g.bench_function("SplitList", |b| b.iter(|| soalist_blob_iter(&splitlist)));
+    g.bench_function("PackedLinksList", |b| {
+        b.iter(|| packedlist_blob_iter(&packedlinkslist))
     });
-    g.bench_function("AosList", |b| b.iter(|| aoslist_blob_iter(&aoslist)));
+    g.bench_function("NodesList", |b| b.iter(|| aoslist_blob_iter(&nodeslist)));
     g.bench_function("VecDeque", |b| b.iter(|| vecdeque_blob_iter(&vecdeque)));
     g.bench_function("LinkedList", |b| {
         b.iter(|| linkedlist_blob_iter(&linkedlist))
@@ -1438,22 +1452,22 @@ fn blob_iter(c: &mut Criterion) {
 /// 这一组就是"要不要把 Slot 暴露出来"的量化依据。
 fn slot_entry(c: &mut Criterion) {
     let positions = make_random_positions(N, RANDOM_OPS);
-    let mut soalist = make_soalist();
-    let mut packedlist = make_packedlist();
-    let mut aoslist = make_aoslist();
+    let mut splitlist = make_soalist();
+    let mut packedlinkslist = make_packedlist();
+    let mut nodeslist = make_aoslist();
 
     // 句柄在计时区外先取好（取的时候要站到那个位置，是 O(N)）
     let soa_handles: Vec<Slot> = positions
         .iter()
-        .map(|&pos| soalist.at(pos).unwrap().slot().unwrap())
+        .map(|&pos| splitlist.at(pos).unwrap().slot().unwrap())
         .collect();
     let packed_handles: Vec<Slot> = positions
         .iter()
-        .map(|&pos| packedlist.at(pos).unwrap().slot().unwrap())
+        .map(|&pos| packedlinkslist.at(pos).unwrap().slot().unwrap())
         .collect();
     let aos_handles: Vec<Slot> = positions
         .iter()
-        .map(|&pos| aoslist.at(pos).unwrap().slot().unwrap())
+        .map(|&pos| nodeslist.at(pos).unwrap().slot().unwrap())
         .collect();
     let mut fastlist = make_fastlist();
     let fast_handles: Vec<LinkedListIndex> = positions
@@ -1462,23 +1476,23 @@ fn slot_entry(c: &mut Criterion) {
         .collect();
 
     let mut g = c.benchmark_group("slot_entry");
-    g.bench_function("SoaList::by_handle", |b| {
-        b.iter(|| soalist_by_handle(&mut soalist, &soa_handles))
+    g.bench_function("SplitList::by_handle", |b| {
+        b.iter(|| soalist_by_handle(&mut splitlist, &soa_handles))
     });
-    g.bench_function("SoaList::by_pos", |b| {
-        b.iter(|| soalist_by_pos(&mut soalist, &positions))
+    g.bench_function("SplitList::by_pos", |b| {
+        b.iter(|| soalist_by_pos(&mut splitlist, &positions))
     });
-    g.bench_function("PackedList::by_handle", |b| {
-        b.iter(|| packedlist_by_handle(&mut packedlist, &packed_handles))
+    g.bench_function("PackedLinksList::by_handle", |b| {
+        b.iter(|| packedlist_by_handle(&mut packedlinkslist, &packed_handles))
     });
-    g.bench_function("PackedList::by_pos", |b| {
-        b.iter(|| packedlist_by_pos(&mut packedlist, &positions))
+    g.bench_function("PackedLinksList::by_pos", |b| {
+        b.iter(|| packedlist_by_pos(&mut packedlinkslist, &positions))
     });
-    g.bench_function("AosList::by_handle", |b| {
-        b.iter(|| aoslist_by_handle(&mut aoslist, &aos_handles))
+    g.bench_function("NodesList::by_handle", |b| {
+        b.iter(|| aoslist_by_handle(&mut nodeslist, &aos_handles))
     });
-    g.bench_function("AosList::by_pos", |b| {
-        b.iter(|| aoslist_by_pos(&mut aoslist, &positions))
+    g.bench_function("NodesList::by_pos", |b| {
+        b.iter(|| aoslist_by_pos(&mut nodeslist, &positions))
     });
     g.bench_function("FastList::by_handle", |b| {
         b.iter(|| fastlist_by_handle(&mut fastlist, &fast_handles, &positions))
@@ -1491,11 +1505,11 @@ fn slot_entry(c: &mut Criterion) {
 
 fn blob_end_ops(c: &mut Criterion) {
     let mut g = c.benchmark_group("blob_end_ops");
-    g.bench_function("SoaList", |b| b.iter(soalist_blob_push_back_pop_front));
-    g.bench_function("PackedList", |b| {
+    g.bench_function("SplitList", |b| b.iter(soalist_blob_push_back_pop_front));
+    g.bench_function("PackedLinksList", |b| {
         b.iter(packedlist_blob_push_back_pop_front)
     });
-    g.bench_function("AosList", |b| b.iter(aoslist_blob_push_back_pop_front));
+    g.bench_function("NodesList", |b| b.iter(aoslist_blob_push_back_pop_front));
     g.bench_function("VecDeque", |b| b.iter(vecdeque_blob_push_back_pop_front));
     g.bench_function("LinkedList", |b| {
         b.iter(linkedlist_blob_push_back_pop_front)
@@ -1509,10 +1523,10 @@ fn blob_end_ops(c: &mut Criterion) {
 // 量两件事（都是用 `iter_batched` 把"造数据/析构"挪出计时区）：
 //
 // 结论（1M 槽位、`u32` 索引）：`clear` 保留追链表。扫描版只在"没有 Drop glue 且八分满以上"
-// 才赢（满表快 7×），交叉点 `live/slots ≈ 0.10`（`Aos` 0.27）；稀疏时慢 100× 以上
-// （1.1 µs → 0.11 ms；带 64 B glue 的稀疏 `Aos` 2 µs → 2.7 ms）；带 Drop glue 时
+// 才赢（满表快 7×），交叉点 `live/slots ≈ 0.10`（`Nodes` 0.27）；稀疏时慢 100× 以上
+// （1.1 µs → 0.11 ms；带 64 B glue 的稀疏 `Nodes` 2 µs → 2.7 ms）；带 Drop glue 时
 // 密集只打平。`Drop` 只走 live 链就地析构则全面胜出——无 glue 1.098 ms → 1.9 µs
-// （析构链被消掉），带 glue `Soa` 2.498 → 1.889 ms（1.32×）、`Aos` 3.569 → 2.069 ms。
+// （析构链被消掉），带 glue `Split` 2.498 → 1.889 ms（1.32×）、`Nodes` 3.569 → 2.069 ms。
 // 扫描版在**本文件里跑不了**（要碰 `List` 的私有字段），它的数字与密度曲线来自
 // `src/tests.rs::probe_clear_vs_scan`。明细见 PERFORMANCE.md §4/§5。
 //
@@ -1592,7 +1606,7 @@ macro_rules! bench_clear_drop {
 }
 
 bench_clear_drop!(
-    SoaList,
+    SplitList,
     make_soalist,
     soalist_clear_dense,
     soalist_clear_sparse,
@@ -1600,7 +1614,7 @@ bench_clear_drop!(
     soalist_drop
 );
 bench_clear_drop!(
-    PackedList,
+    PackedLinksList,
     make_packedlist,
     packedlist_clear_dense,
     packedlist_clear_sparse,
@@ -1608,7 +1622,7 @@ bench_clear_drop!(
     packedlist_drop
 );
 bench_clear_drop!(
-    AosList,
+    NodesList,
     make_aoslist,
     aoslist_clear_dense,
     aoslist_clear_sparse,
@@ -1651,9 +1665,9 @@ macro_rules! make_drop64_list {
     };
 }
 
-make_drop64_list!(make_soalist_drop64, SoaList<Drop64>);
-make_drop64_list!(make_packedlist_drop64, PackedList<Drop64>);
-make_drop64_list!(make_aoslist_drop64, AosList<Drop64>);
+make_drop64_list!(make_soalist_drop64, SplitList<Drop64>);
+make_drop64_list!(make_packedlist_drop64, PackedLinksList<Drop64>);
+make_drop64_list!(make_aoslist_drop64, NodesList<Drop64>);
 
 macro_rules! bench_clear_drop_glue {
     ($ty:ty, $maker:ident, $dense:ident, $dropper:ident) => {
@@ -1676,19 +1690,19 @@ macro_rules! bench_clear_drop_glue {
 }
 
 bench_clear_drop_glue!(
-    SoaList<Drop64>,
+    SplitList<Drop64>,
     make_soalist_drop64,
     soalist_glue_clear_dense,
     soalist_glue_drop
 );
 bench_clear_drop_glue!(
-    PackedList<Drop64>,
+    PackedLinksList<Drop64>,
     make_packedlist_drop64,
     packedlist_glue_clear_dense,
     packedlist_glue_drop
 );
 bench_clear_drop_glue!(
-    AosList<Drop64>,
+    NodesList<Drop64>,
     make_aoslist_drop64,
     aoslist_glue_clear_dense,
     aoslist_glue_drop
@@ -1697,24 +1711,24 @@ bench_clear_drop_glue!(
 fn clear_drop(c: &mut Criterion) {
     let mut g = c.benchmark_group("clear_drop");
 
-    g.bench_function("dense/SoaList", soalist_clear_dense);
-    g.bench_function("dense/PackedList", packedlist_clear_dense);
-    g.bench_function("dense/AosList", aoslist_clear_dense);
-    g.bench_function("sparse/SoaList", soalist_clear_sparse);
-    g.bench_function("sparse/PackedList", packedlist_clear_sparse);
-    g.bench_function("sparse/AosList", aoslist_clear_sparse);
-    g.bench_function("refill/SoaList", soalist_refill);
-    g.bench_function("refill/PackedList", packedlist_refill);
-    g.bench_function("refill/AosList", aoslist_refill);
-    g.bench_function("drop/SoaList", soalist_drop);
-    g.bench_function("drop/PackedList", packedlist_drop);
-    g.bench_function("drop/AosList", aoslist_drop);
-    g.bench_function("gluedense/SoaList", soalist_glue_clear_dense);
-    g.bench_function("gluedense/PackedList", packedlist_glue_clear_dense);
-    g.bench_function("gluedense/AosList", aoslist_glue_clear_dense);
-    g.bench_function("gluedrop/SoaList", soalist_glue_drop);
-    g.bench_function("gluedrop/PackedList", packedlist_glue_drop);
-    g.bench_function("gluedrop/AosList", aoslist_glue_drop);
+    g.bench_function("dense/SplitList", soalist_clear_dense);
+    g.bench_function("dense/PackedLinksList", packedlist_clear_dense);
+    g.bench_function("dense/NodesList", aoslist_clear_dense);
+    g.bench_function("sparse/SplitList", soalist_clear_sparse);
+    g.bench_function("sparse/PackedLinksList", packedlist_clear_sparse);
+    g.bench_function("sparse/NodesList", aoslist_clear_sparse);
+    g.bench_function("refill/SplitList", soalist_refill);
+    g.bench_function("refill/PackedLinksList", packedlist_refill);
+    g.bench_function("refill/NodesList", aoslist_refill);
+    g.bench_function("drop/SplitList", soalist_drop);
+    g.bench_function("drop/PackedLinksList", packedlist_drop);
+    g.bench_function("drop/NodesList", aoslist_drop);
+    g.bench_function("gluedense/SplitList", soalist_glue_clear_dense);
+    g.bench_function("gluedense/PackedLinksList", packedlist_glue_clear_dense);
+    g.bench_function("gluedense/NodesList", aoslist_glue_clear_dense);
+    g.bench_function("gluedrop/SplitList", soalist_glue_drop);
+    g.bench_function("gluedrop/PackedLinksList", packedlist_glue_drop);
+    g.bench_function("gluedrop/NodesList", aoslist_glue_drop);
 
     g.finish();
 }
@@ -1742,4 +1756,19 @@ criterion_group! {
         index_width,
 }
 
-criterion_main!(benches);
+fn main() {
+    // 数字必须带着配置走：索引宽度决定每槽字节数（16 vs 24 B）与串行带宽类指标的走势。
+    println!(
+        "索引宽度：DefaultIx = u{}（{} 字节）；`u32-index` feature {}",
+        core::mem::size_of::<slot_list::DefaultIx>() * 8,
+        core::mem::size_of::<slot_list::DefaultIx>(),
+        if cfg!(feature = "u32-index") {
+            "开"
+        } else {
+            "关"
+        }
+    );
+
+    // `criterion_group!` 生成的函数自己会建 `Criterion`（含 `configure_from_args`）
+    benches();
+}

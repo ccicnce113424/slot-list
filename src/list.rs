@@ -4,12 +4,12 @@ use core::marker::PhantomData;
 use crate::cursor::{Cursor, CursorMut};
 use crate::iter::{IntoIter, Iter, IterMut};
 use crate::slot::Slot;
-use crate::storage::{Aos, NIL, Packed, Soa, Storage};
+use crate::storage::{NIL, Nodes, PackedLinks, Split, Storage};
 
 /// 双向链表：`Vec` 下标 + free-list 的实现，内存布局由 `S` 决定。
 ///
-/// 见 crate 文档里的三个别名 [`SoaList`](crate::SoaList) /
-/// [`PackedList`](crate::PackedList) / [`AosList`](crate::AosList)。
+/// 见 crate 文档里的三个别名 [`SplitList`](crate::SplitList) /
+/// [`PackedLinksList`](crate::PackedLinksList) / [`NodesList`](crate::NodesList)。
 ///
 /// # 数组里没有哨兵值
 ///
@@ -48,8 +48,8 @@ pub struct List<T, S: Storage<T>> {
     pub(crate) storage: S,
     /// 只为"用上 `T`"而存在：`List` 是对**任意** `S: Storage<T>` 定义的，而 `T` 只出现在
     /// 这条 bound 里——Rust **不把 where 子句里的出现算作"被使用"**，删掉这个字段就是
-    /// `error[E0392]: type parameter `T` is never used`（实测；注意 `SoaList<T> = List<T, Soa<T>>`
-    /// 这种**具体别名**里 `T` 会经由 `Soa<T>` 进到字段类型，所以别名不受影响，受影响的是
+    /// `error[E0392]: type parameter `T` is never used`（实测；注意 `SplitList<T> = List<T, Split<T>>`
+    /// 这种**具体别名**里 `T` 会经由 `Split<T>` 进到字段类型，所以别名不受影响，受影响的是
     /// 泛型定义本身）。
     ///
     /// 选 `PhantomData<T>` 而不是别的 marker，是因为它的含义恰好与真实情况一致：
@@ -57,18 +57,18 @@ pub struct List<T, S: Storage<T>> {
     /// - **拥有 `T`**：`List<T, S>` 析构时确实会析构 `T`（[`Drop`](List#impl-Drop) 走 live 链
     ///   逐个 `assume_init_drop`），dropck 需要知道这一点；
     /// - **对 `T` 协变**：与三种 `Storage`（`Vec<MaybeUninit<T>>` / `Link<T>` / `Node<T>`）一致
-    ///   ⇒ `SoaList<&'static str>` 能当 `SoaList<&'a str>` 用；
+    ///   ⇒ `SplitList<&'static str>` 能当 `SplitList<&'a str>` 用；
     /// - **auto traits 跟着 `T`**：`List<T, S>: Send` 当且仅当 `T: Send`（`Sync` 同理）。
     ///
     /// 后两条有编译期测试（`tests::auto_traits_and_variance`）。
     marker: PhantomData<T>,
 }
 
-impl<T, I: crate::Ix> List<T, Soa<T, I>> {
-    /// 空链表（SoA 布局；索引宽度由 `Soa` 的第二个参数决定）。
+impl<T, I: crate::Ix> List<T, Split<T, I>> {
+    /// 空链表（Split 布局；索引宽度由 `Split` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
-            storage: Soa::new(),
+            storage: Split::new(),
             head: NIL,
             tail: NIL,
             free_head: NIL,
@@ -79,11 +79,11 @@ impl<T, I: crate::Ix> List<T, Soa<T, I>> {
     }
 }
 
-impl<T, I: crate::Ix> List<T, Packed<T, I>> {
-    /// 空链表（Packed 布局；索引宽度由 `Packed` 的第二个参数决定）。
+impl<T, I: crate::Ix> List<T, PackedLinks<T, I>> {
+    /// 空链表（PackedLinks 布局；索引宽度由 `PackedLinks` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
-            storage: Packed::new(),
+            storage: PackedLinks::new(),
             head: NIL,
             tail: NIL,
             free_head: NIL,
@@ -94,11 +94,11 @@ impl<T, I: crate::Ix> List<T, Packed<T, I>> {
     }
 }
 
-impl<T, I: crate::Ix> List<T, Aos<T, I>> {
-    /// 空链表（AoS 布局；索引宽度由 `Aos` 的第二个参数决定）。
+impl<T, I: crate::Ix> List<T, Nodes<T, I>> {
+    /// 空链表（Nodes 布局；索引宽度由 `Nodes` 的第二个参数决定）。
     pub const fn new() -> Self {
         Self {
-            storage: Aos::new(),
+            storage: Nodes::new(),
             head: NIL,
             tail: NIL,
             free_head: NIL,
@@ -113,7 +113,7 @@ impl<T, S: Storage<T> + Default> List<T, S> {
     /// **本库扩展**：预留 `capacity` 个槽位的容量后创建空链表。
     ///
     /// 槽位在**连续内存**里，所以预留能避免构造期的反复 realloc
-    /// （对 SoA 布局尤其明显：一次预留省掉三个数组的 3×扩容）。
+    /// （对 Split 布局尤其明显：一次预留省掉三个数组的 3×扩容）。
     pub fn with_capacity(capacity: usize) -> Self {
         let mut list = Self::default();
 
@@ -801,13 +801,13 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 取出整条链的**可搬运状态**（不析构任何元素）。
     ///
     /// 这是 `PERFORMANCE.md` §8 那条"状态可搬运、无指针"承诺的公开入口：整条链的状态
-    /// 就是槽位数组（[`Soa::into_parts`](crate::Soa::into_parts) 等）加上五个数字
+    /// 就是槽位数组（[`Split::into_parts`](crate::Split::into_parts) 等）加上五个数字
     /// （[`RawList`] 的取值器），**没有任何指针**，所以可以直接序列化 / 放进共享内存 /
     /// `mmap`，**不需要指针修正**。
     ///
     /// ```
-    /// # use slot_list::SoaList;
-    /// let mut list: SoaList<u32> = SoaList::new();
+    /// # use slot_list::SplitList;
+    /// let mut list: SplitList<u32> = SplitList::new();
     /// list.extend([1, 2, 3]);
     /// let removed = list.pop_front().unwrap();
     /// assert_eq!(removed, 1);          // 留一个空闲槽，free 链非空
@@ -817,7 +817,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// assert_eq!(raw.len(), 2);
     /// assert_eq!(raw.capacity(), 3);
     ///
-    /// let list = unsafe { SoaList::from_raw(raw) };   // 原样放回
+    /// let list = unsafe { SplitList::from_raw(raw) };   // 原样放回
     /// assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![2, 3]);
     /// ```
     pub fn into_raw(self) -> RawList<T, S> {
@@ -862,7 +862,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**（≈0.11 ns/槽）。
     /// 数据来自 `src/tests.rs` 的 `probe_clear_vs_scan`：
     /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`。
-    /// 1M 槽位、默认 `u32` 索引、min/9 轮、`Soa`）：
+    /// 1M 槽位、显式 `u32` 索引、min/9 轮、`Split`）：
     ///
     /// | `live/slots` | 追链表 | 扫槽位 | |
     /// |---|---|---|---|
@@ -873,24 +873,24 @@ impl<T, S: Storage<T>> List<T, S> {
     /// | 0.01 | 0.011 ms | 0.11 ms | 追链快 10× |
     /// | 0.001 | 1.1 µs | 0.11 ms | 追链快 **100×** |
     /// | 满 + 64 B Drop glue | 2.45 ms | 2.57 ms | 平手 |
-    /// | 0.001 + 64 B Drop glue（`Aos`） | 2 µs | 2.7 ms | 追链快 **1300×** |
+    /// | 0.001 + 64 B Drop glue（`Nodes`） | 2 µs | 2.7 ms | 追链快 **1300×** |
     ///
     /// 两条代价模型完全不同：**追链是 O(live) 次随机槽位访问**（实测 ≈1.07 ns/live：
     /// 依赖加载 + 随机 read-modify-write），**扫描是 O(slots) 次顺序访问**
-    /// （≈0.11 ns/槽：只流式读 `prev` 那几字节标志；`Packed` 0.16~0.23 ms、
-    /// `Aos` 0.38 ms——`Aos` 的标记位和整节点共处一条缓存行，要按节点大小付带宽）。
+    /// （≈0.11 ns/槽：只流式读 `prev` 那几字节标志；`PackedLinks` 0.16~0.23 ms、
+    /// `Nodes` 0.38 ms——`Nodes` 的标记位和整节点共处一条缓存行，要按节点大小付带宽）。
     ///
     /// **打平点**（扫描不亏的最低密度）与**值得切换的阈值**（扫描快 ≥1.5×）——
     /// 两者都随**索引宽度**和**布局**一起动：
     ///
     /// | 布局 / 索引 | 满表加速 | 打平点 | ≥1.5× |
     /// |---|---|---|---|
-    /// | `Soa` / `u32` | 7.1× | 0.25 | 0.25 |
-    /// | `Soa` / `usize`（u64） | 1.9× | 0.50 | 0.75 |
-    /// | `Packed` / `u32` | 4.7× | 0.25 | 0.25 |
-    /// | `Packed` / `usize` | 2.3× | 0.50 | 0.75 |
-    /// | `Aos` / `u32` | 3.4× | 0.50 | 0.50 |
-    /// | `Aos` / `usize` | 2.0× | 0.50 | 0.75 |
+    /// | `Split` / `u32` | 7.1× | 0.25 | 0.25 |
+    /// | `Split` / `usize`（u64） | 1.9× | 0.50 | 0.75 |
+    /// | `PackedLinks` / `u32` | 4.7× | 0.25 | 0.25 |
+    /// | `PackedLinks` / `usize` | 2.3× | 0.50 | 0.75 |
+    /// | `Nodes` / `u32` | 3.4× | 0.50 | 0.50 |
+    /// | `Nodes` / `usize` | 2.0× | 0.50 | 0.75 |
     ///
     /// 阈值取 **0.5**：`2 * len >= slots` 时走扫描。这一档六种组合实测 **0.99×~1.43×**
     /// （最坏是打平，没有组合会明显变慢），代价是打平点更低的组合丢掉了 0.5 以下那
@@ -963,8 +963,8 @@ impl<T, S: Storage<T>> List<T, S> {
 /// 元素在 `MaybeUninit` 里，本来就不由存储析构）。要拿回元素就先放回 `List`。
 ///
 /// 取值器给全了序列化需要的全部信息：数组从 `storage()` 拿
-/// （[`Soa::as_parts`](crate::Soa::as_parts) / [`Packed::as_parts`](crate::Packed::as_parts) /
-/// [`Aos::as_parts`](crate::Aos::as_parts)），五个数字从这里拿。
+/// （[`Split::as_parts`](crate::Split::as_parts) / [`PackedLinks::as_parts`](crate::PackedLinks::as_parts) /
+/// [`Nodes::as_parts`](crate::Nodes::as_parts)），五个数字从这里拿。
 pub struct RawList<T, S: Storage<T>> {
     inner: core::mem::ManuallyDrop<List<T, S>>,
 }
@@ -1157,9 +1157,9 @@ impl<'a, T, S: Storage<T>> IntoIterator for &'a mut List<T, S> {
 /// | 载荷 | 经 `clear` | 只析构 | |
 /// |---|---|---|---|
 /// | `usize`（无 glue） | 1.098 ms | **1.9 µs** | 整条析构链被 LLVM 消掉，只剩释放存储 |
-/// | `Drop64`（有 glue，`Soa`） | 2.498 ms | **1.889 ms** | 快 1.32× |
-/// | `Drop64`（有 glue，`Packed`） | 2.888 ms | 2.062 ms | 快 1.40× |
-/// | `Drop64`（有 glue，`Aos`） | 3.569 ms | 2.069 ms | 快 1.72× |
+/// | `Drop64`（有 glue，`Split`） | 2.498 ms | **1.889 ms** | 快 1.32× |
+/// | `Drop64`（有 glue，`PackedLinks`） | 2.888 ms | 2.062 ms | 快 1.40× |
+/// | `Drop64`（有 glue，`Nodes`） | 3.569 ms | 2.069 ms | 快 1.72× |
 ///
 /// 表里"只析构"那列**还含**释放整个槽位数组（"经 `clear`"那列不含）⇒ 1.3~1.7× 是
 /// 下界：省掉的正是每槽一次随机 read-modify-write 加一次随机 `next` 写。稀疏表上差别

@@ -29,16 +29,17 @@
 //! `PERFORMANCE.md` §9）。`head` / `tail` / `free_head` / `free_tail` 与 `storage`
 //! 里的下标仍然不公开。
 //!
-//! 三种内存布局共用**同一份实现**：
+//! 三种内存布局共用**同一份实现**，区别只有"哪些字段排在一起"：
 //!
-//! | 别名 | 布局 | 每槽（T=8 / T=64） | 结构 |
+//! | 别名 | 布局 | 排布 | 每槽（T=8 / T=64） |
 //! |---|---|---|---|
-//! | [`SoaList`] | [`Soa`] | 16 / 72 B | `data` / `prev` / `next` 三个独立 `Vec` |
-//! | [`PackedList`] | [`Packed`] | 16 / 72 B | `data` 一个 `Vec`，`prev`/`next` 放进同一个 `Link` |
-//! | [`AosList`] | [`Aos`] | 16 / 72 B | 三者放进一个 `Node` |
+//! | [`SplitList`] | [`Split`] | `data` / `prev` / `next` **三条流各自一个 `Vec`** | 24 / 80 B（`u32` 索引：16 / 72） |
+//! | [`PackedLinksList`] | [`PackedLinks`] | `data` 一个 `Vec`，`prev`/`next` **成对**放进同一个 `Link` | 24 / 80 B（`u32`：16 / 72） |
+//! | [`NodesList`] | [`Nodes`] | `data` + `prev` + `next` **整节点**放进一个 `Node` | 24 / 80 B（`u32`：16 / 72） |
 //!
-//! 别名第二个参数是**索引宽度**（[`Ix`]），默认 `u32`：每槽比 `usize` 省 1/3，
-//! `append` 快 37%，其余持平；代价是槽位上限 2.1G（见 [`Ix::MAX_SLOTS`]）。
+//! 别名第二个参数是**索引宽度**（[`Ix`]），默认 [`DefaultIx`] = `usize`；开 `u32-index`
+//! feature 换成 `u32`：每槽省 1/3、`append` 快 37%，代价是槽位上限 2.1G
+//! （见 [`Ix::MAX_SLOTS`]）。**`PERFORMANCE.md` 里绝大多数数字是 `u32` 索引时代测的。**
 //!
 //! 三者都是 [`List<T, S>`] 的别名，所有逻辑只写一遍，布局差异由
 //! [`Storage`] 策略提供。
@@ -148,19 +149,19 @@ pub use cursor::{Cursor, CursorMut};
 pub use iter::{IntoIter, Iter, IterMut};
 pub use list::{List, RawList};
 pub use slot::Slot;
-pub use storage::{Aos, Ix, Packed, Soa, Storage};
+pub use storage::{DefaultIx, Ix, Nodes, PackedLinks, Split, Storage};
 
-/// SoA 布局：`data` / `prev` / `next` 三个独立 `Vec`。
+/// `Split` 布局：`data` / `prev` / `next` 三个独立 `Vec`。
 ///
 /// 第二个参数是**索引宽度**（[`Ix`]：`u8` / `u16` / `u32` / `u64` / `usize`），
 /// 直接决定每槽多少字节：`T = 8` 时 `usize` 是 24 B/槽、`u32` 是 **16 B**、`u16` 是 12 B。
 /// 代价是槽位数上限（`u32` ⇒ 2.1G、`u16` ⇒ 32k、`u8` ⇒ 128，超过就 panic）。
-pub type SoaList<T, I = u32> = List<T, Soa<T, I>>;
+pub type SplitList<T, I = DefaultIx> = List<T, Split<T, I>>;
 
-/// Packed 布局：`data` 一个 `Vec`，`prev`/`next` 交错放在另一个 `Vec`。
-/// 第二个参数是索引宽度（同 [`SoaList`]）。
-pub type PackedList<T, I = u32> = List<T, Packed<T, I>>;
+/// PackedLinks 布局：`data` 一个 `Vec`，`prev`/`next` 交错放在另一个 `Vec`。
+/// 第二个参数是索引宽度（同 [`SplitList`]）。
+pub type PackedLinksList<T, I = DefaultIx> = List<T, PackedLinks<T, I>>;
 
-/// AoS 布局：`data` / `prev` / `next` 放进单个 `Node`。
-/// 第二个参数是索引宽度（同 [`SoaList`]）。
-pub type AosList<T, I = u32> = List<T, Aos<T, I>>;
+/// Nodes 布局：`data` / `prev` / `next` 放进单个 `Node`。
+/// 第二个参数是索引宽度（同 [`SplitList`]）。
+pub type NodesList<T, I = DefaultIx> = List<T, Nodes<T, I>>;

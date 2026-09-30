@@ -2,9 +2,9 @@
 //!
 //! 三种策略的**算法完全相同**，只有存储方式不同：
 //!
-//! - [`Soa`]：三个独立 `Vec`（array of structs 的反面，structure of arrays）
-//! - [`Packed`]：`data` 一个 `Vec`，`prev`/`next` 打包成 [`Link`] 交错存放
-//! - [`Aos`]：三者放进一个 `Node`（array of structs）
+//! - [`Split`]：三个独立 `Vec`（array of structs 的反面，structure of arrays）
+//! - [`PackedLinks`]：`data` 一个 `Vec`，`prev`/`next` 打包成 [`Link`] 交错存放
+//! - [`Nodes`]：三者放进一个 `Node`（array of structs）
 
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, offset_of, size_of};
@@ -25,7 +25,7 @@ pub(crate) const NIL: usize = usize::MAX;
 ///
 /// **上限**：空闲标记位占最高位（见 [`Ix::FREE_BIT`]），而 `append` 的整段 `+= base`
 /// 靠"不向这一位进位"来免特例，所以可用槽位数是 `1 << (BITS - 1)`：
-/// `u32` ⇒ 2.1G（默认）、`u16` ⇒ 32768、`u8` ⇒ 128。超过就在 `grow` / `reserve`
+/// `u32` ⇒ 2.1G、`u16` ⇒ 32768、`u8` ⇒ 128（默认宽度见 [`DefaultIx`]）。超过就在 `grow` / `reserve`
 /// 处 panic，不会静默截断。
 ///
 /// 这个 trait 是**封闭**的（`u8` ~ `u64` / `usize`），出现在类型参数的位置上。
@@ -69,7 +69,7 @@ pub trait Ix:
     ///
     /// 这个位**只在"变空闲"那一次**写，所以它的写法直接落在 `churn` 的热路径上。
     ///
-    /// | 写法 | `churn`（Soa / Packed，两轮交替 A/B） | 结论 |
+    /// | 写法 | `churn`（Split / PackedLinks，两轮交替 A/B） | 结论 |
     /// |---|---|---|
     /// | `prev |= FREE_BIT`（当前） | **2.79 / 2.76 ms** | 保留 |
     /// | `prev = FREE_BIT` | 2.99~3.04 / 2.96~2.98（**+7%**） | 否 |
@@ -181,30 +181,30 @@ impl_ix!(u8, u16, u32, u64, usize);
 ///   不依赖"`data` 恰好在开头"这个假设）；
 /// - `prev` / `next`：元素 0 的链接字段基址（三种布局的链接**都是 `usize`**，
 ///   所以类型固定，变的只有步长）；
-/// - `prev_stride` / `next_stride`：相邻元素的链接字段相隔多少字节——Packed 里
-///   两个链接打包成 `Link`，Aos 里它们和 `data` 同处一个 `Node<T>`，所以这里的
+/// - `prev_stride` / `next_stride`：相邻元素的链接字段相隔多少字节——PackedLinks 里
+///   两个链接打包成 `Link`，Nodes 里它们和 `data` 同处一个 `Node<T>`，所以这里的
 ///   步长是"元素"大小而不是 8。
 ///
-/// 三个布局具体怎么落到这些字段上（`T = usize`、默认索引 `u32`；括号里是
+/// 三个布局具体怎么落到这些字段上（`T = usize`、索引 `u32`；括号里是
 /// `T = [u64; 8]`，实测值）：
 ///
 /// | 布局 | `data` 基址 / `data_stride` / `data_offset` | `prev`·`next` 基址 / 步长 |
 /// |---|---|---|
-/// | `Soa<T, I>` | 数据数组首址 / `size_of::<T>()` 8（64）/ 0 | 各自数组首址 / `size_of::<I>()` 4 |
-/// | `Packed<T, I>` | 数据数组首址 / 8（64）/ 0 | `links + offset_of!(Link<I>, …)` 0·4 / 8 |
-/// | `Aos<T, I>` | 节点数组首址 / `size_of::<Node<T, I>>()` 16（72）/ `offset_of!(Node<T, I>, data)` 0 | `nodes + offset_of!(Node<T, I>, …)` 8·12 / 16（72） |
+/// | `Split<T, I>` | 数据数组首址 / `size_of::<T>()` 8（64）/ 0 | 各自数组首址 / `size_of::<I>()` 4 |
+/// | `PackedLinks<T, I>` | 数据数组首址 / 8（64）/ 0 | `links + offset_of!(Link<I>, …)` 0·4 / 8 |
+/// | `Nodes<T, I>` | 节点数组首址 / `size_of::<Node<T, I>>()` 16（72）/ `offset_of!(Node<T, I>, data)` 0 | `nodes + offset_of!(Node<T, I>, …)` 8·12 / 16（72） |
 ///
 /// ```text
-/// Soa      data  [d0][d1][d2]…      prev [p0][p1]…      next [n0][n1]…
+/// Split      data  [d0][d1][d2]…      prev [p0][p1]…      next [n0][n1]…
 ///                 ↑ stride 8               ↑ stride 4           ↑ stride 4
-/// Packed   data  [d0][d1]…          links [(p0,n0)][(p1,n1)]…
+/// PackedLinks   data  [d0][d1]…          links [(p0,n0)][(p1,n1)]…
 ///                                           ↑ prev=links+0, next=links+4, stride 8
-/// Aos      nodes [(d0,p0,n0)][(d1,p1,n1)]…
+/// Nodes      nodes [(d0,p0,n0)][(d1,p1,n1)]…
 ///                  ↑ data=nodes+0, prev=nodes+8, next=nodes+12, stride 16
 /// ```
 ///
 ///「两个索引域」：`data` 域按 `Layout` 的步长走（宽度由布局决定），**链接域一律是
-/// `Ix` 宽度**（默认 4 字节）——[`IterMut`](crate::IterMut) 靠 `ix_width` 决定怎么读。
+/// `Ix` 宽度**（默认 8 字节，见 [`DefaultIx`]）——[`IterMut`](crate::IterMut) 靠 `ix_width` 决定怎么读。
 ///
 /// 地址能这么算，靠的是三条不变量：① 指针来自同一个容器自己的 `Vec`，而 `Layout`
 /// 只在迭代器持有 `&'a mut List` 的那段独占期里用（中途不会 realloc / 搬家）；
@@ -332,18 +332,36 @@ pub trait Storage<T>: sealed::Sealed {
 }
 
 // ============================================================
-// SoA：三个独立 Vec
+// 默认索引宽度
 // ============================================================
 
-/// 下标宽度可调：`Soa<T, u16>` / `Soa<T, u32>` / `Soa<T, usize>` / ……，默认 `u32`
-/// （每槽比 `usize` 省 1/3，`append` 快 37%，其余持平；上限见 [`Ix`]）。
-pub struct Soa<T, I = u32> {
+/// 索引宽度默认值：**`usize`**。
+///
+/// 开 `u32-index` feature 换成 `u32`（每槽省 1/3、`append` 快 37%，上限见
+/// [`Ix::MAX_SLOTS`]）——那是"在窄索引下跑全套测试/基准"的开关，**默认关闭**。
+#[cfg(feature = "u32-index")]
+pub type DefaultIx = u32;
+#[cfg(not(feature = "u32-index"))]
+pub type DefaultIx = usize;
+
+// ============================================================
+// Split：数据、前驱、后继三条流各自成数组
+// ============================================================
+
+/// **三条流完全分开**：`data` / `prev` / `next` 各一个 `Vec`。
+///
+/// 走链只碰索引数组（`u32` 时 4 B/槽），带宽最省；代价是每个槽位三个基址，
+/// 元素与链接永远不在同一条 cache line。
+///
+/// 索引宽度可调（`prev`/`next` 一起窄）：`Split<T, u16>` / `Split<T, u32>` /
+/// `Split<T, usize>`，默认见 [`DefaultIx`]。
+pub struct Split<T, I = DefaultIx> {
     data: Vec<MaybeUninit<T>>,
     prev: Vec<I>,
     next: Vec<I>,
 }
 
-impl<T, I: Ix> Soa<T, I> {
+impl<T, I: Ix> Split<T, I> {
     pub const fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -353,7 +371,7 @@ impl<T, I: Ix> Soa<T, I> {
     }
 }
 
-impl<T, I: Ix> Soa<T, I> {
+impl<T, I: Ix> Split<T, I> {
     /// 裸部件（只读）：`(data, prev, next)`，三者长度相等 = 槽位数。
     ///
     /// **这是"状态可搬运"的入口**：整条链的全部状态 = 这些数组 + 那五个数字
@@ -383,15 +401,15 @@ impl<T, I: Ix> Soa<T, I> {
     }
 }
 
-impl<T, I: Ix> Default for Soa<T, I> {
+impl<T, I: Ix> Default for Split<T, I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, I: Ix> sealed::Sealed for Soa<T, I> {}
+impl<T, I: Ix> sealed::Sealed for Split<T, I> {}
 
-impl<T, I: Ix> Storage<T> for Soa<T, I> {
+impl<T, I: Ix> Storage<T> for Split<T, I> {
     #[inline]
     fn slots(&self) -> usize {
         self.data.len()
@@ -512,12 +530,12 @@ impl<T, I: Ix> Storage<T> for Soa<T, I> {
 }
 
 // ============================================================
-// Packed：data 一个 Vec，prev/next 打包成 Link
+// PackedLinks：data 一个 Vec，prev/next 打包成 Link
 // ============================================================
 
-/// `Packed` 布局里一条槽位的两条链接。
+/// `PackedLinks` 布局里一条槽位的两条链接。
 ///
-/// 公开是因为**裸部件 API**（`Packed::as_parts` / `from_parts`）要把它交出去 ——
+/// 公开是因为**裸部件 API**（`PackedLinks::as_parts` / `from_parts`）要把它交出去 ——
 /// 想自己序列化 / 从共享内存恢复整条链，就需要能读写这个类型。
 #[derive(Clone, Copy, Debug)]
 pub struct Link<I> {
@@ -527,13 +545,18 @@ pub struct Link<I> {
     pub next: I,
 }
 
-/// 下标宽度可调（`prev`/`next` 共处一个 `Link`，所以两个字段一起窄）。
-pub struct Packed<T, I = u32> {
+/// **只有索引成对交错**：`data` 一个 `Vec`，`prev`/`next` 打包进同一个 `Link` 数组。
+///
+/// 走链时两条链接同处一条 cache line（一次 miss 拿到前驱和后继），`data` 仍独立
+/// ⇒ 判空闲标记只碰索引、不碰元素。
+///
+/// 索引宽度可调（两个字段在同一个 `Link` 里，只能一起窄）。默认见 [`DefaultIx`]。
+pub struct PackedLinks<T, I = DefaultIx> {
     data: Vec<MaybeUninit<T>>,
     links: Vec<Link<I>>,
 }
 
-impl<T, I: Ix> Packed<T, I> {
+impl<T, I: Ix> PackedLinks<T, I> {
     pub const fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -542,7 +565,7 @@ impl<T, I: Ix> Packed<T, I> {
     }
 }
 
-impl<T, I: Ix> Packed<T, I> {
+impl<T, I: Ix> PackedLinks<T, I> {
     /// 裸部件（只读）：`(data, links)`，两个数组长度相等 = 槽位数。
     pub fn as_parts(&self) -> (&[MaybeUninit<T>], &[Link<I>]) {
         (&self.data, &self.links)
@@ -557,7 +580,7 @@ impl<T, I: Ix> Packed<T, I> {
     ///
     /// # Safety
     ///
-    /// 要求与 [`Soa::from_parts`] 相同：两个数组长度相等；每个 `prev`/`next` 都是合法槽位
+    /// 要求与 [`Split::from_parts`] 相同：两个数组长度相等；每个 `prev`/`next` 都是合法槽位
     /// 下标；空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
     pub unsafe fn from_parts(data: Vec<MaybeUninit<T>>, links: Vec<Link<I>>) -> Self {
         debug_assert_eq!(data.len(), links.len(), "from_parts: data/links 长度不等");
@@ -566,15 +589,15 @@ impl<T, I: Ix> Packed<T, I> {
     }
 }
 
-impl<T, I: Ix> Default for Packed<T, I> {
+impl<T, I: Ix> Default for PackedLinks<T, I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, I: Ix> sealed::Sealed for Packed<T, I> {}
+impl<T, I: Ix> sealed::Sealed for PackedLinks<T, I> {}
 
-impl<T, I: Ix> Storage<T> for Packed<T, I> {
+impl<T, I: Ix> Storage<T> for PackedLinks<T, I> {
     #[inline]
     fn slots(&self) -> usize {
         self.links.len()
@@ -691,10 +714,10 @@ impl<T, I: Ix> Storage<T> for Packed<T, I> {
 }
 
 // ============================================================
-// AoS：全部字段放进一个 Node
+// Nodes：全部字段放进一个 Node
 // ============================================================
 
-/// `Aos` 布局里的一个槽位：元素与两条链接同处一条 cache line。
+/// `Nodes` 布局里的一个槽位：元素与两条链接同处一条 cache line。
 ///
 /// 公开的理由同 [`Link`]（裸部件 API）。
 pub struct Node<T, I> {
@@ -713,18 +736,24 @@ impl<T, I> Node<T, I> {
     }
 }
 
-/// 下标宽度可调（`prev`/`next` 就在节点里，和 `data` 同一条 cache line）。
-pub struct Aos<T, I = u32> {
+/// **数据与索引整节点交错**：每槽一个 `Node`（`data` + `prev` + `next`），一个 `Vec` 装完。
+///
+/// `next` 与 `data` 同处一条 cache line（拿到下标顺带有元素）⇒ 短暂访问元素最省；
+/// 代价是**只判空闲标记也要按整节点付带宽**（见 [`List::clear`] 的密度表：它的扫描
+/// 阈值最高）。
+///
+/// 索引宽度默认见 [`DefaultIx`]。
+pub struct Nodes<T, I = DefaultIx> {
     nodes: Vec<Node<T, I>>,
 }
 
-impl<T, I: Ix> Aos<T, I> {
+impl<T, I: Ix> Nodes<T, I> {
     pub const fn new() -> Self {
         Self { nodes: Vec::new() }
     }
 }
 
-impl<T, I: Ix> Aos<T, I> {
+impl<T, I: Ix> Nodes<T, I> {
     /// 裸部件（只读）：`nodes`（每个节点自带元素与两条链接）。
     pub fn as_parts(&self) -> &[Node<T, I>] {
         &self.nodes
@@ -739,22 +768,22 @@ impl<T, I: Ix> Aos<T, I> {
     ///
     /// # Safety
     ///
-    /// 要求与 [`Soa::from_parts`] 相同：每个节点里的 `prev`/`next` 都是合法槽位下标；
+    /// 要求与 [`Split::from_parts`] 相同：每个节点里的 `prev`/`next` 都是合法槽位下标；
     /// 空闲槽的 `prev` 最高位是空闲标记（[`Ix::FREE_BIT`]）；live 槽的 `data` 已初始化。
     pub unsafe fn from_parts(nodes: Vec<Node<T, I>>) -> Self {
         Self { nodes }
     }
 }
 
-impl<T, I: Ix> Default for Aos<T, I> {
+impl<T, I: Ix> Default for Nodes<T, I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, I: Ix> sealed::Sealed for Aos<T, I> {}
+impl<T, I: Ix> sealed::Sealed for Nodes<T, I> {}
 
-impl<T, I: Ix> Storage<T> for Aos<T, I> {
+impl<T, I: Ix> Storage<T> for Nodes<T, I> {
     #[inline]
     fn slots(&self) -> usize {
         self.nodes.len()
