@@ -46,7 +46,14 @@
 //!
 //! # `no_std`
 //!
-//! 关掉默认的 `std` feature 就是 `no_std` + `alloc`（`cargo check --no-default-features`）：
+//! 关掉默认的 `std` feature 就是 `no_std` + `alloc`：
+//!
+//! ```text
+//! cargo check --no-default-features     # no_std 只用 check 验证
+//! ```
+//!
+//! `std` 同时也是**基准与测试**的前提（criterion、测试里的 `std::rc`）：这个组合下
+//! bench target 会被 `required-features` 跳过，测试模块也不编译。
 //! 库本身只用 `core` 与 `alloc::vec::Vec`，没有别的依赖。
 //!
 //! # 状态可搬运（可序列化 / 共享内存）
@@ -143,6 +150,7 @@ mod slot;
 pub mod storage;
 
 #[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;
 
 pub use cursor::{Cursor, CursorMut};

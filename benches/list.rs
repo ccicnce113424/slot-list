@@ -42,7 +42,7 @@
 
 #![cfg_attr(feature = "linked-list-cursors", feature(linked_list_cursors))]
 
-// 全局分配器。`cargo bench --no-default-features` 会切回系统 malloc，
+// 全局分配器。默认是系统 malloc；`cargo bench --features mimalloc` 换成 mimalloc，
 // 便于对比"分配器是否把内存还给内核"对端操作的影响。
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -1763,6 +1763,19 @@ fn main() {
         core::mem::size_of::<slot_list::DefaultIx>() * 8,
         core::mem::size_of::<slot_list::DefaultIx>(),
         if cfg!(feature = "u32-index") {
+            "开"
+        } else {
+            "关"
+        }
+    );
+    println!(
+        "全局分配器：{}（`mimalloc` feature {}）",
+        if cfg!(feature = "mimalloc") {
+            "mimalloc"
+        } else {
+            "系统 malloc"
+        },
+        if cfg!(feature = "mimalloc") {
             "开"
         } else {
             "关"

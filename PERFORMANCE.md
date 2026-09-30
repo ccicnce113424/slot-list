@@ -210,8 +210,8 @@ free-list 串起来复用；三种内存布局（`SplitList` / `PackedLinksList`
 
 | 环境 | SplitList | PackedLinksList | NodesList | 计时区缺页 |
 |---|---|---|---|---|
-| mimalloc（默认 feature） | 3.7 ~ 4.3 ms | 3.6 ~ 4.0 ms | 3.4 ~ 3.7 ms | 0 |
-| 系统 malloc（`--no-default-features`） | 8.2 ms | 17.0 ms | 11.3 ms | 4095 / 8095 / 12003 |
+| mimalloc（`--features mimalloc`） | 3.7 ~ 4.3 ms | 3.6 ~ 4.0 ms | 3.4 ~ 3.7 ms | 0 |
+| 系统 malloc（不留 `mimalloc` feature） | 8.2 ms | 17.0 ms | 11.3 ms | 4095 / 8095 / 12003 |
 | 系统 malloc + `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | 2.8 ms | 4.2 ms | 2.4 ms | 8 / 17 / 24 |
 | 对照：`mmap` 24 MB、每页只写 1 字节、**不做拷贝** | 8.2 ~ 9.4 ms | — | — | 5860 |
 
@@ -355,8 +355,8 @@ K=64，与我们的 `SplitList` 同机同期对照：
 **环境（库外，但对 `append*` 影响最大）**
 
 ```sh
-cargo bench                                  # 默认 mimalloc（默认 feature）
-cargo bench --no-default-features            # 系统 malloc：看缺页，别看墙钟
+cargo bench                                  # 系统 malloc（默认）：看缺页，别看墙钟
+cargo bench --features mimalloc              # mimalloc：本文档绝大多数数字的配置
 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 cargo bench   # glibc ≥ 2.35，让大块走大页
 MIMALLOC_PURGE_DELAY=-1 cargo bench          # mimalloc：别把页还给内核
 ```

@@ -8,10 +8,16 @@ name = "slot_list"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "mimalloc"]
-# 关掉它就是 `no_std` + `alloc`（`cargo check --no-default-features`）。
+# 默认只有 `std`：基准跑在**系统 allocator** 上。
+default = ["std"]
+# 关掉它就是 `no_std` + `alloc`。
+#   cargo check --no-default-features          # 验证 no_std 能编
+# 注意：`std` 也是**基准与测试**的前提（criterion、测试里的 `std::rc`），
+# `--no-default-features` 下 bench target 会被跳过（`required-features`）。
 std = []
-# 只影响基准：`cargo bench --no-default-features` 切回系统 malloc 做 A/B 对比。
+# 只影响**基准**：开它就用 mimalloc 当全局分配器（`PERFORMANCE.md` 里的数字都是这么测的）。
+#   cargo bench --features mimalloc            # 复现文档数字
+#   cargo bench                                # 系统 malloc（默认）
 mimalloc = []
 # 只影响基准：开它才对比 std `LinkedList` 的**游标**（`#![feature(linked_list_cursors)]`）
 # ⇒ 只有 nightly 能开，stable 上开它会是明确报错而不是静默少几行：
@@ -30,3 +36,5 @@ fast-list = "0.1.8"
 [[bench]]
 name = "list"
 harness = false
+# 基准跑不了 `no_std`：criterion 需要 std。
+required-features = ["std"]
