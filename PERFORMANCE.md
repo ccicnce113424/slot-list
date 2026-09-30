@@ -27,6 +27,7 @@ noted. See §1.2 for the element types and §3 for the full tables.
 | Confirmed at the ceiling | **within this crate's shape**: walking the chain during iteration and `append`'s copying. Three routes were implemented/modelled and rejected (§4). Going faster means changing the shape: chunking ≈ `LinkedList<Vec<T>>`, faster on every item but with no element-level cursor and no stable handle (end of §4) |
 | Unique value (beyond performance) | **stable handle `Slot` (O(1) entry/remove/move, measured ~39,000× faster than going by position)**, zero allocation on the hot path (tested), relocatable state (tested), swappable layout — see §8 |
 | Most effective knobs | reusing free slots (`append_elementwise`) and preallocating capacity (`with_capacity`), then the allocator / huge pages (§6) |
+| Allocator | numbers are **mimalloc**; under the system allocator `churn`/`iteration`/`cursor_update` are unchanged, while `end_ops`/`append*`/`blob_*` move by up to ~6.5× **either way** depending on the allocation pattern (§3.8) |
 
 ---
 
@@ -292,8 +293,9 @@ moved twice. The whole gap is that byte count, not the index rewrite:
   overhead is 16 B on an 80 B slot (20%) instead of 16 B on 24 B (67%).
 - **The cost of a block move is mostly "does the target need fresh pages"**: under mimalloc (these
   runs) 1M ⊕ 1M costs ~3.4–4.1 ms with zero page faults in the timing region; under the system
-  allocator (glibc `malloc`, §1.1) the same code is dominated by first-touch faults and can be
-  several times slower. Always read the page-fault count (§1.4).
+  allocator (glibc `malloc`, §1.1) the same code is dominated by first-touch faults. That changes
+  these groups by up to ~6.5×, in **both** directions depending on the allocation pattern — see
+  §3.8. Always read the page-fault count (§1.4).
 
 **Elementwise path, per element** (internal probe, min of 9 rounds; element `usize`, `[u64;8]` or
 `[u64;32]`; target pre-built with N live + N free already-touched slots):
@@ -324,6 +326,45 @@ Element = `usize`, N = 1M. **The same work, differing only in how the element is
 **39,000×**.) The by-handle column is the steady state where the 100 victim slots sit in cache (the
 common case in an LRU); even with cold victim slots it is only a few extra misses (hundreds of ns),
 so the conclusion is unchanged.
+
+### 3.8 Allocator: mimalloc vs the system allocator
+
+Every number elsewhere in this document is **mimalloc** (§1.1). Running the same suite with the
+system allocator (glibc `malloc`, i.e. plain `cargo bench`) changes only the groups that
+**allocate inside the timed region**. Table: median of 3 alternating `mimalloc` / `no-mimalloc`
+runs, ratio = system ÷ mimalloc (`>1` = system slower). Element `usize`, N = 1M, except the
+`blob_*` rows (`Blob64`, 250k).
+
+| Group (allocates?) | SplitList | PackedLinksList | NodesList | VecDeque | Vec | LinkedList |
+|---|---|---|---|---|---|---|
+| `churn` (no) | 1.03× | 0.98× | 0.98× | 1.05× | — | 1.17× |
+| `iteration` (no) | 1.01× | 1.02× | 1.06× | 1.00× | 0.99× | 1.11× |
+| `end_ops` push_back+pop_front (yes, grows) | **2.51×** | **3.62×** | 0.63× | 0.75× | — | 1.59× |
+| `end_ops` push_front+pop_back (yes, grows) | 0.81× | 0.99× | 0.66× | 0.67× | — | 1.60× |
+| `append` 1M ⊕ 1M `usize` (yes, grows) | 1.09× | **4.07×** | **6.52×** | 1.12× | 0.91× | n/a (O(1)) |
+| `append_blob` 250k ⊕ 250k `Blob64` (yes, grows) | 1.68× | 1.96× | 2.05× | 2.08× | 1.07× | n/a (O(1)) |
+| `append_blob::elementwise` (reuses free slots) | 1.19× | 1.09× | 1.21× | — | — | — |
+| `blob_end_ops` 250k `Blob64` (yes) | 0.77× | 0.68× | 0.70× | 0.69× | — | 2.20× |
+
+Reading:
+
+- **Non-allocating paths are allocator-independent**: `churn` and `iteration` stay within 1–6%
+  (noise), because the timed loop never enters the allocator.
+- **Allocating paths are allocator- and page-fault-dependent, and not in one direction**: glibc is
+  up to **~6.5× slower** (Nodes `append`, where a single big `Vec` is repeatedly grown, and
+  PackedLinks/Split `end_ops` growing a fresh table), yet **~1.3–1.6× faster** on `blob_end_ops` and
+  the `push_front`/`pop_back` end operations in the very same session. The direction follows the
+  allocation pattern (size class, glibc's `mmap`/`munmap` of blocks above ~128 KB, whether the
+  repeated batch iteration can reuse hot pages), not the crate.
+- **Mechanism**: mimalloc retains freed segments and purges lazily, so each repeated
+  `iter_batched` iteration reuses already-faulted pages (0 faults in the timing region); glibc
+  returns large blocks to the kernel (`munmap`) and re-faults them on the next iteration — which
+  costs when the same pages must be touched again, and *saves* when the fault path happens to be
+  cheaper than the allocator's own bookkeeping for that size class.
+- **Practical rule**: compare allocators only within one configuration, reproduce published
+  numbers with `--features mimalloc`, and expect the `end_ops` / `append*` / `blob_*` groups to
+  move by up to several-fold (in either direction) under the system allocator. `churn`,
+  `iteration`, `cursor_update`, `middle_*` and `slot_entry` do not move with the allocator.
 
 ---
 
@@ -430,7 +471,7 @@ MIMALLOC_PURGE_DELAY=-1 cargo bench             # mimalloc: don't give pages bac
 
 ```sh
 cargo bench --features mimalloc,linked-list-cursors   # the configuration of this document
-cargo bench                                     # system malloc; page-fault accounting shows through
+cargo bench                                     # system malloc (glibc); see the allocator comparison, §3.8
 cargo bench -- 'FastList'                       # only the fast-list comparison group (§9)
 cargo bench -- 'clear_drop'                     # clear/Drop comparison (§5)
 cargo test --release -- --ignored --nocapture probe_clear_vs_scan   # clear's density curve and crossing point (§5)
