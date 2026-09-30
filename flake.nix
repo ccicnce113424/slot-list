@@ -1,5 +1,5 @@
 {
-  description = "Cargo project";
+  description = "slot-list — a doubly linked list over a contiguous slot arena";
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
     crane.url = "github:ipetkov/crane";
@@ -63,7 +63,7 @@
                 # MY_CUSTOM_VAR = "some value";
               };
               cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-              my-crate = craneLib.buildPackage (
+              slot-list = craneLib.buildPackage (
                 commonArgs
                 // {
                   inherit cargoArtifacts;
@@ -73,7 +73,7 @@
             {
               checks = {
                 # Build the crate as part of `nix flake check` for convenience
-                inherit my-crate;
+                inherit slot-list;
 
                 # Run clippy (and deny all warnings) on the crate source,
                 # again, reusing the dependency artifacts from above.
@@ -81,7 +81,7 @@
                 # Note that this is done as a separate derivation so that
                 # we can block the CI if there are issues here, but not
                 # prevent downstream consumers from building our crate by itself.
-                my-crate-clippy = craneLib.cargoClippy (
+                slot-list-clippy = craneLib.cargoClippy (
                   commonArgs
                   // {
                     inherit cargoArtifacts;
@@ -89,7 +89,7 @@
                   }
                 );
 
-                # my-crate-doc = craneLib.cargoDoc (
+                # slot-list-doc = craneLib.cargoDoc (
                 #   commonArgs
                 #   // {
                 #     inherit cargoArtifacts;
@@ -100,7 +100,7 @@
                 # );
               };
               packages = {
-                default = my-crate;
+                default = slot-list;
               };
 
               devShells.default = craneLib.devShell {
