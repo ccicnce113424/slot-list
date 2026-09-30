@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `rust-version = "1.88"`: what sets it is edition-2024 let-chains
-      # (`if let Some(x) = .. && cond`), stabilized in 1.88. 1.87 fails on them.
+      # `rust-version = "1.88"` follows from the edition-2024 let-chains
+      # (`if let Some(x) = .. && cond`), stabilized in 1.88; 1.87 rejects them.
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       # The dev-dependencies are compatible with 1.88, so the full suite can run here.

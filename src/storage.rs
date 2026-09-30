@@ -12,9 +12,9 @@ use core::mem::{MaybeUninit, offset_of, size_of};
 /// "There is no neighbor on this side."
 ///
 /// **Scalar-only**: it appears as a function argument (`prev` / `next` of
-/// `List::insert_link`) and as a cursor's phantom-position tag. It **never appears in the
-/// `prev` / `next` arrays** — every value there is a valid slot index (the "dummy" link
-/// fields at either end of a list are "valid indices nobody reads", not NIL). This is the
+/// `List::insert_between`) and as a cursor's phantom-position tag. It **never appears in the
+/// `prev` / `next` arrays**: every value there is a valid slot index. The "dummy" link
+/// fields at either end of a list are valid indices nobody reads, not NIL. That is the
 /// premise that lets [`Storage::append`] add an offset to a whole run of indices.
 pub(crate) const NIL: usize = usize::MAX;
 
@@ -51,38 +51,33 @@ pub trait Ix:
     /// (`usize` below; narrower indices work the same way with a width of `Ix::BITS - 1`).
     ///
     /// Why it exists: a handle ([`Slot`](crate::Slot)) is a raw identifier pointing at a
-    /// slot, and slots are recycled through the free list => "is this slot alive?" must be
-    /// O(1), **otherwise we would have to `assume_init_*` the `MaybeUninit` of a free slot
-    /// (UB)**.
+    /// slot, and slots are recycled through the free list, so "is this slot alive?" must be
+    /// O(1). Otherwise we would have to `assume_init_*` the `MaybeUninit` of a free slot
+    /// (UB).
     ///
     /// Why the top bit of `prev`:
     ///
     /// - **Cheapest to write**: a live slot's `prev` is overwritten by link writes (those
     ///   values never have this bit set), and a free slot only uses `next` in the free
-    ///   chain => this bit is written **only on the transition to free**, so the link-write
-    ///   path carries no extra work (a direct assignment `prev = FREE_BIT` to save a load
-    ///   measured consistently slower on `churn` — see `PERFORMANCE.md` — so the
-    ///   read-modify-write stays);
+    ///   chain, so this bit changes **only on the transition to free** and the link-write
+    ///   path carries no extra work. A direct assignment `prev = FREE_BIT` to save a load
+    ///   measured consistently slower on `churn` (`PERFORMANCE.md`), so the
+    ///   read-modify-write stays.
     /// - **`append`'s wholesale `+= base` carries it along by itself**: `2^63 | v` plus
-    ///   `base` is still `2^63 | (v + base)`; as long as `u64` does not overflow no special
-    ///   case is needed (`v + base < 2^63` and the slot count is far below that => always
-    ///   true in practice, with a `debug_assert` as backstop);
+    ///   `base` is still `2^63 | (v + base)`, so no special case is needed as long as `u64`
+    ///   does not overflow (`v + base < 2^63` and the slot count is far below that, so this
+    ///   holds in practice; a `debug_assert` is the backstop).
     /// - **`prev` is read only on live slots** (a contract, not advice): a free slot's
     ///   `prev` *is* this mark bit (`FREE_BIT | base` after `append`), so masking would add
     ///   an `and` at every read site and lengthen the address dependency chain.
     ///   [`Storage::prev`] therefore **returns the raw value** and pins "the slot must be
     ///   live" with a `debug_assert` in debug builds (zero cost in release).
     ///
-    /// Marking free is written **only on the transition to free**, so its form sits
-    /// directly on `churn`'s hot path. Direct assignment and a single-byte write both
-    /// measured slower than the current `prev |= FREE_BIT` (see `PERFORMANCE.md`); the
-    /// gaps come from whole-function codegen rearrangement, not one instruction.
+    /// Read as a **boolean** (`raw & FREE_BIT != 0`) the mark is cheap: LLVM lowers it to
+    /// `mov %rdi,%rax; shr $63,%rax` (two instructions, no immediate).
     ///
-    /// Used as a **boolean** (`raw & FREE_BIT != 0`) it has no such problem: LLVM lowers it
-    /// to `mov %rdi,%rax; shr $63,%rax` (two instructions, no immediate).
-    ///
-    /// Cost: one read-modify-write per slot that becomes free (once on every reclamation
-    /// path: `pop`/`remove`/`clear`, etc.).
+    /// Cost: one read-modify-write per slot that becomes free, once on every reclamation
+    /// path (`pop`/`remove`/`clear`, etc.).
     const FREE_BIT: Self;
 
     /// Zero (used to test the mark bit without relying on `PartialEq<{integer}>`).
@@ -100,10 +95,10 @@ pub trait Ix:
 
 /// Cold path for hitting the limit.
 ///
-/// **Deliberately** `#[cold] #[inline(never)]` and a message with no format arguments:
-/// `grow` is part of the hot path (`alloc_slot` must inline into it). A `{}` argument
-/// would drag the formatting machinery into `grow`, after which the inliner gives up on
-/// inlining `alloc_slot` — measured ~47% slower `churn` (a `call` appears in the loop).
+/// **Deliberately** `#[cold] #[inline(never)]` with a message that has no format
+/// arguments: `grow` is on the hot path, and `alloc_slot` must inline into it. A `{}`
+/// argument would pull the formatting machinery into `grow`; the inliner then gives up on
+/// `alloc_slot`, and `churn` measured ~47% slower, with a `call` in the loop.
 #[cold]
 #[inline(never)]
 fn ix_overflow() -> ! {
@@ -142,8 +137,8 @@ impl_ix!(u8, u16, u32, u64, usize);
 /// The raw-address layout that [`Iter`](crate::Iter) / [`IterMut`](crate::IterMut) need.
 ///
 /// The three `Storage`s place the same three logical fields in completely different spots,
-/// and the iterators must walk the chain through raw addresses (so `next()` can hand out
-/// `&'a mut T` without fighting its own state). This unifies all three under a single
+/// and the iterators walk the chain through raw addresses, so `next()` can hand out
+/// `&'a mut T` without fighting its own state. `Layout` unifies all three under a single
 /// "**base + stride + offset**" formula (all indices are slot indices):
 ///
 /// ```text
@@ -152,9 +147,9 @@ impl_ix!(u8, u16, u32, u64, usize);
 /// next value of element i   = *(next.cast::<u8>() + i * next_stride)
 /// ```
 ///
-/// Fields (all bases are **byte pointers** `u8`, so each access needs only **one** cast:
-/// `u8` -> target type. Marking a base as `*mut MaybeUninit<T>` would instead require a
-/// `cast::<u8>()` for byte arithmetic and a cast back — two):
+/// Fields (all bases are **byte pointers** `u8`, so each access needs only **one** cast,
+/// `u8` -> target type; a base marked `*mut MaybeUninit<T>` would instead need a
+/// `cast::<u8>()` for byte arithmetic and a cast back, i.e. two):
 /// - `data`: the **base** of element 0's `data` slot (a slot may be uninitialized; call
 ///   `assume_init_*` before reading);
 /// - `data_stride`: bytes between the `data` of adjacent elements (= the size of one "element");
@@ -163,8 +158,8 @@ impl_ix!(u8, u16, u32, u64, usize);
 ///   `offset_of!`, so it does not rely on the assumption that `data` sits at the start);
 /// - `prev` / `next`: the base of element 0's link fields (links are **always `usize`** in
 ///   all three layouts, so the type is fixed and only the stride varies);
-/// - `prev_stride` / `next_stride`: bytes between the link fields of adjacent elements —
-///   in PackedLinks the two links are packed into a `Link`, and in Nodes they share a
+/// - `prev_stride` / `next_stride`: bytes between the link fields of adjacent elements.
+///   In PackedLinks the two links are packed into a `Link`, and in Nodes they share a
 ///   `Node<T>` with `data`, so the stride here is the "element" size rather than 8.
 ///
 /// How each layout maps onto these fields (`T = usize`, index `u32`; parenthesized values
@@ -187,15 +182,15 @@ impl_ix!(u8, u16, u32, u64, usize);
 ///
 /// "Two index domains": the `data` domain follows `Layout`'s stride (width set by the
 /// layout), while the **link domain is always `Ix` width** (8 bytes by default, see
-/// [`DefaultIx`]) — [`IterMut`](crate::IterMut) uses `ix_width` to decide how to read.
+/// [`DefaultIx`]); [`IterMut`](crate::IterMut) uses `ix_width` to decide how to read.
 ///
 /// Computing addresses this way rests on three invariants: (1) the pointers come from the
 /// container's own `Vec`, and `Layout` is only used during the exclusive period when an
 /// iterator holds `&'a mut List` (no realloc / relocation in between); (2) indices stay
 /// within allocated slots; (3) every `prev`/`next` in the arrays is a **valid index** (the
 /// two ends are "self-referential dummy" links, see the crate docs), so they can be read
-/// unconditionally and `+= base` applied unconditionally — which is exactly the premise for
-/// [`Storage::append`]'s wholesale relocation.
+/// unconditionally and `+= base` applied unconditionally. That last invariant is exactly
+/// the premise for [`Storage::append`]'s wholesale relocation.
 #[doc(hidden)]
 pub struct Layout {
     pub(crate) data: *mut u8,
@@ -257,31 +252,28 @@ pub trait Storage<T>: sealed::Sealed {
     /// followed by an in-place read-modify-write pass (~0.7 ms/24 MB), and even faster than
     /// a plain three-array memcpy, because it saves a 16 MB read + 16 MB write.
     ///
-    /// The measured cost is dominated by allocator behavior, not the copy: with mimalloc (the
-    /// crate's benchmark default) a 1M ⊕ 1M append of 24 MB of payload runs in ~3.8-4.3 ms
-    /// with zero page faults, whereas the system malloc pays 4095-8187 page faults and
-    /// 7.9-16 ms. A control experiment that `mmap`s 24 MB and writes one byte per page with
-    /// no copying at all takes 8.2 ms / 5860 pages under both allocators, so this path is
-    /// billed **per page**: faulting, not copying, is the dominant cost (glibc switches to
-    /// mmap/munmap above 128 KB; mimalloc reuses segments and purges lazily), which also
-    /// explains how one and the same append can drift from 2 ms to 16 ms — compare page-fault
-    /// counts alongside timings. Only touching the target memory beforehand avoids it — fill
-    /// the elements into existing free slots, i.e. [`crate::List::append_elementwise`]
-    /// (measured ~1.8 ms). `madvise(MADV_HUGEPAGE)` would in theory erase the cost (5860 pages
-    /// -> 239 in the best case), but this machine runs THP in `madvise` mode with
-    /// `nr_hugepages=0`, so the re-measurement is unstable and it is not something to count on.
+    /// The allocator and the kernel dominate the cost here. With mimalloc (the crate's
+    /// benchmark default) a 1M ⊕ 1M append of 24 MB of payload runs in ~3.8-4.3 ms with
+    /// zero page faults, whereas the system malloc pays 4095-8187 page faults and 7.9-16 ms:
+    /// this path is billed **per page**, so one and the same append can drift from 2 ms to
+    /// 16 ms and page-fault counts must be read alongside the timings. The only way to touch
+    /// the target memory beforehand is to fill the elements into existing free slots, i.e.
+    /// [`crate::List::append_elementwise`] (measured ~1.8 ms).
     ///
     /// Three negative results (all measured; do not retry):
     ///
-    /// - `map(|i| i + base)` matches `extend_from_slice` => the index rewrite has no room for
-    ///   improvement;
-    /// - a `u32` index cuts this path by ~32% (3.67 → 2.48 ms for a 1M ⊕ 1M `SplitList` append
-    ///   in the benchmarks' `index_width` group) — fewer bytes per slot is real here;
-    /// - **`reserve` before append has no measurable benefit** — std's `Vec::append`/`extend`
-    ///   already reserves then copies, and spelling it out (3 runs per allocator) gives
-    ///   identical time and fault counts; conversely `reserve_exact` shaves off the
-    ///   amortization headroom and makes the immediate next `push` pay a full relocation again
-    ///   (measured 3.9->7.5 ms, 15.5->34.0 ms, i.e. **doubled**).
+    /// - `map(|i| i + base)` matches `extend_from_slice`, so the index rewrite has no room
+    ///   for improvement;
+    /// - a `u32` index cuts this path by ~32% (3.67 → 2.48 ms for a 1M ⊕ 1M `SplitList`
+    ///   append in the benchmarks' `index_width` group), so fewer bytes per slot is real
+    ///   here;
+    /// - **`reserve` before append has no measurable benefit**: std's `Vec::append`/`extend`
+    ///   already reserves then copies, and spelling it out gives identical time and fault
+    ///   counts. `reserve_exact` is worse: it shaves off the amortization headroom and makes
+    ///   the immediate next `push` pay a full relocation again (measured 3.9->7.5 ms,
+    ///   15.5->34.0 ms, i.e. **doubled**).
+    ///
+    /// Full numbers: `PERFORMANCE.md` §3.6 and §4 rows 5, 6 and 8.
     fn append(&mut self, other: &mut Self);
 
     /// The slot's element storage, as `MaybeUninit`: a slot may be uninitialized,
@@ -297,8 +289,8 @@ pub trait Storage<T>: sealed::Sealed {
     /// marking is idempotent.
     ///
     /// The implementation sets the top bit ([`Ix::FREE_BIT`]) of `prev` in place and does
-    /// nothing beyond that read-modify-write — `append`'s wholesale `+= base` turns it into
-    /// `FREE_BIT | base`, and the mark bit remains.
+    /// nothing beyond that read-modify-write; `append`'s wholesale `+= base` turns it into
+    /// `FREE_BIT | base` with the mark bit intact.
     fn mark_free(&mut self, slot: usize);
 
     /// Predecessor index of the slot.
@@ -326,8 +318,8 @@ pub trait Storage<T>: sealed::Sealed {
 /// Default index width: **`usize`**.
 ///
 /// The `u32-index` feature switches it to `u32` (one third fewer bytes per slot, ~32% faster
-/// `append`, limit see [`Ix::MAX_SLOTS`]) — a switch for "run the full test suite /
-/// benchmarks under a narrow index", **off by default**.
+/// `append`, limit see [`Ix::MAX_SLOTS`]). That switch exists to "run the full test suite /
+/// benchmarks under a narrow index", and is **off by default**.
 #[cfg(feature = "u32-index")]
 pub type DefaultIx = u32;
 /// [`DefaultIx`] without the `u32-index` feature (the default configuration).
@@ -341,7 +333,7 @@ pub type DefaultIx = usize;
 /// **Three completely separate streams**: one `Vec` each for `data` / `prev` / `next`.
 ///
 /// Walking the chain touches only the index arrays (8 B per link with the default `usize`
-/// index, 4 B with `u32`) — the most bandwidth-efficient option; the cost is three base
+/// index, 4 B with `u32`), the most bandwidth-efficient option. The cost is three base
 /// addresses per slot, so an element and its links never share a cache line.
 ///
 /// The index width is adjustable (`prev`/`next` narrow together): `Split<T, u16>` /
@@ -468,7 +460,7 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
         // The two index arrays are copied and incrementally offset: written once.
         // The addition happens **in the narrow integer domain**, not through `from_usize`:
         // a free slot's `prev` still carries the free mark (`FREE_BIT | v`), and adding the
-        // base yields `FREE_BIT | (v + base)` — which is exactly why `prev` needs no
+        // base yields `FREE_BIT | (v + base)`, which is exactly why `prev` needs no
         // separate mark-bit fixup (see the `FREE_BIT` docs).
         self.prev.extend(other.prev.iter().map(|&ix| ix + base));
         self.next.extend(other.next.iter().map(|&ix| ix + base));
@@ -541,7 +533,7 @@ impl<T, I: Ix> Storage<T> for Split<T, I> {
 /// The two links of one slot in the `PackedLinks` layout.
 ///
 /// Public because the **raw-parts API** (`PackedLinks::as_parts` / `from_parts`) hands it
-/// out — serializing a chain yourself or restoring it from shared memory requires reading
+/// out: serializing a chain yourself or restoring it from shared memory requires reading
 /// and writing this type.
 #[derive(Clone, Copy, Debug)]
 pub struct Link<I> {

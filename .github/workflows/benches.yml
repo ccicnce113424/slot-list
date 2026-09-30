@@ -25,7 +25,7 @@ env:
 
 jobs:
   x86_64:
-    name: build benches, run the clear probe (x86_64)
+    name: benches, clear probe, full suite on dispatch (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,11 +38,15 @@ jobs:
       # The `clear` density curve / break-even check behind PERFORMANCE.md §5.
       - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
 
-      # Numbers from a shared CI runner are only indicative: the machines are noisy
-      # and the allocator-sensitive groups swing by several-fold. Full run on demand.
+      # Same-machine A/B is the method behind PERFORMANCE.md; a shared runner is a
+      # different machine class, so read ratios inside one run and never compare
+      # absolute values across runs. Measured over two x86 runner instances: the
+      # code-bound groups agree within ~0.5%, the allocator-bound groups swing 8-40%.
       # `repeat > 1` measures the same commit N times in N processes and keeps one
-      # criterion baseline per pass, i.e. the run-to-run spread on one instance; the
-      # spread between two dispatches additionally includes the instance draw.
+      # criterion baseline per pass, which is the run-to-run spread on one instance.
+      # The spread between two dispatches adds the instance draw on top.
+      # criterion matches the whole benchmark id, so a filter also selects longer ids
+      # that contain it: 'churn|clear_drop' also picks up `index_width/churn_u32`.
       - if: github.event_name == 'workflow_dispatch'
         env:
           FILTER: ${{ inputs.filter }}
@@ -69,12 +73,15 @@ jobs:
           retention-days: 14
 
   arm64:
-    name: build benches, targeted run (arm64)
+    name: benches, targeted run (arm64)
     # GitHub-hosted arm64 Linux runners are free for public repositories; a private
     # repository needs a plan that includes them (otherwise drop this job).
-    # Purpose: the free-marking path (read-modify-write vs a byte-wide store,
-    # PERFORMANCE.md §4 row 10 and the `FREE_BIT` docs) is the part that is expected
-    # to differ per ISA, so this runner exists to re-measure `churn` on AArch64.
+    # Purpose: the free-marking path is the part most likely to differ per ISA, but this
+    # job builds the shipped read-modify-write implementation, so it cannot compare that
+    # against a byte-wide store. PERFORMANCE.md §4 row 10 asks for that comparison and it
+    # needs a second build. What this job does show is how the current code behaves on
+    # AArch64 and whether the layout and ratio conclusions survive. This runner varies
+    # 1-19% between instances even on `churn`, so it only supports large effects.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -84,8 +91,9 @@ jobs:
       - run: cargo bench --no-run --features mimalloc,linked-list-cursors
       - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
 
-      # `churn` is the pure-code, allocation-free group that the free-marking write
-      # shows up in; `clear_drop` covers the reclaim paths.
+      # `churn` is the pure-code group where the free-marking write shows up, and
+      # `clear_drop` covers the reclaim paths. The filter matches whole benchmark ids, so
+      # this also selects `index_width/churn_u32` and `index_width/churn_usize`.
       - if: github.event_name == 'workflow_dispatch'
         env:
           FILTER: ${{ inputs.filter || 'churn|clear_drop' }}

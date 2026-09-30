@@ -365,8 +365,8 @@ impl<'a, T, S: Storage<T>> CursorMut<'a, T, S> {
     /// Mirrors `CursorMut::split_before`: detaches the part **before** the current element
     /// into a new list; the cursor stays on the head of the remainder (the original current element becomes the head). Ghost position (the back) ⇒ the whole list is detached.
     ///
-    /// **Different complexity**: std is `O(1)` (pointer split), ours is `O(pos)` — slots live in one contiguous storage, so detaching half requires moving
-    /// elements; **moved elements get slots in the new list and old handles are invalidated**.
+    /// **Different complexity**: std is `O(1)` (pointer split), ours is `O(pos)`; slots live in one contiguous storage, so detaching half requires moving
+    /// elements. **Moved elements get slots in the new list and old handles are invalidated**.
     pub fn split_before(&mut self) -> List<T, S>
     where
         S: Default,

@@ -27,7 +27,7 @@ use crate::storage::{NIL, Nodes, PackedLinks, Split, Storage};
 /// **All four endpoint fields reset to `NIL` when their chain is empty**: `head` / `tail`
 /// when `len == 0`, `free_head` / `free_tail` when the free chain empties. So "is it empty?"
 /// is one field load plus a comparison, instead of `storage.slots() - len` (two loads plus a
-/// subtraction) — the latter runs on every free/alloc and is measurably slower on the `churn`
+/// subtraction). The latter runs on every free/alloc and is measurably slower on the `churn`
 /// benchmark. The reset itself is cheap: it writes two fields only on the transition to empty.
 ///
 /// # Shape of the chains
@@ -48,7 +48,7 @@ pub struct List<T, S: Storage<T>> {
     pub(crate) len: usize,
     pub(crate) storage: S,
     /// Exists only to "use" `T`: `List` is defined for **any** `S: Storage<T>`, and `T`
-    /// appears only in that bound — Rust **does not count occurrences in where-clauses as a
+    /// appears only in that bound, and Rust **does not count occurrences in where-clauses as a
     /// use**, so removing this field gives `error[E0392]: type parameter `T` is never used`.
     /// (Concrete aliases like `SplitList<T> = List<T, Split<T>>` are unaffected, since there `T`
     /// reaches a field type through `Split<T>`; what is affected is the generic definition itself.)
@@ -152,7 +152,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// (`Vec::shrink_to_fit`).
     ///
     /// **Not** the semantics of `Vec::shrink_to_fit`: that shrinks to `len()`, while here the
-    /// **slot count is unchanged** — free slots are part of the free chain and are what
+    /// **slot count is unchanged**: free slots are part of the free chain and are what
     /// [`Slot`](crate::Slot) handles point at; discarding them would invalidate handles and
     /// break the chains. So this only returns capacity that was allocated but never used.
     pub fn shrink_to_fit(&mut self) {
@@ -669,7 +669,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// Mirrors `LinkedList::retain`. O(N).
     ///
     /// The loop terminates by **fixed count** (capture `len` before the loop and decrement), not
-    /// by testing `len > 0` + `index == tail` each round — the latter costs an extra comparison
+    /// by testing `len > 0` + `index == tail` each round, which costs an extra comparison
     /// per round and is measurably slower at 1M elements. The dummy links at the chain ends are
     /// not NIL, so traversal must be count-driven.
     #[inline]
@@ -697,7 +697,7 @@ impl<T, S: Storage<T>> List<T, S> {
         }
     }
 
-    /// Mirrors `LinkedList::append`: move **all slots** of `other` to the end in one block — the
+    /// Mirrors `LinkedList::append`: move **all slots** of `other` to the end in one block. The
     /// slot indices are shifted in bulk as the block moves (indices written once), and each chain
     /// is spliced once. Complexity O(total slots in `other`), independent of the number of live
     /// elements there.
@@ -859,33 +859,25 @@ impl<T, S: Storage<T>> List<T, S> {
     /// until NIL" does not work).
     ///
     /// Why not "`pop_front` until empty": `pop_front` routes every element through
-    /// `unlink_slot` / `free_slot` — read `prev`, patch the neighbors, check
-    /// endpoints — and `assume_init_read()` **moves `T` out of the slot** before dropping it;
-    /// `clear` only reads `next`, drops **in place**, and resets the endpoints once.
+    /// `unlink_slot` / `free_slot` (read `prev`, patch the neighbors, check endpoints), and
+    /// `assume_init_read()` **moves `T` out of the slot** before dropping it; `clear` only reads
+    /// `next`, drops **in place**, and resets the endpoints once.
     ///
     /// # Hybrid: density ≥ 0.5 scans slots sequentially, otherwise walks the chain
     ///
-    /// The two paths have completely different cost models: **walking the live chain is O(live)
-    /// random slot accesses** (each a dependent load plus a random read-modify-write), while
-    /// **scanning is O(slots) sequential accesses** (streaming over just the few mark bytes). The
-    /// break-even density moves with **index width** and **layout**: a full table favors scanning
-    /// by 1.5–2.2× with the default `usize` index (up to ~3× with a `u32` index), while a sparse
-    /// table favors the walk by orders of magnitude (at density 0.001 the walk is ~200–400×
-    /// faster). The threshold is therefore **0.5**: scan when `2 * len >= slots`. Across the six
-    /// layout/index combinations this keeps the result between 0.99× and 1.81× (worst case a tie,
-    /// no combination measurably slower).
-    ///
-    /// Data comes from `probe_clear_vs_scan` in `src/tests.rs`:
-    /// `cargo test --release -- --ignored --nocapture probe_clear_vs_scan`.
-    ///
-    /// **Reading note**: the scan branch is purely bandwidth-bound and can swing 3~4× with other
-    /// load on the machine, whereas the walk is latency-bound and stable ⇒ the ratio must be
-    /// taken **within a single run** (and ideally on an idle machine). `probe_clear_vs_scan`
-    /// already produces both columns in the same run, so do not divide numbers from different
-    /// moments.
+    /// **Walking the live chain is O(live) random slot accesses** (each a dependent load plus a
+    /// random read-modify-write), while **scanning is O(slots) sequential accesses** (streaming
+    /// over just the few mark bytes). The break-even density moves with **index width** and
+    /// **layout**: a full table favors scanning by 1.5-2.2× with the default `usize` index (up to
+    /// ~3× with a `u32` index), and a sparse table favors the walk by orders of magnitude (at
+    /// density 0.001 the walk is ~200-400× faster). The threshold is therefore **0.5**: scan when
+    /// `2 * len >= slots`. Across the six layout/index combinations this keeps the result between
+    /// 0.99× and 1.81×: worst case a tie, no combination measurably slower. The numbers and the
+    /// density curve are in `PERFORMANCE.md` §4 row 9 and §5; reproduce with
+    /// `probe_clear_vs_scan` in `src/tests.rs`.
     ///
     /// Known boundary cost: a full-table scan with Drop glue merely ties, because the drops
-    /// themselves consume the bandwidth; deliberately not testing `needs_drop` separately keeps
+    /// themselves consume the bandwidth. Deliberately not testing `needs_drop` separately keeps
     /// the decision to a single predicate (measured worst case ~5%, within noise).
     ///
     /// Complexity: the scan is O(slots) but is only chosen when `len >= slots/2`, so the worst
@@ -978,7 +970,7 @@ impl<T, S: Storage<T>> RawList<T, S> {
         &self.inner.storage
     }
 
-    /// The slot array (writable) — use it to modify in place (e.g. compact before serializing).
+    /// The slot array (writable). Use it to modify in place (e.g. compact before serializing).
     ///
     /// **Breaking an invariant means UB when the `RawList` is later put back into a `List`**
     /// (links must be valid indices, free slots must carry the mark bit).

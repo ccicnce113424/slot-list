@@ -5,21 +5,21 @@
 [![MSRV](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml)
 
 A doubly linked list whose nodes all live in a single, preallocated, contiguous
-slot array. The **slot index is the element's identity**: it stays stable for as
+slot array. The slot index is the element's identity: it stays stable for as
 long as the element is alive, and freed slots are recycled through a LIFO free
 list. That is where the name comes from.
 
 - **No per-node allocation.** Growth is one `realloc` of the slot array; a warmed
   list performs zero allocations while pushing/popping.
 - **Stable, `O(1)` handles.** `Slot` is a bare index you can store in a map or an
-  adjacency list and use later to enter a cursor, remove, or move an element —
-  no chain walk.
+  adjacency list and use later to enter a cursor, remove, or move an element,
+  with no chain walk.
 - **Element-level cursors** with the usual `std::collections::LinkedList`
   semantics (ghost positions, wrap-around movement, `insert_before`/`insert_after`).
 - **Three memory layouts** behind one implementation: `Split`, `PackedLinks`, `Nodes`.
 - **`no_std` + `alloc`, zero dependencies.**
 - **Relocatable state.** The whole list is a slot array plus five integers, with
-  no pointers — it can be serialized or placed in shared memory as-is.
+  no pointers, so it can be serialized or placed in shared memory as-is.
 
 The public API mirrors `std::collections::LinkedList` (`push_*`/`pop_*`,
 `front`/`back`, cursors, iterators, `retain`, `append`, `split_off`, `Clone`,
@@ -64,8 +64,8 @@ All three layouts share one implementation; only where the fields sit differs.
 
 The second type parameter is the link index width (`u8`/`u16`/`u32`/`u64`/`usize`);
 `u32` halves each link (8 B → 4 B) at the cost of a 2^31-1 slot ceiling; for an 8-byte element
-that takes a slot from 24 B (8 B payload + 16 B links) to 16 B. All three layouts total the same
-bytes per slot; only the field arrangement differs.
+that takes a slot from 24 B (8 B payload + 16 B links) to 16 B. All three layouts use the same
+bytes per slot.
 
 ## `no_std`
 
@@ -80,11 +80,11 @@ The library itself needs only `core` and `alloc`.
 
 Measured results, mechanism explanations, the `append` v. `append_elementwise`
 decision matrix, and the optimizations that were tried and rejected all live in
-[`PERFORMANCE.md`](PERFORMANCE.md). Headline numbers (1M elements, `usize` index
-— see the document for the reading discipline):
+[`PERFORMANCE.md`](PERFORMANCE.md). Headline numbers (1M elements, `usize` index;
+see the document for the reading discipline):
 
 - steady-state `churn` is ~2.0x faster than `LinkedList`, and iteration is on par
-  with it while being 1.57x faster at a 64-byte payload;
+  with it, 1.57x faster at a 64-byte payload;
 - a handle-based lookup is ~39000x faster than a position-based one on the same
   workload, because it skips the chain walk entirely.
 

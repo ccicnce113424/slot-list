@@ -416,7 +416,6 @@ fn check_bulk<S: Storage<i32> + Default>() {
 // Invariants
 // ============================================================
 
-/// Check every invariant listed in the `List` docs (read-only, no state changes).
 /// Whether a slot is on the free chain (test helper). Walk by **count** (the free
 /// chain's tail is a self-loop and `NIL` never enters the array, so we cannot "walk until NIL").
 fn free_set<S: Storage<T>, T>(list: &List<T, S>) -> Vec<bool> {
@@ -433,13 +432,14 @@ fn free_set<S: Storage<T>, T>(list: &List<T, S>) -> Vec<bool> {
     on_free
 }
 
+/// Check every invariant listed in the `List` docs (read-only, no state changes).
 fn assert_invariants<T, S: Storage<T>>(list: &List<T, S>) {
     let slots = list.storage.slots();
     let len = list.len();
 
     // 1) Every value in `next` is a valid index (**no sentinel values**: this is
     //    what lets `append` shift a whole block of indices by `+= base`); `prev`
-    //    must be valid only for **live** slots — a free slot's `prev` is stale (its only use is the free bit) and never participates in arithmetic.
+    //    must be valid only for **live** slots: a free slot's `prev` is stale (its only use is the free bit) and never participates in arithmetic.
     for i in 0..slots {
         assert!(
             list.storage.next(i) < slots,
@@ -1423,6 +1423,8 @@ impl Drop for PanicOnDrop {
     }
 }
 
+/// Semantics of a panic mid-`Drop`: the remaining elements leak but are never dropped twice
+/// (per `Vec::clear`'s convention).
 fn check_drop_panic<S: Storage<PanicOnDrop> + Default>() {
     let count = Rc::new(Cell::new(0));
     let mut list: List<PanicOnDrop, S> = List::default();
@@ -1442,9 +1444,8 @@ fn check_drop_panic<S: Storage<PanicOnDrop> + Default>() {
     assert_eq!(count.get(), before + 1);
 }
 
-/// Semantics of a panic mid-`Drop`: the remaining elements leak but are never dropped twice (per `Vec::clear`'s convention).
 /// Index width is configurable: the same invariant checks run for every width. `IterMut`'s raw-address link reads dispatch by width, and
-/// the 4-byte path is only reached with narrow indices — leaving it untested would be an uncovered UB surface.
+/// the 4-byte path is only reached with narrow indices; leaving it untested would leave an uncovered UB surface.
 fn check_index_width<S: Storage<i32> + Default>(count: usize) {
     let mut list: List<i32, S> = List::with_capacity(4);
 
@@ -1637,7 +1638,7 @@ fn check_raw_roundtrip<S: Storage<i32> + Default>() {
 }
 
 /// `into_raw` frees the array only, **without dropping `T`** (`Vec::into_raw_parts` semantics).
-// `into_raw` is defined to **not drop** elements (`Vec::into_raw_parts` semantics), and this test asserts exactly that ⇒ miri's leak check will necessarily fire, as expected.
+// Miri's leak check will necessarily fire here, as expected.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn into_raw_does_not_drop_elements() {
@@ -1995,7 +1996,7 @@ fn churn_does_not_allocate() {
 
     assert!(allocs > 0, "the allocation counter is not working");
 
-    // Control 2: `fast-list` (slotmap-indexed) likewise reaches zero allocation by reusing free slots —
+    // Control 2: `fast-list` (slotmap-indexed) likewise reaches zero allocation by reusing free slots;
     // this is the evidence for the "zero allocation" cell of the PERFORMANCE.md §9 feature comparison table.
     let mut fast: fast_list::LinkedList<usize> = fast_list::LinkedList::new();
 
@@ -2165,7 +2166,7 @@ fn check_slot_as_key<S: Storage<i32> + Default>() {
     let mut keys: Vec<Slot> = list.iter_slots().map(|(slot, _)| slot).collect();
     let mut map: HashMap<Slot, i32> = list.iter_slots().map(|(slot, &v)| (slot, v)).collect();
 
-    // Change the value, move the position, and remove in O(1) via the handle — no "which index" anywhere
+    // Change the value, move the position, and remove in O(1) via the handle, with no index lookup anywhere
     for (i, &slot) in keys.iter().enumerate() {
         map.insert(slot, 100 + i as i32);
         assert_eq!(list.move_to_front(slot), Some(()));
@@ -2287,7 +2288,7 @@ mod probe_clear_vs_scan {
 
     /// Chain-walking clear: the equivalent of the `2 * len < slots` branch of the hybrid implementation (touches only live slots).
     ///
-    /// The probe **cannot** use `clear()` to represent chain walking — it is now hybrid and scans when dense.
+    /// The probe **cannot** use `clear()` to represent chain walking: it is now hybrid and scans when dense.
     fn p_walk_clear<T, S: Storage<T>>(list: &mut List<T, S>) {
         while list.len > 0 {
             let slot = list.head;

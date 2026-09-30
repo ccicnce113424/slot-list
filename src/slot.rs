@@ -3,12 +3,12 @@
 /// Slot handle: an identity that is **stable while the element lives**, and can be
 /// stored in other containers (hash maps, adjacency lists, undo stacks, ...).
 ///
-/// It points at a **physical slot** (`slot`), not a **logical position** (`pos`) — the
+/// It points at a **physical slot** (`slot`), not a **logical position** (`pos`); the
 /// two have no conversion formula; see the "two positions" section of the crate docs.
 /// Getting a handle: [`Cursor::slot`](crate::Cursor::slot) /
 /// [`CursorMut::slot`](crate::CursorMut::slot) / [`List::front_slot`](crate::List::front_slot).
 /// Using a handle: [`List::cursor_at`](crate::List::cursor_at) / [`List::remove_slot`](crate::List::remove_slot)
-/// / [`List::move_to_front`](crate::List::move_to_front) — all `O(1)`.
+/// / [`List::move_to_front`](crate::List::move_to_front); all `O(1)`.
 ///
 /// Lifetime: `remove` / `pop_*` / `clear` push the slot back onto the free-list, after
 /// which the old `Slot` is **no longer valid** (`cursor_at` / `remove_slot` return

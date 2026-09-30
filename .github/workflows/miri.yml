@@ -23,8 +23,8 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      # The core is unchecked reads/writes plus a raw-address iterator; Miri is what
-      # proves the provenance and aliasing are sound (strict provenance is the
+      # The core reads and writes through raw addresses without bounds checks, so Miri is
+      # the check that the provenance and aliasing are sound (strict provenance is the
       # default in current Miri).
       - run: cargo miri test
       - run: cargo miri test --features u32-index

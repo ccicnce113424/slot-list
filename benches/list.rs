@@ -8,11 +8,11 @@
 //!
 //! Run: `cargo bench [-- <filter regex>]`
 //!
-//! **Compiles on stable**: only the three rows comparing std `LinkedList` **cursors**
+//! Compiles on stable: only the three rows that compare std `LinkedList` cursors
 //! (`middle_insert_remove` / `random_remove_insert` / `cursor_update` for `LinkedList`) need
-//! `#![feature(linked_list_cursors)]`, and they are gated behind the `linked-list-cursors`
-//! feature — **which is not in `default`** — so `cargo bench` works as-is on stable, while
-//! nightly users who want those three rows opt in explicitly:
+//! `#![feature(linked_list_cursors)]`, and they sit behind the `linked-list-cursors` feature,
+//! which is not in `default`. So `cargo bench` works as-is on stable, and nightly users opt in
+//! to those three rows explicitly:
 //!
 //! ```text
 //! cargo bench                                                    # runs on any channel
@@ -24,28 +24,46 @@
 //! explicit, costs downstream nothing, and matches what `mimalloc` does.
 //! Report: `target/criterion/report/index.html`
 //!
-//! # Reading discipline (read this first)
+//! # Which group measures what
 //!
-//! - **Noise floor ±5%**; the big-allocation groups `append*` / `blob_*` **±10 ~ 20%**. The
-//!   same code drifts that much between runs while external baselines may not move at all ⇒
-//!   to judge a regression, run the two versions **alternating** (A/B/A/B) and watch how far
-//!   the baselines drift too.
-//! - `end_ops` / `churn` / `append*` measure the **allocator and kernel**, not our code:
-//!   identical `append` code can drift from 2 ms to 16 ms (timed-region page faults 0 →
-//!   8187). Compare by **page-fault count**.
-//! - Huge pages only via environment variables (THP is in `madvise` mode here with
-//!   `nr_hugepages=0`, and the in-crate `madvise` is hit-or-miss):
-//!   `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, or mimalloc's page reuse /
-//!   `MIMALLOC_PURGE_DELAY=-1`.
+//! | Group | What the timed region actually does |
+//! |---|---|
+//! | `churn`, `iteration`, `middle_access`, `middle_insert_remove`, `cursor_update`, `slot_entry`, `random_remove_insert`, `blob_iter` | our code. The list is built in setup and a removal recycles a free slot, so nothing enters the allocator and the numbers repeat |
+//! | `end_ops_*`, `append`, `append_blob` | allocator and page faults. The timed region grows a fresh table or `Vec`, and the same code drifts from 2 ms to 16 ms as timed-region page faults go 0 to 8187, so compare by page-fault count |
+//! | `clear_drop/drop_*` | deallocation of the backing vectors. The element-drop loop optimises away for a `usize` element |
+//! | `clear_drop/gluedrop_*`, `gluedense_*` | `Drop` and `clear` with a 64 B element carrying real `Drop` glue, which is the pair that measures that code |
+//! | `clear_drop/dense_*`, `sparse_*`, `refill_*` | `clear` at full and at sparse occupancy, and free-chain reuse |
+//! | the `VecDeque` / `LinkedList` / `FastList` columns | the baseline, which for `churn` and `end_ops` mostly means the allocator |
 //!
-//! # How to read each group, numbers, mechanisms
+//! # Reading discipline
 //!
-//! Everything is in **`PERFORMANCE.md`** at the repo root: the memory/address tables for the
-//! three layouts, the full result set, the byte reconciliation and selection matrix for the
-//! two `append` APIs, the internal probes (`clear` / `Drop` / the three iteration tiers /
-//! bandwidth reconciliation), and the **tried-and-rejected optimizations** (blocked layout,
-//! row-major bitmap, iterator lookahead, u32 index, `reserve`, `madvise` …), each with its
-//! measured numbers and cost.
+//! Two traps first, because each of them yields a wrong number with no warning:
+//!
+//! - **criterion keys results by group and bench name.** A rename (the layouts were `SoaList` /
+//!   `PackedList` / `AosList` before this file used `SplitList` / `PackedLinksList` /
+//!   `NodesList`), or a run with a different feature set, leaves the old leaves on disk, and
+//!   `base` / `change` then compare the fresh run against numbers from another day or another
+//!   allocator. Delete `target/criterion` before a clean comparison, or give each run its own
+//!   `--save-baseline <name>`.
+//! - **`cargo bench` and `cargo bench --features mimalloc` are two different allocators**, and
+//!   their results must not be mixed. Every number in `PERFORMANCE.md` is mimalloc.
+//!
+//! The noise floor, the alternating A/B protocol, the bandwidth-vs-latency rule and the
+//! environment of the numbers in `PERFORMANCE.md` all live in `PERFORMANCE.md` §1.1 and §1.4.
+//! Huge pages only come from environment variables (THP is in `madvise` mode here with
+//! `nr_hugepages=0`, and the in-crate `madvise` is hit-or-miss):
+//! `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, or mimalloc's page reuse / `MIMALLOC_PURGE_DELAY=-1`.
+//! A shared CI runner is a different machine class; `.github/workflows/benches.yml` runs these
+//! benches there and uploads `target/criterion` along with the `machine.txt` that names the CPU.
+//!
+//! # Where the numbers are
+//!
+//! `PERFORMANCE.md` at the repo root holds the memory/address tables for the three layouts, the
+//! full result set, the byte reconciliation and the selection matrix for the two `append` APIs,
+//! the internal probes (`clear` / `Drop` / the three iteration tiers / bandwidth
+//! reconciliation), and the tried-and-rejected optimizations (blocked layout, row-major bitmap,
+//! iterator lookahead, `u32` index, `reserve`, `madvise` among others), each with its measured
+//! numbers and cost.
 
 #![cfg_attr(feature = "linked-list-cursors", feature(linked_list_cursors))]
 
@@ -174,8 +192,8 @@ macro_rules! bench_insert_before_remove {
 }
 
 /// Random position "remove one + insert back in place":
-/// - `by_handle`: `cursor_at(handle)` —— **O(1)** entry;
-/// - `by_pos`   : `at(pos)`          —— O(N) entry that walks the chain.
+/// - `by_handle`: `cursor_at(handle)`, which is O(1);
+/// - `by_pos`: `at(pos)`, which is O(N) and walks the chain.
 ///
 /// Both do **exactly the same work**; only the entry differs.
 macro_rules! bench_slot_vs_pos {
@@ -1538,27 +1556,24 @@ fn blob_end_ops(c: &mut Criterion) {
 // ============================================================
 // clear / Drop probes
 //
-// Two things are measured (both move construction/destruction out of the timed region with
-// `iter_batched`):
+// `iter_batched` keeps construction and destruction out of the timed region, so each row
+// isolates one call:
 //
-// 1. `clear`: walking the free chain vs. scanning `data` in memory order and testing
-//    `is_free`. The two cost models are unrelated — the chain walk is O(live) **random**
-//    slot accesses, the scan is O(slots) **sequential** accesses. Dense rows show the upper
-//    bound, sparse rows the lower bound.
-// 2. `Drop`: destroying the whole list only needs "walk the live chain, drop in place", but
-//    it currently goes through `clear`, which also threads every slot back onto the free
-//    chain — wasted work for a structure about to be discarded.
+// - `dense_*` and `sparse_*`: `clear` at full occupancy and at 0.1%. `clear` is hybrid
+//   (`2 * len >= slots` scans `data` in memory order, otherwise it walks the free chain), so
+//   the dense rows measure the scan and the sparse rows the walk. The two cost models are
+//   unrelated: the walk is O(live) random slot accesses, the scan is O(slots) sequential
+//   accesses.
+// - `refill_*`: pushing N elements back into the list just cleared. The order of the free chain
+//   decides reuse locality, and nothing in the timed region enters the allocator.
+// - `drop_*` and `gluedrop_*`: destroying the list. With a `usize` element the element-drop loop
+//   optimises away, so `drop_*` only deallocates the backing vectors; `gluedrop_*` uses a 64 B
+//   element with real `Drop` glue and is the row to read for `Drop` code.
+// - `gluedense_*`: `clear` with that same 64 B element.
 //
-// Conclusion (1M slots, `u32` index): `clear` keeps the chain walk. The scan variant only
-// wins with no Drop glue and over ~7/8 full (7x faster on a full table), crossing over at
-// `live/slots ≈ 0.10`; `Drop` that walks the live chain and drops in place wins across the
-// board. The scan variant cannot run in this file (it needs private `List` fields); its
-// numbers and density curve come from `src/tests.rs::probe_clear_vs_scan`. Details in
-// PERFORMANCE.md §4/§5.
-//
-// Note: `clear` is now **hybrid** (`2 * len >= slots` scans, otherwise walks the chain) ⇒
-// the `dense/*` rows measure the scan and the `sparse/*` rows the chain walk; see
-// `src/tests.rs::probe_clear_vs_scan` for the numbers of each.
+// Numbers, the density curve and the conclusions are in PERFORMANCE.md §4/§5 and in
+// `src/tests.rs::probe_clear_vs_scan`. The scan arm needs private `List` fields, so it cannot
+// run from this file.
 // ============================================================
 macro_rules! bench_clear_drop {
     ($ty:ty, $maker:ident, $dense:ident, $sparse:ident, $refill:ident, $dropper:ident) => {
