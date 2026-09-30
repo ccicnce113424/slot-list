@@ -78,8 +78,8 @@ The library itself needs only `core` and `alloc`.
 
 ## Performance
 
-Measured results, mechanism explanations, the `append` v. `append_elementwise`
-decision matrix, and the optimizations that were tried and rejected all live in
+Measured results, the `append` v. `append_elementwise` decision matrix and the
+comparisons against `std`'s containers and `fast-list` live in
 [`PERFORMANCE.md`](PERFORMANCE.md). Headline numbers (1M elements, `usize` index;
 see the document for the reading discipline):
 

@@ -1571,7 +1571,7 @@ fn blob_end_ops(c: &mut Criterion) {
 //   element with real `Drop` glue and is the row to read for `Drop` code.
 // - `gluedense_*`: `clear` with that same 64 B element.
 //
-// Numbers, the density curve and the conclusions are in PERFORMANCE.md §4/§5 and in
+// Numbers and the density curve are in the commit messages and in
 // `src/tests.rs::probe_clear_vs_scan`. The scan arm needs private `List` fields, so it cannot
 // run from this file.
 // ============================================================

@@ -19,7 +19,7 @@
 //! | Stability | changes on every insert/remove | **constant while the element lives** (usable as a handle) |
 //! | How to get it | walk the chain from an endpoint; `Cursor::index()` | **handle**: `Cursor::slot` / `CursorMut::slot` /
 //!   `List::front_slot` / `back_slot` / `iter_slots` (all `O(1)`); the type is [`Slot`] (a raw index,
-//!   8 B, **no generation tag** ⇒ a stale handle is undetectable; for the trade-off vs `fast-list` see `PERFORMANCE.md` §9) |
+//!   8 B, **no generation tag** ⇒ a stale handle is undetectable; for the trade-off vs `fast-list` see `PERFORMANCE.md` §7) |
 //! | Conversion | `slot_at(pos)`: walk the chain, `O(min(pos, len-1-pos))` | `pos_of(slot)`: walk the chain, `O(len)` |
 //!
 //! Any "position" in the public API means the logical position: [`List::at`] /
@@ -33,7 +33,7 @@
 //! handle stays valid while the element lives and that inserts/removes do not move
 //! other elements. After an element is removed its slot is reused, so an old handle
 //! does not become invalid: it may point at the new element (classic ABA; for the
-//! same-machine comparison and trade-offs see `PERFORMANCE.md` §9). The indices in
+//! same-machine comparison and trade-offs see `PERFORMANCE.md` §7). The indices in
 //! `head` / `tail` / `free_head` / `free_tail` and `storage` remain private.
 //!
 //! The three memory layouts share one implementation; the only difference is
@@ -150,10 +150,13 @@
 //!
 //! # Performance
 //!
-//! Numbers, mechanism explanations, the choice matrix for `append`'s two APIs, and the
-//! optimizations already tried and rejected are all in `PERFORMANCE.md` at the
-//! repository root; the benchmarks themselves are in `benches/list.rs`, whose header
-//! spells out the reading discipline (noise floor, page-fault counting, alternating A/B).
+//! Numbers, the choice matrix for `append`'s two APIs, and the comparisons against
+//! `std`'s containers and `fast-list` are in `PERFORMANCE.md` at the repository root; the
+//! benchmarks themselves are in `benches/list.rs`, whose header spells out the reading
+//! discipline (one run at a time, alternating A/B). Variants that were measured and
+//! rejected are not kept as documentation: the reason a piece of state is the way it is
+//! sits next to it in the source, and the measurements that picked it are in the commit
+//! messages.
 //!
 //! # Intentionally not implemented
 //!

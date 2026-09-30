@@ -811,7 +811,7 @@ impl<T, S: Storage<T>> List<T, S> {
     /// Extract the **relocatable state** of the whole chain (dropping no element).
     ///
     /// This is the public entry point for the "relocatable, pointer-free state" promise of
-    /// `PERFORMANCE.md` §8: the state is the slot array ([`Split::into_parts`](crate::Split::into_parts)
+    /// `PERFORMANCE.md` §6: the state is the slot array ([`Split::into_parts`](crate::Split::into_parts)
     /// and friends) plus five numbers ([`RawList`]'s accessors), with **no pointers at all**, so it
     /// can be serialized / placed in shared memory / `mmap`ped with **no pointer fixup**.
     ///
@@ -872,8 +872,8 @@ impl<T, S: Storage<T>> List<T, S> {
     /// ~3× with a `u32` index), and a sparse table favors the walk by orders of magnitude (at
     /// density 0.001 the walk is ~200-400× faster). The threshold is therefore **0.5**: scan when
     /// `2 * len >= slots`. Across the six layout/index combinations this keeps the result between
-    /// 0.99× and 1.81×: worst case a tie, no combination measurably slower. The numbers and the
-    /// density curve are in `PERFORMANCE.md` §4 row 9 and §5; reproduce with
+    /// 0.99× and 1.81×: worst case a tie, no combination measurably slower. The measurements
+    /// behind the threshold are in the commit history of this file; reproduce with
     /// `probe_clear_vs_scan` in `src/tests.rs`.
     ///
     /// Known boundary cost: a full-table scan with Drop glue merely ties, because the drops

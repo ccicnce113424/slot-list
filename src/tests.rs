@@ -1997,7 +1997,7 @@ fn churn_does_not_allocate() {
     assert!(allocs > 0, "the allocation counter is not working");
 
     // Control 2: `fast-list` (slotmap-indexed) likewise reaches zero allocation by reusing free slots;
-    // this is the evidence for the "zero allocation" cell of the PERFORMANCE.md §9 feature comparison table.
+    // this is the evidence for the "zero allocation" cell of the PERFORMANCE.md §7.2 feature comparison table.
     let mut fast: fast_list::LinkedList<usize> = fast_list::LinkedList::new();
 
     for i in 0..n {

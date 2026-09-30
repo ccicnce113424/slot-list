@@ -22,7 +22,7 @@ pub(crate) const NIL: usize = usize::MAX;
 ///
 /// Per-slot cost = `T` + two links, so the link width directly determines memory and
 /// bandwidth: switching `usize` to `u32` takes the slot for an 8-byte element (`usize`)
-/// from 24 B (8 B payload + 2×8 B links) down to **16 B** (`PERFORMANCE.md` §1.3/§4).
+/// from 24 B (8 B payload + 2×8 B links) down to **16 B** (`PERFORMANCE.md` §1.3, §3.8).
 ///
 /// **Limit**: the free mark bit occupies the top bit (see [`Ix::FREE_BIT`]), and `append`'s
 /// wholesale `+= base` avoids the special case by never carrying into that bit, so the
@@ -273,7 +273,7 @@ pub trait Storage<T>: sealed::Sealed {
     ///   the immediate next `push` pay a full relocation again (measured 3.9->7.5 ms,
     ///   15.5->34.0 ms, i.e. **doubled**).
     ///
-    /// Full numbers: `PERFORMANCE.md` §3.6 and §4 rows 5, 6 and 8.
+    /// Full numbers: `PERFORMANCE.md` §3.6 and §3.8.
     fn append(&mut self, other: &mut Self);
 
     /// The slot's element storage, as `MaybeUninit`: a slot may be uninitialized,

@@ -35,7 +35,8 @@ jobs:
       # adds the std-`LinkedList`-cursor comparison rows (nightly only).
       - run: cargo bench --no-run --features linked-list-cursors
       - run: cargo bench --no-run --features mimalloc,linked-list-cursors
-      # The `clear` density curve / break-even check behind PERFORMANCE.md §5.
+      # The `clear` density curve / break-even check (permanent probe; the numbers behind
+      # the threshold are in the commit history).
       - run: cargo test --release -- --ignored --nocapture probe_clear_vs_scan
 
       # `Swatinem/rust-cache` caches `target`, and its post-job cleanup deletes every file
@@ -89,10 +90,10 @@ jobs:
     # repository needs a plan that includes them (otherwise drop this job).
     # Purpose: the free-marking path is the part most likely to differ per ISA, but this
     # job builds the shipped read-modify-write implementation, so it cannot compare that
-    # against a byte-wide store. PERFORMANCE.md §4 row 10 asks for that comparison and it
-    # needs a second build. What this job does show is how the current code behaves on
-    # AArch64 and whether the layout and ratio conclusions survive. This runner varies
-    # 1-19% between instances even on `churn`, so it only supports large effects.
+    # against a byte-wide store; that needs a second build. What this job does show is how
+    # the current code behaves on AArch64 and whether the layout and ratio conclusions
+    # survive. Two instances agreed within 1.19x (median 1.05x) on the targeted groups, so
+    # it only supports large effects.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
