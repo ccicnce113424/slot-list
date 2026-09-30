@@ -93,7 +93,7 @@ Benchmarks reproduce with `cargo bench` (system allocator) or
 
 ## Minimum supported Rust version
 
-Rust **1.85** (edition 2024). The library builds on stable; the optional
+Rust **1.88** (edition 2024, set by let-chains). The library builds on stable; the optional
 `linked-list-cursors` benchmark feature requires nightly.
 
 ## License

@@ -14,14 +14,16 @@ env:
 
 jobs:
   msrv:
-    name: 1.85 (library)
+    name: "1.88"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # `rust-version = "1.88"`: what sets it is edition-2024 let-chains
+      # (`if let Some(x) = .. && cond`), stabilized in 1.88. 1.87 fails on them.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      # `rust-version = "1.85"` (edition 2024) applies to the library. Only `--lib`
-      # is checked: the dev-dependencies (criterion, mimalloc) may need a newer Rust.
-      - run: cargo check --lib
+      # The dev-dependencies are compatible with 1.88, so the full suite can run here.
+      - run: cargo test
+      # `no_std` + `alloc` plus the narrow-index configuration.
       - run: cargo check --lib --no-default-features
       - run: cargo check --lib --features u32-index

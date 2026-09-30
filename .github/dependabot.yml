@@ -12,6 +12,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # `dtolnay/rust-toolchain@<toolchain>` is not an action version: the ref is a Rust
+      # toolchain name, and in `msrv.yml` it *is* the MSRV pin. Dependabot reads it as a
+      # version and proposes `1.85.0 -> 1.120.0` (see PR #1), which would silently change
+      # what the MSRV job tests. Never update it automatically; bump it by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # Cargo: the dev-dependencies (criterion, mimalloc, fast-list) and the lockfile.
   - package-ecosystem: cargo

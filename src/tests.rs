@@ -1896,16 +1896,33 @@ fn iter_mut_scrambled_chain() {
 // ============================================================
 
 use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+// Allocations are counted **per thread**: the test harness runs the other tests in
+// parallel, and a single global counter let their allocations leak into the measured
+// region (which made this test fail on Windows).
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Bump this thread's counter; called from the global allocator.
+///
+/// `try_with` because the allocator can also run during thread-local teardown, where
+/// `with` would panic.
+fn record_alloc() {
+    let _ = ALLOCS.try_with(|count| count.set(count.get() + 1));
+}
+
+/// This thread's allocation count so far.
+fn allocs() -> usize {
+    ALLOCS.with(Cell::get)
+}
 
 /// Global allocator that counts allocations (test-only).
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: AllocLayout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        record_alloc();
         unsafe { System.alloc(l) }
     }
 
@@ -1914,7 +1931,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: AllocLayout, n: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        record_alloc();
         unsafe { System.realloc(p, l, n) }
     }
 }
@@ -1923,11 +1940,11 @@ unsafe impl GlobalAlloc for Counting {
 static GA: Counting = Counting;
 
 fn count_alloc<F: FnMut()>(mut f: F) -> usize {
-    let before = ALLOCS.load(Ordering::Relaxed);
+    let before = allocs();
 
     f();
 
-    ALLOCS.load(Ordering::Relaxed) - before
+    allocs() - before
 }
 
 /// Scale: Miri interprets and records provenance byte by byte, so 1M elements would take hours;

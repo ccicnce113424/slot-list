@@ -2,7 +2,7 @@
 name = "slot-list"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A doubly linked list over a contiguous slot arena, with stable O(1) slot handles, element-level cursors, three configurable memory layouts, and no_std support."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
