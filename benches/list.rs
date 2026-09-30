@@ -59,11 +59,10 @@
 //! # Where the numbers are
 //!
 //! `PERFORMANCE.md` at the repo root holds the memory/address tables for the three layouts, the
-//! full result set, the byte reconciliation and the selection matrix for the two `append` APIs,
-//! the internal probes (`clear` / `Drop` / the three iteration tiers / bandwidth
-//! reconciliation), and the tried-and-rejected optimizations (blocked layout, row-major bitmap,
-//! iterator lookahead, `u32` index, `reserve`, `madvise` among others), each with its measured
-//! numbers and cost.
+//! full result set, the selection matrix for the two `append` APIs, the handle-vs-position
+//! comparison and the `fast-list` comparison. The measurements behind implementation choices
+//! (`clear`'s scan threshold, the free-marking write, `u32`'s slot ceiling, the rejected
+//! variants) are in the commit history and next to the code they explain.
 
 #![cfg_attr(feature = "linked-list-cursors", feature(linked_list_cursors))]
 
