@@ -61,7 +61,7 @@ pub trait Ix:
     ///   values never have this bit set), and a free slot only uses `next` in the free
     ///   chain, so this bit changes **only on the transition to free** and the link-write
     ///   path carries no extra work. A direct assignment `prev = FREE_BIT` to save a load
-    ///   measured consistently slower on `churn` (`PERFORMANCE.md`), so the
+    ///   measured consistently slower on `churn` on x86-64 and on aarch64, so the
     ///   read-modify-write stays.
     /// - **`append`'s wholesale `+= base` carries it along by itself**: `2^63 | v` plus
     ///   `base` is still `2^63 | (v + base)`, so no special case is needed as long as `u64`
