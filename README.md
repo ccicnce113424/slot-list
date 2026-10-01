@@ -1,5 +1,8 @@
 # slot-list
 
+[![crates.io](https://img.shields.io/crates/v/slot-list.svg)](https://crates.io/crates/slot-list)
+[![docs.rs](https://docs.rs/slot-list/badge.svg)](https://docs.rs/slot-list)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/ccicnce113424/slot-list/actions/workflows/ci.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/ci.yml)
 [![Miri](https://github.com/ccicnce113424/slot-list/actions/workflows/miri.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/miri.yml)
 [![MSRV](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml/badge.svg)](https://github.com/ccicnce113424/slot-list/actions/workflows/msrv.yml)
