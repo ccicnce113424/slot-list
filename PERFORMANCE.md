@@ -47,10 +47,16 @@ no stable handle (§6).
 | Build profile | cargo `bench`: `opt-level = 3`, LTO off, debug assertions off, no `target-cpu` override |
 | Harness | criterion 0.8, `sample_size(10)`, warm-up 500 ms, measurement 1 s, **median**, single-threaded single process |
 
-Every number is a same-machine A/B on the machine above. The allocator is part of the configuration:
-`churn`, `iteration`, `cursor_update`, `middle_*` and `slot_entry` do not move with it, while
-`end_ops`, `append*` and `blob_*` allocate inside the timed region and can move by several-fold in
-either direction under the system allocator, so do not mix the two. The CI artifacts
+Every number is a same-machine A/B on the machine above. The allocator is part of the configuration,
+and it does not move our cells uniformly. `churn`, `iteration`, `cursor_update`, `middle_*`,
+`random_remove_insert`, `slot_entry` and `index_width` stay inside ±5%, while `end_ops` and
+`append*` allocate inside the timed region and are **not reproducible under the system (glibc)
+allocator**: `end_ops` measured 0.27-1.52× of the mimalloc column depending on layout *and* shape
+(`PackedLinksList`'s `push_back`+`pop_front` 20.3 ms against 5.5 ms, `SplitList`'s 5.3 ms against
+7.2 ms), and the same `append/NodesList` cell gave 21.3, 20.6, 3.4 and 4.9 ms across four
+system-allocator passes of one session. The reference columns move as well: `churn/LinkedList` 1.30×
+slower (it `malloc`s a node per push) and `iteration/VecDeque` 1.44× faster (440 → 305 µs). So do not
+mix the two, and read the mimalloc column as the reproducible one. The CI artifacts
 (`.github/workflows/benches.yml`, published for every dispatch) are a different machine class again,
 and the guest CPU model varies between dispatches, so they support structural conclusions and A/B
 inside one run only.
@@ -397,7 +403,8 @@ comes from both sides' source; the numbers are medians from one same-machine `ca
 | `slot_entry::by_handle` (100 handle entries) | **719 ns** | 42.11 ms | **58,000×** | - | - |
 | `slot_entry::by_pos` (100 position entries) | **28.33 ms** | 42.29 ms | 1.5× | - | - |
 
-Reading note: `end_ops` measures the allocator (§1.4, ±20%); the other groups ±5%.
+Reading note: `end_ops` and `append*` measure the allocator and are not reproducible under the
+system one (§1.1); the other groups ±5%.
 
 **Why the `by_handle` cell differs by ~58,000×** (generation semantics, not implementation quality):
 
